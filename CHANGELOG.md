@@ -57,6 +57,55 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   search and status filters, immutable hashes, structured addresses, source
   paths, and evidence links without copying proof records into ordinary
   memory, cortex, the graph, or dream consolidation.
+### Fixed (2026-09-01 — beam_rejudge: a timed-out judge call can no longer hang the run)
+- **`evals/beam_rejudge.py` now kills the whole process tree on a judge-call
+  timeout** — the same `subprocess.run(..., timeout=...)` gap fixed in
+  `claude_shim.py` and `codex_shim.py`: the timeout kills only the direct
+  child (`claude.cmd` → `cmd.exe` → node on Windows) and reaps it with an
+  unbounded `communicate()`, so a surviving node descendant holding the
+  stdout pipe blocks the reap forever. `CliJudge` is pooled rather than
+  serialized, so a wedged call permanently ate a worker slot and kept the
+  run from ever exiting instead of wedging a lock; the per-call fix is
+  identical — a `Popen`/`communicate` seam with `start_new_session` on
+  POSIX and a tree kill (`os.killpg` / `taskkill /F /T`) before the reap.
+  `evals/beam_reader_sweep.py` builds its answerer and judge from the same
+  `CliJudge`, so its long-generation answer calls — the likelier ones to
+  time out — get the fix for free. No behavior change outside the timeout
+  path. (`evals/beam_rejudge.py`, `tests/test_beam_rejudge.py`.)
+
+### Added (2026-09-01 — extension-schema seams, extracted from the RE Hub pilot)
+- **Extension schemas have a sanctioned pattern, and their markers no longer
+  travel in bank transfers.** A fork adding its own tables records lineage
+  under a namespaced `meta` key ending in `_schema_version` instead of
+  consuming upstream's next integer `schema_version`
+  ([convention](docs/guide/configuration.md#extension-schemas)); the logical
+  export/import now skips any such key exactly like `schema_version` itself,
+  so a marker can never land in a bank whose build lacks the extension
+  (`tests/test_transfer_cli.py` pins it). Extracted and generalized from the
+  RE Hub pilot (PR #226, @blacksheep25), which stays a downstream extension.
+- **`MemoryService._ensure_postgres_storage()` — connect the durable store
+  without loading the embedding model.** Split out of `_ensure_init` so
+  exact/hash-addressed paths that never embed can reach Postgres cheaply as
+  a session's first call; the connection is reused (never rebuilt on a
+  mid-init retry, extending the 2026-08-04 boot-balloon fix), and the
+  `public`-search-path shadow-schema invariant now runs on every connect
+  path rather than only the embedder-backed one.
+
+### Added (2026-08-31 — fixture dev server announces its demo data)
+- **The Console now shows a "DEMO DATA — fixture server, not a real bank"
+  banner when served by the fixture dev server.** The fixture bank
+  (`pseudolife_memory/web/devserver.py` + `FixtureService`) is visually
+  indistinguishable from a real daemon's Console — an external adopter
+  opened a fixture tab, read the 1,840 canned entries as his own bank, and
+  concluded the package shipped pre-populated with someone else's data
+  (2026-08-31); the only tell was the writer name in the System card.
+  Fixture payloads now self-announce: `FixtureService` declares a marker
+  the Console routes surface as `fixtures: true` on the overview health
+  object (and the devserver's top-level `/health` carries the same field),
+  and the topbar renders the flag as an always-visible warning chip in
+  place of the "live" chip. The real daemon's payloads are unchanged — no
+  marker, no new field; an absent key means a real bank
+  (`tests/test_web.py` pins both directions plus the topbar wiring).
 
 ### Added (2026-08-31 — installer wiring for the Codex dreamer)
 - **`codex-only` / `codex-fallback` extractor modes** in `ops/install.sh`

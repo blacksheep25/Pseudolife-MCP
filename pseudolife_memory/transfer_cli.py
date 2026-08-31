@@ -25,8 +25,8 @@ Contract, pinned by ``tests/test_transfer_cli.py``:
   build), while an export *carrying* an unknown column refuses (new
   export, old build — importing would silently drop data).
 * Build-owned and transient ``meta`` keys never travel: ``schema_version``
-  and extension versions belong to the target build, while the active-session
-  pointer is session state.
+  and extension lineage markers (``*_schema_version``) belong to the
+  target build, while the active-session pointer is session state.
 
 The module stays torch-free: embeddings move verbatim as pgvector text (the
 manifest pins the dimension; import refuses a mismatch), so neither command
@@ -77,11 +77,15 @@ EXCLUDED_TABLES = (
     "slot_reads", "re_evidence_artifacts", "re_claims", "re_claim_evidence",
 )
 
-# meta keys that must not travel: the target build owns its base and extension
-# schema versions, and the active-session pointer is transient session state.
-_META_SKIP_KEYS = {
-    "schema_version", "rehub_schema_version", "active_session_pointer",
-}
+# meta keys that must not travel: the target build owns its schema_version
+# and any extension lineage marker (the `*_schema_version` convention —
+# see docs/guide/configuration.md#extension-schemas), and the
+# active-session pointer is transient session state.
+_META_SKIP_KEYS = {"schema_version", "active_session_pointer"}
+
+
+def _skip_meta_key(key) -> bool:
+    return key in _META_SKIP_KEYS or str(key).endswith("_schema_version")
 
 # The freshness check import runs. Derived, not listed: every exported
 # table must be empty except the two a daemon-initialized bank legitimately
@@ -200,7 +204,7 @@ def _export_table(conn, zf: zipfile.ZipFile, table: str) -> int:
         cols = [d.name for d in cur.description]
         for row in cur:
             rec = dict(zip(cols, row))
-            if table == "meta" and rec.get("key") in _META_SKIP_KEYS:
+            if table == "meta" and _skip_meta_key(rec.get("key")):
                 continue
             text.write(json.dumps(
                 rec, default=_json_default, ensure_ascii=False) + "\n")
@@ -334,7 +338,7 @@ def _import_meta(conn, lines) -> int:
                     f"{sorted(unknown)} this build does not know — the "
                     "export came from a newer pseudolife-mcp; upgrade "
                     "this install and retry.")
-            if rec.get("key") in _META_SKIP_KEYS:
+            if _skip_meta_key(rec.get("key")):
                 continue
             cur.execute(
                 "INSERT INTO meta (key, value) VALUES (%s, %s::jsonb) "
