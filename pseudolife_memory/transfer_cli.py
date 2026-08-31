@@ -68,12 +68,13 @@ EXPORTED_TABLES = (
     "chronicle_events",
 )
 
-# Operational, not knowledge: the dream pre-image journal only exists to
-# roll back runs against THIS bank's row ids, and the retrieval/read
-# telemetry is training signal tied to this deployment's serving history.
+# Operational or independently portable, not transferable memory: the dream
+# pre-image journal only exists to roll back runs against THIS bank's row ids,
+# retrieval/read telemetry is tied to this deployment's serving history, and
+# strict RE proof records travel only through re_evidence's hash-checked archive.
 EXCLUDED_TABLES = (
     "dream_runs", "dream_run_slots", "retrieval_events", "retrieval_uses",
-    "slot_reads",
+    "slot_reads", "re_evidence_artifacts", "re_claims", "re_claim_evidence",
 )
 
 # meta keys that must not travel: the target build owns its schema_version

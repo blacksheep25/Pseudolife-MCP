@@ -36,6 +36,7 @@ import logging
 import os
 import re
 import time
+from contextlib import contextmanager
 from pathlib import Path
 from threading import Lock
 from typing import Any
@@ -976,6 +977,189 @@ class MemoryService(DreamOps):
                         best = cand
         if best > (0, 0):
             self._hlc.observe(*best)
+
+    # ------------------------------------------------------------------
+    # Tool: strict reverse-engineering evidence
+    # ------------------------------------------------------------------
+
+    def re_evidence_ingest(
+        self, *, path: str, project: str, kind: str = "evidence-hub-json",
+        locator: str | None = None, summary: str | None = None,
+        binary_id: str,
+    ) -> dict[str, Any]:
+        from pseudolife_memory.re_evidence import (
+            EvidenceInputError, normalize_address, parse_evidence_file)
+
+        project = project.strip()
+        binary_id = binary_id.strip()
+        kind = kind.strip()
+        if not project or not binary_id or not kind:
+            raise EvidenceInputError("project, binary_id, and kind must be non-empty")
+        artifact = parse_evidence_file(path)
+        if locator:
+            artifact["locator"] = normalize_address(locator)
+            if artifact["locator"] not in artifact["addresses"]:
+                artifact["addresses"].append(artifact["locator"])
+                artifact["addresses"].sort()
+        artifact.update({
+            "project": project,
+            "kind": kind,
+            "summary": summary.strip() if summary else None,
+            "binary_id": binary_id,
+        })
+        with self._lock:
+            storage = self._ensure_postgres_storage()
+            artifact_id = storage.insert_re_evidence(artifact)
+        return {
+            "id": artifact_id,
+            "project": project,
+            "binary_id": binary_id,
+            "kind": kind,
+            "locator": artifact["locator"],
+            "addresses": artifact["addresses"],
+            "content_hash": artifact["content_hash"],
+            "immutable": True,
+        }
+
+    def re_claim_record(
+        self, *, project: str, binary_id: str, subject: str, claim: str, status: str,
+        evidence_ids: list[int] | None = None,
+        confidence: float | None = None,
+    ) -> dict[str, Any]:
+        with self._lock:
+            storage = self._ensure_postgres_storage()
+            claim_id = storage.upsert_re_claim(
+                project=project, binary_id=binary_id, subject=subject,
+                claim=claim, status=status,
+                evidence_ids=evidence_ids, confidence=confidence)
+        return {"id": claim_id, "project": project.strip(),
+                "binary_id": binary_id.strip(), "status": status.lower()}
+
+    def re_evidence_query(
+        self, *, project: str, binary_id: str, address: str | None = None,
+        subject: str | None = None, status: str | None = None,
+        text: str | None = None, limit: int = 50,
+        include_payload: bool = False,
+    ) -> dict[str, Any]:
+        with self._lock:
+            storage = self._ensure_postgres_storage()
+            artifacts = storage.query_re_evidence(
+                project=project, binary_id=binary_id, address=address,
+                text=text, limit=limit,
+                include_payload=include_payload)
+            claims = storage.query_re_claims(
+                project=project, binary_id=binary_id,
+                subject=subject or address, status=status, text=text, limit=limit)
+        return {"project": project.strip(), "binary_id": binary_id.strip(),
+                "artifacts": artifacts, "claims": claims}
+
+    def re_evidence_export(
+        self, *, project: str, binary_id: str, path: str,
+    ) -> dict[str, Any]:
+        from pseudolife_memory.re_evidence import export_evidence_archive
+        from psycopg import IsolationLevel
+
+        with self._re_evidence_archive_storage() as storage:
+            # One stable manifest even if another daemon writes concurrently;
+            # the snapshot stays open during ZIP I/O without blocking writes.
+            with storage.conn.transaction(
+                    isolation_level=IsolationLevel.REPEATABLE_READ,
+                    read_only=True):
+                return export_evidence_archive(
+                    storage, path=path, project=project, binary_id=binary_id,
+                    archive_root=self._re_evidence_archive_root())
+
+    def _re_evidence_archive_root(self) -> Path:
+        configured = os.environ.get("PSEUDOLIFE_RE_EVIDENCE_ARCHIVE_ROOT")
+        return (Path(configured).expanduser().resolve() if configured else
+                (self.data_dir / "re_evidence_archives").resolve())
+
+    @contextmanager
+    def _re_evidence_archive_storage(self):
+        """Give archive I/O its own connection, outside the coarse service
+        lock, so a large ZIP cannot stall unrelated memory calls."""
+        with self._lock:
+            dsn = self._ensure_postgres_storage().dsn
+        from pseudolife_memory.storage.postgres import PostgresStorage
+        storage = PostgresStorage(dsn)
+        try:
+            yield storage
+        finally:
+            storage.close()
+
+    def re_evidence_import(
+        self, *, project: str, binary_id: str, path: str,
+    ) -> dict[str, Any]:
+        from pseudolife_memory.re_evidence import import_evidence_archive
+
+        with self._re_evidence_archive_storage() as storage:
+            return import_evidence_archive(
+                storage, path=path, project=project, binary_id=binary_id,
+                archive_root=self._re_evidence_archive_root())
+
+    def re_evidence_stats(
+        self, *, project: str, binary_id: str | None = None,
+    ) -> dict[str, Any]:
+        with self._lock:
+            return self._ensure_postgres_storage().re_evidence_stats(
+                project, binary_id=binary_id)
+
+    def re_evidence_dashboard(
+        self, *, project: str | None = None, binary_id: str | None = None,
+        text: str | None = None, status: str | None = None, limit: int = 100,
+    ) -> dict[str, Any]:
+        """Read-only Console projection over the isolated RE proof store."""
+        project = project.strip() if project else None
+        binary_id = binary_id.strip() if binary_id else None
+        text = text.strip() if text else None
+        status = status.strip().lower() if status else None
+        limit = max(1, min(int(limit), 500))
+        with self._lock:
+            storage = self._ensure_postgres_storage()
+            scopes = storage.re_evidence_scopes()
+            selected = None
+            if project and binary_id:
+                selected = next((scope for scope in scopes
+                                 if scope["project"] == project
+                                 and scope["binary_id"] == binary_id), None)
+            elif project:
+                selected = next((scope for scope in scopes
+                                 if scope["project"] == project), None)
+            elif scopes:
+                selected = scopes[0]
+
+            if selected is None:
+                return {
+                    "read_only": True,
+                    "scopes": scopes,
+                    "selection": None,
+                    "totals": {"artifacts": 0, "claims": {}},
+                    "artifacts": [],
+                    "claims": [],
+                }
+
+            selected_project = selected["project"]
+            selected_binary = selected["binary_id"]
+            artifacts = storage.query_re_evidence(
+                project=selected_project, binary_id=selected_binary,
+                text=text, limit=limit, include_payload=False)
+            claims = storage.query_re_claims(
+                project=selected_project, binary_id=selected_binary,
+                status=status, text=text, limit=limit)
+            return {
+                "read_only": True,
+                "scopes": scopes,
+                "selection": {
+                    "project": selected_project,
+                    "binary_id": selected_binary,
+                },
+                "totals": {
+                    "artifacts": selected["artifacts"],
+                    "claims": selected["claims"],
+                },
+                "artifacts": artifacts,
+                "claims": claims,
+            }
 
     # ------------------------------------------------------------------
     # Tool: store

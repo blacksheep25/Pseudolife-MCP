@@ -281,7 +281,7 @@
    "x": 940,
    "y": 160,
    "t": "mcp_server.py",
-   "s": "MCPServer (SDK v2) · 35 tools",
+   "s": "MCPServer (SDK v2) · 36 tools",
    "p": "pseudolife_memory/mcp_server.py",
    "d": [
     "Every tool is a thin tier-tagged wrapper over MemoryService",
@@ -300,7 +300,7 @@
    "d": [
     "Resolution: principal override → tier map → env default (core)",
     "12h-TTL principal overrides (PrincipalTierState); visibility is a token lever, NOT security",
-    "core = 22 of 35 tools; minimal = 9; auth is the bearer token"
+    "core = 23 of 36 tools; minimal = 9; auth is the bearer token"
    ]
   },
   {
@@ -368,7 +368,7 @@
    "s": "vanilla JS · /ui/",
    "p": "pseudolife_memory/web/static/",
    "d": [
-    "Panels: Observatory · Cortex · World · Lessons · Stream · Recall · Graph (3D galaxy) · Insight · Episodes · Console",
+    "Panels: Observatory · Cortex · World · Lessons · Stream · Recall · Graph (3D galaxy) · Insight · Episodes · RE Evidence · Console",
     "Hash-routed, REST-only; 401 anywhere → token modal",
     "Dev harness: web/devserver.py on :8770 against FixtureService"
    ]
@@ -831,8 +831,9 @@
    "p": "pseudolife_memory/storage/schema.py",
    "d": [
     "pgvector required; Apache AGE fully removed",
-    "entries(vector 1024) · facts · world_facts · lessons · entities/edges · episodes · memory_traces · communities · outcome_signals · entity_kinds · dream_runs/dream_run_slots · chronicle_events · retrieval_events/retrieval_uses · slot_reads",
+    "entries(vector 1024) · facts · world_facts · lessons · entities/edges · episodes · memory_traces · communities · outcome_signals · entity_kinds · dream_runs/dream_run_slots · chronicle_events · retrieval_events/retrieval_uses · slot_reads · optional RE evidence/claims",
     "Additive migrations: v23 fact freshness_class · v24 entity_kinds · v25 1024-d re-embed · v26 set-valued slots · v27 dream-run pre-image journal · v28 chronicle events (dated occurrences, additive-only) · v29 fact stance (labelled hedge field, NULL = plain) · v30 merge-proposal judge verdict (five nullable entity_proposals.judge_* columns, an opinion until a decision path ratifies it) · v31 retrieval event log (retrieval_events/retrieval_uses append-only query/served/used tuples for a future learned reranker; observational only) · v32 retrieval-log ranking params + per-entry fusion components (nullable retrieval_events.params JSONB; NULL = a v31-era row) · v33 read telemetry (slot_reads per-slot serve counters, slot-keyed so cortex snapshots don't reset them; entries.explicit_reinforcements splits deliberate reinforces from dream-trace links; feeds memory_stats read_audit) · v34 served facts on the retrieval log (nullable retrieval_events.served_facts JSONB — the cortex-first block's slots attached to the exact event row by returned id, completing the reranker training tuple; read_audit gains graduation_candidates, no DDL)",
+    "Independent extension: v34-rehub adds immutable build/address evidence plus evidence-gated claims without consuming an upstream integer schema version",
     "One-current-row-per-slot partial unique indexes"
    ]
   },
@@ -1334,7 +1335,7 @@
   {
    "f": "mcpsrv",
    "t": "service",
-   "l": "35 tools → service.*",
+   "l": "36 tools → service.*",
    "k": "data"
   },
   {

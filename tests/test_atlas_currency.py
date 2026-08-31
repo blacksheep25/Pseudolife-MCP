@@ -167,3 +167,15 @@ def test_no_removed_tool_references(atlas: dict) -> None:
         f"docs/atlas/atlas.json still references removed tool(s) {hits} — "
         "point the description at the current tool surface instead"
     )
+
+
+def test_atlas_tool_counts_and_console_panels_match_code(atlas: dict) -> None:
+    from pseudolife_memory import mcp_server
+
+    tool_count = len(mcp_server._TOOL_TIERS)
+    core_count = len(mcp_server._visible_tool_names("core"))
+    atlas_text = json.dumps(atlas, ensure_ascii=False)
+    assert f"{tool_count} tools" in atlas_text
+    assert f"core = {core_count} of {tool_count} tools" in atlas_text
+    assert f"{tool_count} tools → service.*" in atlas_text
+    assert "RE Evidence" in atlas_text

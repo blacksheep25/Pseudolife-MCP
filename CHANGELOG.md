@@ -6,6 +6,57 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Security (2026-09-01 — RE evidence archive and pilot hardening)
+- **RE evidence archives are confined to a configured server-side root.**
+  Export/import paths can no longer write or read arbitrary daemon-visible
+  files; traversal and symlink escapes are rejected. Docker persists the
+  default `/data/re_evidence_archives` root in its state volume.
+- **Archive work no longer holds the service-wide storage lock during ZIP
+  I/O.** Export uses a dedicated connection and a read-only, repeatable-read
+  snapshot; import also uses a dedicated connection plus a transaction-scoped
+  project/build lock, keeping unrelated MCP requests responsive while
+  serializing same-scope restores and retaining atomic database writes.
+- **Startup now refuses incompatible unpublished RE pilot table shapes.**
+  Column types, nullability, sequence/array defaults, and exact primary,
+  unique, check, and foreign-key semantics are checked after idempotent DDL so
+  an older pilot cannot be mistaken for `v34-rehub`.
+
+### Fixed (2026-09-01 — RE evidence integrity review)
+- **RE evidence artifacts are now fully immutable at the PostgreSQL
+  boundary.** The maintenance-SQL trigger previously protected only project
+  and build scope, allowing bytes, payload, locator, and a matching hash to be
+  forged together underneath already-verified claims. Every artifact update is
+  now rejected; regression probes cover all stored content and metadata.
+- **Claim updates preserve evidence links when `evidence_ids` is omitted.** An
+  explicit list still replaces the complete set and `[]` explicitly clears it,
+  preventing a downgrade to `hypothesis` from silently discarding provenance.
+  Concurrent artifact replay now returns a clean input error if the conflicting
+  row disappears before verification instead of dereferencing `None`.
+- **RE evidence documentation surfaces are current:** Atlas tool counts and
+  Console panels include the 36th/core-23 RE tool, and the toolset description
+  advertises strict RE evidence.
+
+### Added (2026-08-31 — strict reverse-engineering evidence pilot)
+- **Added the independently versioned `v34-rehub` reverse-engineering proof
+  store and the core-tier
+  `re_evidence` tool.** Evidence Hub JSON artifacts are retained immutably with
+  an original-byte SHA-256, exact address index, project/build attribution, and
+  replay deduplication. Behavioral claims live separately and cannot be marked
+  `observed`, `verified`, or `rejected` without project-local evidence links.
+  Exact build-scoped query, compact/raw payload modes, project stats, and a
+  hash-verified portable ZIP export/import make the feature optional and
+  removable. These tables are outside
+  associative memory, the reference bank, cortex promotion, and dream
+  consolidation, so a remembered inference cannot silently become proof. The
+  extension records `rehub_schema_version` separately and leaves upstream's
+  integer `schema_version` at v34, avoiding collisions with future upstream
+  migrations. General memory transfer explicitly excludes these proof tables;
+  they travel only through the feature's hash-validated archive format.
+- **The Cortex Console now has a read-only RE Evidence view.** It exposes
+  project/build scopes, artifact and claim totals, claim-status breakdowns,
+  search and status filters, immutable hashes, structured addresses, source
+  paths, and evidence links without copying proof records into ordinary
+  memory, cortex, the graph, or dream consolidation.
 ### Fixed (2026-09-01 — beam_rejudge: a timed-out judge call can no longer hang the run)
 - **`evals/beam_rejudge.py` now kills the whole process tree on a judge-call
   timeout** — the same `subprocess.run(..., timeout=...)` gap fixed in
