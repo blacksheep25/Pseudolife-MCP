@@ -972,6 +972,20 @@ class PostgresStorage:
 
     # ── reverse-engineering evidence (v34-rehub extension) ────────────
 
+    def _lock_re_evidence_scope(self, project: str, binary_id: str) -> None:
+        """Serialize every proof-store mutation for one project/build.
+
+        Import relies on this cooperative transaction lock to keep its
+        empty-scope check true until the complete restore commits. Reacquiring
+        it inside an import's nested savepoints is safe and releases only when
+        the outer transaction ends.
+        """
+        from pseudolife_memory.re_evidence import _archive_scope_lock_key
+
+        self.conn.execute(
+            "SELECT pg_advisory_xact_lock(hashtextextended(%s, 0))",
+            (_archive_scope_lock_key(project, binary_id),))
+
     def insert_re_evidence(self, artifact: dict) -> int:
         """Insert one immutable artifact, returning the existing id on replay."""
         from pseudolife_memory.re_evidence import EvidenceInputError
@@ -983,6 +997,8 @@ class PostgresStorage:
             raise EvidenceInputError(f"evidence artifact missing fields: {missing}")
         now = time.time()
         with self._txn():
+            self._lock_re_evidence_scope(
+                str(artifact["project"]), str(artifact["binary_id"]))
             row = self.conn.execute(
                 """
                 INSERT INTO re_evidence_artifacts
@@ -1087,6 +1103,7 @@ class PostgresStorage:
             require_evidence=not preserve_links)
         now = time.time()
         with self._txn():
+            self._lock_re_evidence_scope(project, binary_id)
             if preserve_links and status.strip().lower() in (
                     "observed", "verified", "rejected"):
                 linked = self.conn.execute(

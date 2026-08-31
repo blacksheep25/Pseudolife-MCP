@@ -1755,7 +1755,8 @@ def re_evidence(
         description="Stable project key, for example 'srfn-client'.")],
     path: Annotated[str | None, Field(
         description="For ingest: JSON input path. For export/import: archive "
-                    "path on the server filesystem.")] = None,
+                    "path beneath the server's configured RE evidence archive "
+                    "root (relative paths are preferred).")] = None,
     kind: Annotated[str, Field(
         description="For ingest: evidence type such as 'ghidra-function'.")]
         = "evidence-hub-json",

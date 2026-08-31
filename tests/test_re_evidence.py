@@ -485,7 +485,7 @@ def test_portable_archive_round_trip_preserves_original_bytes(pg_url, pg_conn, t
         archive_path = tmp_path / "proof.zip"
         exported = export_evidence_archive(
             storage, path=archive_path, project="srfn-client",
-            binary_id="client:test")
+            binary_id="client:test", archive_root=tmp_path)
         assert exported["sha256"] == hashlib.sha256(archive_path.read_bytes()).hexdigest()
         from pseudolife_memory.re_evidence import EvidenceInputError
         with pytest.raises(
@@ -493,11 +493,87 @@ def test_portable_archive_round_trip_preserves_original_bytes(pg_url, pg_conn, t
                 match="project and binary_id must be non-empty"):
             import_evidence_archive(
                 storage, path=archive_path, project=" ",
-                binary_id="client:test")
+                binary_id="client:test", archive_root=tmp_path)
         with pytest.raises(EvidenceInputError, match="empty project/build"):
             import_evidence_archive(
                 storage, path=archive_path, project="srfn-client",
-                binary_id="client:test")
+                binary_id="client:test", archive_root=tmp_path)
+
+        with storage._txn():
+            storage.conn.execute("DELETE FROM re_claims WHERE project = 'srfn-client'")
+            storage.conn.execute(
+                "DELETE FROM re_evidence_artifacts WHERE project = 'srfn-client'")
+
+        # A different daemon may begin writing this scope while an import is
+        # ready to commit. Hold the same transaction-scoped lock the importer
+        # must take, add a row, and prove the second connection waits and then
+        # rechecks emptiness instead of merging the archive into live state.
+        from pseudolife_memory.re_evidence import _archive_scope_lock_key
+
+        blocker = PostgresStorage(pg_url)
+        importer = PostgresStorage(pg_url)
+        started = threading.Event()
+        result: list[object] = []
+
+        def concurrent_import():
+            started.set()
+            try:
+                result.append(import_evidence_archive(
+                    importer, path=archive_path, project="srfn-client",
+                    binary_id="client:test", archive_root=tmp_path))
+            except Exception as exc:  # asserted below across the thread boundary
+                result.append(exc)
+
+        try:
+            with blocker._txn():
+                blocker.conn.execute(
+                    "SELECT pg_advisory_xact_lock(hashtextextended(%s, 0))",
+                    (_archive_scope_lock_key("srfn-client", "client:test"),))
+                thread = threading.Thread(target=concurrent_import)
+                thread.start()
+                assert started.wait(timeout=1)
+                thread.join(timeout=0.25)
+                assert thread.is_alive(), "import did not wait for the scope lock"
+                blocker.insert_re_evidence(artifact)
+            thread.join(timeout=2)
+            assert not thread.is_alive()
+            assert len(result) == 1
+            assert isinstance(result[0], EvidenceInputError)
+            assert "empty project/build" in str(result[0])
+
+            # Ordinary production writers must honor the same scope lock, not
+            # only competing importers. Otherwise they can commit after the
+            # import's empty check and merge live state into the restore.
+            writer = PostgresStorage(pg_url)
+            writer_result: list[object] = []
+            try:
+                with blocker._txn():
+                    blocker.conn.execute(
+                        "SELECT pg_advisory_xact_lock(hashtextextended(%s, 0))",
+                        (_archive_scope_lock_key(
+                            "srfn-client", "client:test"),))
+
+                    def concurrent_writer():
+                        try:
+                            writer_result.append(
+                                writer.insert_re_evidence(artifact))
+                        except Exception as exc:
+                            writer_result.append(exc)
+
+                    writer_thread = threading.Thread(target=concurrent_writer)
+                    writer_thread.start()
+                    writer_thread.join(timeout=0.25)
+                    assert writer_thread.is_alive(), (
+                        "production evidence writer ignored the scope lock")
+                writer_thread.join(timeout=2)
+                assert not writer_thread.is_alive()
+                assert len(writer_result) == 1
+                assert isinstance(writer_result[0], int)
+            finally:
+                writer.close()
+        finally:
+            blocker.close()
+            importer.close()
 
         with storage._txn():
             storage.conn.execute("DELETE FROM re_claims WHERE project = 'srfn-client'")
@@ -505,7 +581,7 @@ def test_portable_archive_round_trip_preserves_original_bytes(pg_url, pg_conn, t
                 "DELETE FROM re_evidence_artifacts WHERE project = 'srfn-client'")
         imported = import_evidence_archive(
             storage, path=archive_path, project="srfn-client",
-            binary_id="client:test")
+            binary_id="client:test", archive_root=tmp_path)
         assert imported == {
             "format": "pseudolife-re-evidence-v1", "project": "srfn-client",
             "binary_id": "client:test", "artifacts": 1, "claims": 1}
@@ -550,4 +626,79 @@ def test_archive_prevalidation_rejects_duplicate_member_reference(tmp_path):
 
     with pytest.raises(EvidenceInputError, match="duplicate artifact member"):
         import_evidence_archive(
-            object(), path=path, project="srfn-client", binary_id="client:test")
+            object(), path=path, project="srfn-client", binary_id="client:test",
+            archive_root=tmp_path)
+
+
+def test_archive_paths_are_confined_to_the_configured_root(tmp_path):
+    from pseudolife_memory.re_evidence import (
+        EvidenceInputError, resolve_evidence_archive_path)
+
+    root = tmp_path / "archives"
+    assert resolve_evidence_archive_path(
+        "proof.zip", archive_root=root) == (root / "proof.zip").resolve()
+
+    with pytest.raises(EvidenceInputError, match="archive root"):
+        resolve_evidence_archive_path(
+            tmp_path / "outside.zip", archive_root=root)
+
+    root.mkdir()
+    outside = tmp_path / "outside-target.zip"
+    outside.write_bytes(b"not an archive")
+    link = root / "linked.zip"
+    try:
+        link.symlink_to(outside)
+    except OSError as exc:
+        pytest.skip(f"symlink creation unavailable: {exc}")
+    with pytest.raises(EvidenceInputError, match="archive root"):
+        resolve_evidence_archive_path(link, archive_root=root)
+
+
+@pytest.mark.parametrize("operation", ["export", "import"])
+def test_archive_file_io_does_not_hold_the_service_lock(
+        monkeypatch, tmp_path, operation):
+    from pseudolife_memory import re_evidence
+    from pseudolife_memory.service import MemoryService
+    from pseudolife_memory.storage import postgres
+
+    service = MemoryService.__new__(MemoryService)
+    service._lock = threading.Lock()
+    service.data_dir = tmp_path
+
+    class PrimaryStorage:
+        dsn = "postgresql://archive-test"
+
+    class Connection:
+        def transaction(self, **_kwargs):
+            return nullcontext()
+
+    class ArchiveStorage:
+        conn = Connection()
+
+        def close(self):
+            pass
+
+    service._ensure_postgres_storage = lambda: PrimaryStorage()
+    monkeypatch.setattr(postgres, "PostgresStorage", lambda _dsn: ArchiveStorage())
+
+    def file_io(_storage, **_kwargs):
+        acquired = []
+
+        def probe():
+            got = service._lock.acquire(timeout=0.2)
+            acquired.append(got)
+            if got:
+                service._lock.release()
+
+        thread = threading.Thread(target=probe)
+        thread.start()
+        thread.join()
+        assert acquired == [True], "archive I/O held the global service lock"
+        return {"operation": operation}
+
+    monkeypatch.setattr(
+        re_evidence, f"{operation}_evidence_archive", file_io)
+    result = getattr(service, f"re_evidence_{operation}")(
+        project="srfn-client", binary_id="client:test", path="proof.zip")
+
+    assert result == {"operation": operation}

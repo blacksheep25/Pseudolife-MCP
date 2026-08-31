@@ -168,14 +168,37 @@ MAX_ARCHIVE_COMPRESSION_RATIO = 250.0
 MAX_ARCHIVE_FILE_BYTES = 300 * 1024 * 1024
 
 
+def _archive_scope_lock_key(project: str, binary_id: str) -> str:
+    """Stable advisory-lock namespace for one import destination scope."""
+    return "pseudolife:re-evidence-import:" + json.dumps(
+        [project, binary_id], ensure_ascii=True, separators=(",", ":"))
+
+
+def resolve_evidence_archive_path(
+    path: str | Path, *, archive_root: str | Path,
+) -> Path:
+    """Resolve a caller path inside the configured server-side archive root."""
+    root = Path(archive_root).expanduser().resolve()
+    requested = Path(path).expanduser()
+    resolved = (requested if requested.is_absolute()
+                else root / requested).resolve()
+    try:
+        resolved.relative_to(root)
+    except ValueError as exc:
+        raise EvidenceInputError(
+            f"evidence archive path must stay inside archive root {root}") from exc
+    return resolved
+
+
 def export_evidence_archive(
     storage, *, path: str | Path, project: str, binary_id: str,
+    archive_root: str | Path,
 ) -> dict[str, Any]:
     """Write a portable ZIP without materializing all raw artifacts at once."""
     project, binary_id = project.strip(), binary_id.strip()
     if not project or not binary_id:
         raise EvidenceInputError("project and binary_id must be non-empty")
-    target = Path(path).expanduser().resolve()
+    target = resolve_evidence_archive_path(path, archive_root=archive_root)
     if target.exists():
         raise EvidenceInputError(f"export target already exists: {target}")
     target.parent.mkdir(parents=True, exist_ok=True)
@@ -264,12 +287,13 @@ def export_evidence_archive(
 
 def import_evidence_archive(
     storage, *, path: str | Path, project: str, binary_id: str,
+    archive_root: str | Path,
 ) -> dict[str, Any]:
     """Restore an exported archive after validating every original-byte hash."""
     project, binary_id = project.strip(), binary_id.strip()
     if not project or not binary_id:
         raise EvidenceInputError("project and binary_id must be non-empty")
-    source = Path(path).expanduser().resolve()
+    source = resolve_evidence_archive_path(path, archive_root=archive_root)
     if not source.is_file():
         raise EvidenceInputError(f"evidence archive not found: {source}")
     if source.stat().st_size > MAX_ARCHIVE_FILE_BYTES:
@@ -371,16 +395,20 @@ def import_evidence_archive(
                     f"duplicate claim identity in manifest: {identity!r}")
             claim_identities.add(identity)
 
-        stats = storage.re_evidence_stats(project, binary_id=binary_id)
-        if stats["artifacts"] or sum(stats["claims"].values()):
-            raise EvidenceInputError(
-                "archive import requires an empty project/build scope")
-
         # Pass 2: re-read validated members and restore inside one outer
-        # transaction. Storage methods create nested savepoints; any later
-        # failure rolls the complete import back at the outer boundary.
+        # transaction. The database-scoped lock serializes this destination
+        # across daemon processes/connections; emptiness is rechecked only
+        # after acquiring it. Storage methods create nested savepoints; any
+        # later failure rolls the complete import back at the outer boundary.
         id_map: dict[int, int] = {}
         with storage._txn():
+            storage.conn.execute(
+                "SELECT pg_advisory_xact_lock(hashtextextended(%s, 0))",
+                (_archive_scope_lock_key(project, binary_id),))
+            stats = storage.re_evidence_stats(project, binary_id=binary_id)
+            if stats["artifacts"] or sum(stats["claims"].values()):
+                raise EvidenceInputError(
+                    "archive import requires an empty project/build scope")
             for item, member in validated:
                 parsed = parse_evidence_bytes(
                     archive.read(member),

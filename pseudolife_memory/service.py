@@ -36,6 +36,7 @@ import logging
 import os
 import re
 import time
+from contextlib import contextmanager
 from pathlib import Path
 from threading import Lock
 from typing import Any
@@ -1040,21 +1041,45 @@ class MemoryService(DreamOps):
         self, *, project: str, binary_id: str, path: str,
     ) -> dict[str, Any]:
         from pseudolife_memory.re_evidence import export_evidence_archive
+        from psycopg import IsolationLevel
 
+        with self._re_evidence_archive_storage() as storage:
+            # One stable manifest even if another daemon writes concurrently;
+            # the snapshot stays open during ZIP I/O without blocking writes.
+            with storage.conn.transaction(
+                    isolation_level=IsolationLevel.REPEATABLE_READ,
+                    read_only=True):
+                return export_evidence_archive(
+                    storage, path=path, project=project, binary_id=binary_id,
+                    archive_root=self._re_evidence_archive_root())
+
+    def _re_evidence_archive_root(self) -> Path:
+        configured = os.environ.get("PSEUDOLIFE_RE_EVIDENCE_ARCHIVE_ROOT")
+        return (Path(configured).expanduser().resolve() if configured else
+                (self.data_dir / "re_evidence_archives").resolve())
+
+    @contextmanager
+    def _re_evidence_archive_storage(self):
+        """Give archive I/O its own connection, outside the coarse service
+        lock, so a large ZIP cannot stall unrelated memory calls."""
         with self._lock:
-            storage = self._ensure_postgres_storage()
-            return export_evidence_archive(
-                storage, path=path, project=project, binary_id=binary_id)
+            dsn = self._ensure_postgres_storage().dsn
+        from pseudolife_memory.storage.postgres import PostgresStorage
+        storage = PostgresStorage(dsn)
+        try:
+            yield storage
+        finally:
+            storage.close()
 
     def re_evidence_import(
         self, *, project: str, binary_id: str, path: str,
     ) -> dict[str, Any]:
         from pseudolife_memory.re_evidence import import_evidence_archive
 
-        with self._lock:
-            storage = self._ensure_postgres_storage()
+        with self._re_evidence_archive_storage() as storage:
             return import_evidence_archive(
-                storage, path=path, project=project, binary_id=binary_id)
+                storage, path=path, project=project, binary_id=binary_id,
+                archive_root=self._re_evidence_archive_root())
 
     def re_evidence_stats(
         self, *, project: str, binary_id: str | None = None,
