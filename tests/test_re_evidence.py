@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import json
 import threading
+import time
+from contextlib import nullcontext
 
 import pytest
 
@@ -104,17 +106,12 @@ def test_storage_lists_re_evidence_scopes_with_counts(pg_url, pg_conn):
             })
 
         old_id = add("srfn-client", "client:old", "00100000", "1")
-        add("srfn-client", "client:new", "00200000", "2")
         storage.upsert_re_claim(
             project="srfn-client", binary_id="client:old", subject="00100000",
             claim="old build behavior", status="verified",
             evidence_ids=[old_id], confidence=1.0)
-        storage.conn.execute(
-            "UPDATE re_evidence_artifacts SET ingested_at = 1 "
-            "WHERE project = 'srfn-client' AND binary_id = 'client:old'")
-        storage.conn.execute(
-            "UPDATE re_claims SET created_at = 1, updated_at = 1 "
-            "WHERE project = 'srfn-client' AND binary_id = 'client:old'")
+        time.sleep(0.001)
+        add("srfn-client", "client:new", "00200000", "2")
 
         scopes = storage.re_evidence_scopes()
 
@@ -255,6 +252,53 @@ def test_claim_update_replaces_its_evidence_set(pg_url, pg_conn):
         storage.close()
 
 
+def test_claim_update_preserves_links_when_evidence_ids_are_omitted(
+        pg_url, pg_conn):
+    from pseudolife_memory.storage.postgres import PostgresStorage
+
+    storage = PostgresStorage(pg_url)
+    try:
+        evidence_id = storage.insert_re_evidence({
+            "project": "srfn-client", "kind": "ghidra-function",
+            "locator": "00b72870", "source_path": "evidence/a.json",
+            "content_hash": "9" * 64, "payload": {"address": "00b72870"},
+            "summary": None, "binary_id": "client:test",
+            "addresses": ["00b72870"], "raw_bytes": b"{}",
+            "payload_keys": ["address"],
+        })
+        storage.upsert_re_claim(
+            project="srfn-client", binary_id="client:test", subject="00b72870",
+            claim="collision dispatch succeeds", status="observed",
+            evidence_ids=[evidence_id])
+
+        storage.upsert_re_claim(
+            project="srfn-client", binary_id="client:test", subject="00b72870",
+            claim="collision dispatch succeeds", status="verified")
+        rows = storage.query_re_claims(
+            project="srfn-client", binary_id="client:test", subject="00b72870")
+        assert rows[0]["status"] == "verified"
+        assert rows[0]["evidence_ids"] == [evidence_id]
+
+        storage.upsert_re_claim(
+            project="srfn-client", binary_id="client:test", subject="00b72870",
+            claim="collision dispatch succeeds", status="hypothesis")
+
+        rows = storage.query_re_claims(
+            project="srfn-client", binary_id="client:test", subject="00b72870")
+        assert rows[0]["status"] == "hypothesis"
+        assert rows[0]["evidence_ids"] == [evidence_id]
+
+        storage.upsert_re_claim(
+            project="srfn-client", binary_id="client:test", subject="00b72870",
+            claim="collision dispatch succeeds", status="hypothesis",
+            evidence_ids=[])
+        rows = storage.query_re_claims(
+            project="srfn-client", binary_id="client:test", subject="00b72870")
+        assert rows[0]["evidence_ids"] == []
+    finally:
+        storage.close()
+
+
 def test_replay_with_conflicting_metadata_is_rejected(pg_url, pg_conn):
     from pseudolife_memory.re_evidence import EvidenceInputError
     from pseudolife_memory.storage.postgres import PostgresStorage
@@ -275,6 +319,37 @@ def test_replay_with_conflicting_metadata_is_rejected(pg_url, pg_conn):
             storage.insert_re_evidence(artifact)
     finally:
         storage.close()
+
+
+def test_replay_missing_after_conflict_is_a_clean_input_error():
+    from pseudolife_memory.re_evidence import EvidenceInputError
+    from pseudolife_memory.storage.postgres import PostgresStorage
+
+    class Result:
+        def fetchone(self):
+            return None
+
+    class Connection:
+        closed = False
+        broken = False
+
+        def execute(self, *_args, **_kwargs):
+            return Result()
+
+    storage = PostgresStorage.__new__(PostgresStorage)
+    storage._conn = Connection()
+    storage._txn = lambda: nullcontext()
+    artifact = {
+        "project": "srfn-client", "kind": "ghidra-function",
+        "locator": "00b72870", "source_path": "evidence/a.json",
+        "content_hash": "8" * 64, "payload": {"address": "00b72870"},
+        "summary": None, "binary_id": "client:test",
+        "addresses": ["00b72870"], "raw_bytes": b"{}",
+        "payload_keys": ["address"],
+    }
+
+    with pytest.raises(EvidenceInputError, match="concurrent replay"):
+        storage.insert_re_evidence(artifact)
 
 
 def test_address_query_plan_can_use_gin_index(pg_url, pg_conn):
@@ -354,6 +429,37 @@ def test_database_rejects_cross_build_link_and_link_reassignment(pg_conn):
             pg_conn.execute(
                 "UPDATE re_evidence_artifacts SET binary_id = 'build:b' "
                 "WHERE id = %s", (evidence_a,))
+
+
+@pytest.mark.parametrize("assignment", [
+    "raw_bytes = decode('00', 'hex')",
+    "payload = '{\"forged\": true}'::jsonb",
+    "content_hash = repeat('f', 64)",
+    "locator = 'deadbeef'",
+    "source_path = 'forged.json'",
+    "kind = 'forged'",
+    "summary = 'forged'",
+    "addresses = ARRAY['deadbeef']::text[]",
+    "payload_keys = ARRAY['forged']::text[]",
+    "ingested_at = 2",
+])
+def test_database_rejects_every_artifact_update(pg_conn, assignment):
+    import psycopg
+
+    evidence_id = int(pg_conn.execute(
+        "INSERT INTO re_evidence_artifacts "
+        "(project, binary_id, kind, locator, source_path, content_hash, "
+        "raw_bytes, payload, payload_keys, addresses, ingested_at) "
+        "VALUES ('srfn-client', 'build:a', 'ghidra-function', '00b72870', "
+        "'evidence.json', %s, '{}'::bytea, '{}'::jsonb, '{}', '{}', 1) "
+        "RETURNING id", ("7" * 64,)).fetchone()[0])
+    pg_conn.commit()
+
+    with pytest.raises(psycopg.errors.CheckViolation, match="immutable"):
+        with pg_conn.transaction():
+            pg_conn.execute(
+                f"UPDATE re_evidence_artifacts SET {assignment} WHERE id = %s",
+                (evidence_id,))
 
 
 def test_portable_archive_round_trip_preserves_original_bytes(pg_url, pg_conn, tmp_path):

@@ -6,6 +6,21 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Fixed (2026-09-01 — RE evidence integrity review)
+- **RE evidence artifacts are now fully immutable at the PostgreSQL
+  boundary.** The maintenance-SQL trigger previously protected only project
+  and build scope, allowing bytes, payload, locator, and a matching hash to be
+  forged together underneath already-verified claims. Every artifact update is
+  now rejected; regression probes cover all stored content and metadata.
+- **Claim updates preserve evidence links when `evidence_ids` is omitted.** An
+  explicit list still replaces the complete set and `[]` explicitly clears it,
+  preventing a downgrade to `hypothesis` from silently discarding provenance.
+  Concurrent artifact replay now returns a clean input error if the conflicting
+  row disappears before verification instead of dereferencing `None`.
+- **RE evidence documentation surfaces are current:** Atlas tool counts and
+  Console panels include the 36th/core-23 RE tool, and the toolset description
+  advertises strict RE evidence.
+
 ### Added (2026-08-31 — strict reverse-engineering evidence pilot)
 - **Added the independently versioned `v34-rehub` reverse-engineering proof
   store and the core-tier
@@ -438,6 +453,7 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   (`publish`/`registry`: `id-token`, `images`: `packages`). Previously
   these jobs ran with the repository's default token, which can write
   repo contents.
+
 ### Fixed (2026-08-28 — Codex hook trust is an explicit install step)
 - **Codex now requires every new or changed lifecycle hook to be reviewed and
   trusted before it runs, but the hook installers reported success without

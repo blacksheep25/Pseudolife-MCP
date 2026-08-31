@@ -616,7 +616,8 @@ async def memory_toolset(
 ) -> dict[str, Any]:
     """Adjust YOUR visible toolset, one tier at a time (minimal → core →
     full; scoped to your credential/writer identity, free, instant). Core
-    adds graph/recall, world facts, lessons, documents; full adds
+    adds graph/recall, world facts, lessons, documents and strict RE evidence;
+    full adds
     supersede/forget/history, dream and graph-review admin. ``status``
     reports the ladder. Expand first: clients reject hidden-tool calls.
     """
@@ -1773,7 +1774,8 @@ def re_evidence(
                       Field(description="Claim status; observed, verified, and "
                                         "rejected require evidence_ids.")] = None,
     evidence_ids: Annotated[list[int] | None, Field(
-        description="For claim: immutable artifact ids supporting the status.")] = None,
+        description="For claim: immutable artifact ids supporting the status. "
+                    "Omit to preserve existing links; pass [] to clear them.")] = None,
     confidence: Annotated[float | None, Field(
         description="Optional claim confidence from 0 through 1; not proof.")] = None,
     address: Annotated[str | None, Field(
