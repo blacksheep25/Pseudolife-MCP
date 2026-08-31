@@ -189,6 +189,23 @@ def test_re_evidence_dispatches_ingest_and_claim(monkeypatch) -> None:
     assert seen[1][1]["evidence_ids"] == [7]
 
 
+def test_re_evidence_coerces_stringified_evidence_ids(monkeypatch) -> None:
+    from pseudolife_memory import mcp_server
+
+    seen = []
+    monkeypatch.setattr(
+        mcp_server.service, "re_claim_record",
+        lambda **kw: seen.append(kw) or {"id": 8, "status": kw["status"]})
+
+    result = _invoke("re_evidence", {
+        "action": "claim", "project": "srfn-client", "binary_id": "client:test",
+        "subject": "00b72870", "claim": "calls 00b72510",
+        "status": "observed", "evidence_ids": "[7, 9]"})
+
+    assert result == {"id": 8, "status": "observed"}
+    assert seen[0]["evidence_ids"] == [7, 9]
+
+
 def test_get_neighbors_tool_is_gone() -> None:
     from pseudolife_memory import mcp_server  # noqa: PLC0415
     names = {t.name for t in asyncio.run(mcp_server.mcp.list_tools())}

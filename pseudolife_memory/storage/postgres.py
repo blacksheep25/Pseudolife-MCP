@@ -1007,6 +1007,10 @@ class PostgresStorage:
                 (artifact["project"], artifact["binary_id"],
                  artifact["content_hash"], artifact["locator"]),
             ).fetchone()
+            if existing is None:
+                raise EvidenceInputError(
+                    "concurrent replay conflict disappeared before the stored "
+                    "artifact could be verified; retry the ingest")
             expected = (
                 artifact["kind"], artifact.get("summary"),
                 list(artifact.get("addresses") or []),
@@ -1076,11 +1080,26 @@ class PostgresStorage:
     ) -> int:
         from pseudolife_memory.re_evidence import EvidenceInputError, validate_claim
 
+        preserve_links = evidence_ids is None
         project, binary_id, subject, claim, ids, confidence = validate_claim(
             project=project, binary_id=binary_id, subject=subject, claim=claim, status=status,
-            evidence_ids=evidence_ids, confidence=confidence)
+            evidence_ids=evidence_ids, confidence=confidence,
+            require_evidence=not preserve_links)
         now = time.time()
         with self._txn():
+            if preserve_links and status.strip().lower() in (
+                    "observed", "verified", "rejected"):
+                linked = self.conn.execute(
+                    "SELECT count(*) FROM re_claims c "
+                    "JOIN re_claim_evidence l ON l.claim_id = c.id "
+                    "WHERE c.project = %s AND c.binary_id = %s "
+                    "AND c.subject = %s AND c.claim = %s",
+                    (project, binary_id, subject, claim),
+                ).fetchone()[0]
+                if not linked:
+                    raise EvidenceInputError(
+                        f"claim status {status.strip().lower()!r} requires "
+                        "linked evidence")
             if ids:
                 rows = self.conn.execute(
                     "SELECT id FROM re_evidence_artifacts "
@@ -1108,15 +1127,16 @@ class PostgresStorage:
                 (project, binary_id, subject, claim, status, confidence, now, now),
             ).fetchone()
             claim_id = int(row[0])
-            self.conn.execute(
-                "DELETE FROM re_claim_evidence WHERE claim_id = %s", (claim_id,))
-            for evidence_id in ids:
+            if not preserve_links:
                 self.conn.execute(
-                    "INSERT INTO re_claim_evidence "
-                    "(claim_id, evidence_id, linked_at) VALUES (%s, %s, %s) "
-                    "ON CONFLICT (claim_id, evidence_id) DO NOTHING",
-                    (claim_id, evidence_id, now),
-                )
+                    "DELETE FROM re_claim_evidence WHERE claim_id = %s", (claim_id,))
+                for evidence_id in ids:
+                    self.conn.execute(
+                        "INSERT INTO re_claim_evidence "
+                        "(claim_id, evidence_id, linked_at) VALUES (%s, %s, %s) "
+                        "ON CONFLICT (claim_id, evidence_id) DO NOTHING",
+                        (claim_id, evidence_id, now),
+                    )
         return claim_id
 
     def query_re_claims(

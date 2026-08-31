@@ -3510,6 +3510,9 @@ updated in place.
 Claims are separate records. `hypothesis` and `todo` may be recorded without
 proof; `observed`, `verified`, and `rejected` require at least one artifact id
 from the same project. Confidence is metadata and never relaxes this rule.
+Updating a claim without `evidence_ids` preserves its current links. Passing an
+explicit empty list clears them (and is therefore valid only for `hypothesis`
+or `todo`); passing a non-empty list replaces the complete link set.
 
 The authoritative sources remain the binary-analysis export, packet capture,
 runtime log, asset, or other artifact producer. Pseudolife indexes a copy and

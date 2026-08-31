@@ -281,7 +281,7 @@
    "x": 940,
    "y": 160,
    "t": "mcp_server.py",
-   "s": "MCPServer (SDK v2) · 35 tools",
+   "s": "MCPServer (SDK v2) · 36 tools",
    "p": "pseudolife_memory/mcp_server.py",
    "d": [
     "Every tool is a thin tier-tagged wrapper over MemoryService",
@@ -300,7 +300,7 @@
    "d": [
     "Resolution: principal override → tier map → env default (core)",
     "12h-TTL principal overrides (PrincipalTierState); visibility is a token lever, NOT security",
-    "core = 22 of 35 tools; minimal = 9; auth is the bearer token"
+    "core = 23 of 36 tools; minimal = 9; auth is the bearer token"
    ]
   },
   {
@@ -368,7 +368,7 @@
    "s": "vanilla JS · /ui/",
    "p": "pseudolife_memory/web/static/",
    "d": [
-    "Panels: Observatory · Cortex · World · Lessons · Stream · Recall · Graph (3D galaxy) · Insight · Episodes · Console",
+    "Panels: Observatory · Cortex · World · Lessons · Stream · Recall · Graph (3D galaxy) · Insight · Episodes · RE Evidence · Console",
     "Hash-routed, REST-only; 401 anywhere → token modal",
     "Dev harness: web/devserver.py on :8770 against FixtureService"
    ]
@@ -1335,7 +1335,7 @@
   {
    "f": "mcpsrv",
    "t": "service",
-   "l": "35 tools → service.*",
+   "l": "36 tools → service.*",
    "k": "data"
   },
   {

@@ -512,3 +512,11 @@ def test_docs_tool_tier_counts_match_code() -> None:
         got = tuple(int(g) for g in m.groups())
         want = (counts["minimal"], counts["core"], counts["full"])
         assert got == want, f"{site.name} states tiers {got}, code has {want}"
+
+
+def test_codex_hook_changelog_subsection_keeps_its_separator() -> None:
+    changelog = (_README.parent / "CHANGELOG.md").read_text(encoding="utf-8")
+    header = "### Fixed (2026-08-28 — Codex hook trust is an explicit install step)"
+    before, separator, _after = changelog.partition(header)
+    assert separator, "Codex hook trust changelog subsection is missing"
+    assert before.endswith("\n\n"), "changelog subsection must follow a blank line"

@@ -133,6 +133,7 @@ def parse_evidence_bytes(raw: bytes, *, source_path: str) -> dict[str, Any]:
 def validate_claim(
     *, project: str, binary_id: str, subject: str, claim: str, status: str,
     evidence_ids: list[int] | None, confidence: float | None,
+    require_evidence: bool = True,
 ) -> tuple[str, str, str, str, list[int], float | None]:
     """Normalize a claim and enforce the evidence gate before persistence."""
     project = project.strip()
@@ -147,7 +148,7 @@ def validate_claim(
         raise EvidenceInputError(
             f"invalid claim status {status!r}; expected one of {sorted(CLAIM_STATUSES)}")
     ids = sorted({int(value) for value in (evidence_ids or [])})
-    if status in EVIDENCE_REQUIRED_STATUSES and not ids:
+    if require_evidence and status in EVIDENCE_REQUIRED_STATUSES and not ids:
         raise EvidenceInputError(f"claim status {status!r} requires linked evidence")
     if confidence is not None and not 0.0 <= float(confidence) <= 1.0:
         raise EvidenceInputError("confidence must be between 0 and 1")

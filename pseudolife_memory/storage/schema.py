@@ -919,21 +919,17 @@ def ensure_schema(conn) -> dict:
             )
             """
         )
-        # A linked proof artifact cannot be moved into another project/build by
-        # maintenance SQL. Keeping scope immutable also makes the uniqueness
-        # and claim-link invariants stable for the artifact's lifetime.
+        # Proof artifacts are append-only even for maintenance SQL. Rejecting
+        # every UPDATE protects the bytes/hash pair and all derived metadata;
+        # otherwise an operator could forge both bytes and hash while linked
+        # verified claims continued to look proven.
         cur.execute(
             """
             CREATE OR REPLACE FUNCTION enforce_re_artifact_scope_immutable()
             RETURNS TRIGGER AS $$
             BEGIN
-              IF NEW.project IS DISTINCT FROM OLD.project
-                  OR NEW.binary_id IS DISTINCT FROM OLD.binary_id THEN
-                RAISE EXCEPTION
-                  'RE evidence artifact project/binary_id is immutable'
-                  USING ERRCODE = '23514';
-              END IF;
-              RETURN NEW;
+              RAISE EXCEPTION 'RE evidence artifacts are immutable'
+                USING ERRCODE = '23514';
             END;
             $$ LANGUAGE plpgsql
             """
@@ -943,7 +939,7 @@ def ensure_schema(conn) -> dict:
             "ON re_evidence_artifacts")
         cur.execute(
             "CREATE TRIGGER re_artifact_scope_immutable "
-            "BEFORE UPDATE OF project, binary_id ON re_evidence_artifacts "
+            "BEFORE UPDATE ON re_evidence_artifacts "
             "FOR EACH ROW EXECUTE FUNCTION enforce_re_artifact_scope_immutable()")
         # Deferred DB-level proof gate. Python validates before write for a
         # useful error at the API boundary; these triggers protect the same
