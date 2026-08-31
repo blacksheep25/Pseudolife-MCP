@@ -98,14 +98,14 @@ re_evidence(
 No repository build, test, or stage gate should depend on this tool. To stop
 using it, disable the MCP registration or service and continue with the
 original evidence workflow. Before removing its database, export a portable
-archive to a new server-visible path:
+archive to a new path beneath the daemon's configured archive root:
 
 ```text
 re_evidence(
   action="export",
   project="example-client",
   binary_id="client.exe:sha256:<required-digest>",
-  path="X:\\backups\\example-client-proof.zip"
+  path="example-client-proof.zip"
 )
 ```
 
@@ -115,6 +115,16 @@ project/build scope after validating the entire archive and every artifact
 hash. Export refuses to overwrite an existing file. Artifact count, claim
 count, manifest size, aggregate uncompressed bytes, and compression ratio are
 bounded so an archive cannot monopolize the daemon indefinitely.
+
+Archive paths are resolved beneath `PSEUDOLIFE_RE_EVIDENCE_ARCHIVE_ROOT`,
+which defaults to `<data_dir>/re_evidence_archives` (and to
+`/data/re_evidence_archives` in Docker compose). Relative paths are preferred;
+absolute paths, `..`, and symlinks cannot escape that root. Export reads from a
+consistent PostgreSQL snapshot, and both export and import use a dedicated
+database connection so ZIP file I/O does not block unrelated MCP requests.
+The archive root is trusted daemon state and should be writable only by the
+daemon account; path confinement is not a sandbox against another local
+process that can replace files in that directory while an operation is open.
 
 The tool requires Postgres (the normal durable or lite tier). It deliberately
 does not fall back to the legacy file-only memory path because proof records

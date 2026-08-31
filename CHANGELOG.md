@@ -6,6 +6,21 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Security (2026-09-01 — RE evidence archive and pilot hardening)
+- **RE evidence archives are confined to a configured server-side root.**
+  Export/import paths can no longer write or read arbitrary daemon-visible
+  files; traversal and symlink escapes are rejected. Docker persists the
+  default `/data/re_evidence_archives` root in its state volume.
+- **Archive work no longer holds the service-wide storage lock during ZIP
+  I/O.** Export uses a dedicated connection and a read-only, repeatable-read
+  snapshot; import also uses a dedicated connection plus a transaction-scoped
+  project/build lock, keeping unrelated MCP requests responsive while
+  serializing same-scope restores and retaining atomic database writes.
+- **Startup now refuses incompatible unpublished RE pilot table shapes.**
+  Column types, nullability, sequence/array defaults, and exact primary,
+  unique, check, and foreign-key semantics are checked after idempotent DDL so
+  an older pilot cannot be mistaken for `v34-rehub`.
+
 ### Fixed (2026-09-01 — RE evidence integrity review)
 - **RE evidence artifacts are now fully immutable at the PostgreSQL
   boundary.** The maintenance-SQL trigger previously protected only project

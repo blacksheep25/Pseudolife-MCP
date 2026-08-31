@@ -119,6 +119,7 @@ services:
       PSEUDOLIFE_MCP_HOST: 0.0.0.0
       PSEUDOLIFE_MCP_PORT: "8765"
       PSEUDOLIFE_MCP_DATA_DIR: /data
+      PSEUDOLIFE_RE_EVIDENCE_ARCHIVE_ROOT: ${PSEUDOLIFE_RE_EVIDENCE_ARCHIVE_ROOT:-/data/re_evidence_archives}
       # Local timezone for daemon-generated episode titles (the container is
       # UTC by default). Set TZ in ops/.env to your zone (e.g. Australia/Sydney)
       # so "session - YYYY-MM-DD HH:MM" titles read in local time.

@@ -23,6 +23,59 @@ SCHEMA_META_VERSION = 34
 # an upstream migration.
 REHUB_SCHEMA_VERSION = "v34-rehub"
 
+_REHUB_COLUMNS = {
+    "re_evidence_artifacts": {
+        "id": ("int8", "NO"), "project": ("text", "NO"),
+        "kind": ("text", "NO"), "locator": ("text", "NO"),
+        "source_path": ("text", "NO"), "content_hash": ("text", "NO"),
+        "raw_bytes": ("bytea", "NO"), "payload": ("jsonb", "NO"),
+        "payload_keys": ("_text", "NO"), "summary": ("text", "YES"),
+        "binary_id": ("text", "NO"), "addresses": ("_text", "NO"),
+        "ingested_at": ("float8", "NO"),
+    },
+    "re_claims": {
+        "id": ("int8", "NO"), "project": ("text", "NO"),
+        "binary_id": ("text", "NO"), "subject": ("text", "NO"),
+        "claim": ("text", "NO"), "status": ("text", "NO"),
+        "confidence": ("float4", "YES"), "created_at": ("float8", "NO"),
+        "updated_at": ("float8", "NO"),
+    },
+    "re_claim_evidence": {
+        "claim_id": ("int8", "NO"), "evidence_id": ("int8", "NO"),
+        "linked_at": ("float8", "NO"),
+    },
+}
+
+_REHUB_DEFAULTS = {
+    "re_evidence_artifacts": {
+        "id": "nextval('re_evidence_artifacts_id_seq'::regclass)",
+        "payload_keys": "'{}'::text[]",
+        "addresses": "'{}'::text[]",
+    },
+    "re_claims": {
+        "id": "nextval('re_claims_id_seq'::regclass)",
+    },
+}
+
+_REHUB_CONSTRAINT_DEFINITIONS = {
+    "re_evidence_artifacts": {
+        "PRIMARY KEY (id)",
+        "UNIQUE (project, binary_id, content_hash, locator)",
+    },
+    "re_claims": {
+        "PRIMARY KEY (id)",
+        "UNIQUE (project, binary_id, subject, claim)",
+        "CHECK ((status = ANY (ARRAY['hypothesis'::text, 'todo'::text, "
+        "'observed'::text, 'verified'::text, 'rejected'::text])))",
+    },
+    "re_claim_evidence": {
+        "PRIMARY KEY (claim_id, evidence_id)",
+        "FOREIGN KEY (claim_id) REFERENCES re_claims(id) ON DELETE CASCADE",
+        "FOREIGN KEY (evidence_id) REFERENCES re_evidence_artifacts(id) "
+        "ON DELETE RESTRICT",
+    },
+}
+
 SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS meta (
   key TEXT PRIMARY KEY,
@@ -454,6 +507,85 @@ def _refuse_on_embedding_dim_mismatch(cur) -> None:
         )
 
 
+def _assert_rehub_table_shape(cur, table: str) -> None:
+    """Refuse a pre-release pilot table that ``CREATE IF NOT EXISTS`` cannot
+    safely reconcile. Additive extension DDL may grow these maps deliberately;
+    known columns may never silently change type or nullability."""
+    expected = _REHUB_COLUMNS[table]
+    rows = cur.execute(
+        "SELECT column_name, udt_name, is_nullable, column_default "
+        "FROM information_schema.columns "
+        "WHERE table_schema = 'public' AND table_name = %s",
+        (table,),
+    ).fetchall()
+    actual = {name: (udt_name, nullable)
+              for name, udt_name, nullable, _default in rows}
+    problems = [
+        f"{name} expected {kind[0]}/{kind[1]}, got "
+        f"{actual.get(name, 'missing')}"
+        for name, kind in expected.items()
+        if actual.get(name) != kind
+    ]
+    unexpected_required = [
+        name for name, _udt_name, nullable, default in rows
+        if name not in expected and nullable == "NO" and default is None
+    ]
+    if unexpected_required:
+        problems.append(
+            "unexpected required columns without defaults "
+            f"{sorted(unexpected_required)}")
+    if problems:
+        raise RuntimeError(
+            f"incompatible {REHUB_SCHEMA_VERSION} extension schema in "
+            f"{table}: " + "; ".join(problems) + ". Restore a backup or "
+            "migrate the unpublished pilot tables before starting the daemon.")
+    expected_defaults = _REHUB_DEFAULTS.get(table, {})
+    if expected_defaults:
+        rows = cur.execute(
+            "SELECT column_name, column_default "
+            "FROM information_schema.columns "
+            "WHERE table_schema = 'public' AND table_name = %s",
+            (table,),
+        ).fetchall()
+        actual_defaults = dict(rows)
+        default_problems = [
+            f"{name} default expected {expected!r}, got "
+            f"{actual_defaults.get(name)!r}"
+            for name, expected in expected_defaults.items()
+            if actual_defaults.get(name) != expected
+        ]
+        if default_problems:
+            raise RuntimeError(
+                f"incompatible {REHUB_SCHEMA_VERSION} extension schema in "
+                f"{table}: " + "; ".join(default_problems) + ". Restore a "
+                "backup or migrate the unpublished pilot tables before "
+                "starting the daemon.")
+
+
+def _assert_rehub_constraints(cur) -> None:
+    problems = []
+    for table, expected in _REHUB_CONSTRAINT_DEFINITIONS.items():
+        rows = cur.execute(
+            "SELECT pg_get_constraintdef(c.oid) "
+            "FROM pg_constraint c "
+            "WHERE c.conrelid = to_regclass(%s) "
+            "AND c.contype IN ('p', 'u', 'f', 'c')",
+            (f"public.{table}",),
+        ).fetchall()
+        actual = {definition for definition, in rows}
+        missing = sorted(expected - actual)
+        unexpected = sorted(actual - expected)
+        if missing or unexpected:
+            problems.append(
+                f"{table} constraint mismatch; missing={missing}, "
+                f"unexpected={unexpected}")
+    if problems:
+        raise RuntimeError(
+            f"incompatible {REHUB_SCHEMA_VERSION} extension schema: "
+            + "; ".join(problems) + ". Restore a backup or migrate the "
+            "unpublished pilot tables before starting the daemon.")
+
+
 def ensure_schema(conn) -> dict:
     """Create extensions + tables idempotently. Returns capability flags.
 
@@ -879,6 +1011,7 @@ def ensure_schema(conn) -> dict:
             )
             """
         )
+        _assert_rehub_table_shape(cur, "re_evidence_artifacts")
         cur.execute(
             "CREATE INDEX IF NOT EXISTS re_evidence_project_idx "
             "ON re_evidence_artifacts (project, binary_id, locator)"
@@ -904,6 +1037,7 @@ def ensure_schema(conn) -> dict:
             )
             """
         )
+        _assert_rehub_table_shape(cur, "re_claims")
         cur.execute(
             "CREATE INDEX IF NOT EXISTS re_claims_project_subject_idx "
             "ON re_claims (project, binary_id, subject, status)"
@@ -919,6 +1053,8 @@ def ensure_schema(conn) -> dict:
             )
             """
         )
+        _assert_rehub_table_shape(cur, "re_claim_evidence")
+        _assert_rehub_constraints(cur)
         # Proof artifacts are append-only even for maintenance SQL. Rejecting
         # every UPDATE protects the bytes/hash pair and all derived metadata;
         # otherwise an operator could forge both bytes and hash while linked
