@@ -7,10 +7,10 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ## [Unreleased]
 
 ### Fixed (2026-09-05 — Firefox Console controls)
-- **The topbar's Live/Dream status dots are now static.** Their animated
-  box-shadow forced repeated compositing of the blurred status layer and could
-  make adjacent health/storage chips flicker rapidly in Firefox-family
-  browsers such as Zen.
+- **Healthy Live/Postgres status dots are now static across every view.** Their
+  animated box-shadow forced repeated compositing and could make adjacent
+  health/storage chips flicker rapidly in Firefox-family browsers such as Zen;
+  warning and activity indicators retain their pulse treatment.
 - **The Graph growth-replay button now responds under reduced-motion.** The
   graph simulation and camera remain motion-reduced, while the explicitly
   requested visibility replay starts immediately and exposes correct

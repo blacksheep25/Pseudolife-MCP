@@ -148,17 +148,17 @@ def test_devserver_fixture_bank_carries_markup_shaped_entity_name():
     )
 
 
-def test_topbar_status_dots_are_static():
-    """Operational state must not continuously repaint the blurred topbar.
+def test_all_green_status_dots_are_static():
+    """Healthy state chips must stay static on every Console view.
 
-    Firefox-family browsers can flicker the neighbouring status chips when an
-    animated box-shadow is composited inside a backdrop-filter layer.  A
-    health indicator is a state, not an activity spinner, so the topbar keeps
-    its dot but suppresses the global pulse animation there.
+    Observatory renders its Postgres health chip outside ``.topbar-status``,
+    so a topbar-only override leaves the same Firefox box-shadow compositing
+    flicker active on that view.  Green state is stable; warning activity may
+    continue to use the pulse treatment.
     """
     src = STYLES_CSS.read_text(encoding="utf-8")
-    rule = re.search(r"\.topbar-status\s+\.pulse-dot\s*\{([^}]+)\}", src)
-    assert rule, "topbar needs an explicit Firefox-safe pulse-dot override"
+    rule = re.search(r"\.chip\.ok\s+\.pulse-dot\s*\{([^}]+)\}", src)
+    assert rule, "all green health chips need a Firefox-safe static dot"
     body = rule.group(1).replace(" ", "")
     assert "animation:none" in body
     assert "box-shadow:none" in body
