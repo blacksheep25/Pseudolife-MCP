@@ -17,6 +17,11 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   requested visibility replay starts immediately and exposes correct
   play/pause state to assistive technology instead of silently ignoring the
   click.
+- **Daemon rebuilds now cache dependencies and embedding models independently
+  from application source.** Ordinary CSS, JavaScript, and Python edits rebuild
+  only the small local-package layer instead of downloading and baking both
+  embedding models again; a shared BuildKit download cache also preserves model
+  bytes across interrupted or failed builds so slow transfers can resume.
 
 ### Security (2026-09-01 — RE evidence archive and pilot hardening)
 - **RE evidence archives are confined to a configured server-side root.**

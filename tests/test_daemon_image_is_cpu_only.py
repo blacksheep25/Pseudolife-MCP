@@ -149,6 +149,49 @@ def test_dockerfile_installs_torch_from_the_cpu_wheel_index() -> None:
     )
 
 
+def test_source_changes_do_not_invalidate_dependencies_or_baked_models() -> None:
+    """CSS/JS/Python edits must not trigger the multi-GB model downloads.
+
+    Docker invalidates every layer after a changed ``COPY``.  Keep the pinned
+    runtime dependency install and both network-bound model bakes ahead of the
+    application-source copy, then install the local package without resolving
+    dependencies again.  This makes ordinary code deploys rebuild only the
+    small package layer.
+    """
+    dockerfile = _DOCKERFILE.read_text(encoding="utf-8")
+    lock_install = dockerfile.index(
+        "pip install -r /app/requirements.lock.txt"
+    )
+    qwen_bake = dockerfile.index(
+        "SentenceTransformer('Qwen/Qwen3-Embedding-0.6B')"
+    )
+    minilm_bake = dockerfile.index(
+        "SentenceTransformer('all-MiniLM-L6-v2')"
+    )
+    source_copy = dockerfile.index("COPY pseudolife_memory /app/pseudolife_memory")
+    assert lock_install < qwen_bake < minilm_bake < source_copy, (
+        "dependency/model layers must precede the source COPY or every code "
+        "edit redownloads the embedding models"
+    )
+    assert 'pip install --no-deps "/app"' in dockerfile[source_copy:], (
+        "the post-COPY app install must not resolve the already-pinned runtime "
+        "dependencies again"
+    )
+
+
+def test_model_downloads_survive_interrupted_builds() -> None:
+    """A slow/failed model fetch must resume from BuildKit's cache mount."""
+    dockerfile = _DOCKERFILE.read_text(encoding="utf-8")
+    cache_mount = "--mount=type=cache,id=pseudolife-hf,target=/tmp/hf-cache"
+    assert dockerfile.count(cache_mount) == 2, (
+        "both embedding-model bake steps must share the persistent HF cache"
+    )
+    assert dockerfile.count("HF_HOME=/tmp/hf-cache") == 2
+    assert dockerfile.count("cp -a /tmp/hf-cache/. /opt/hf/") == 2, (
+        "cached downloads must be copied into the final offline image"
+    )
+
+
 # ── the actual regression: a ceiling collision, not a floor ───────────────
 
 
