@@ -6,6 +6,17 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Fixed (2026-09-05 — Firefox Console controls)
+- **The topbar's Live/Dream status dots are now static.** Their animated
+  box-shadow forced repeated compositing of the blurred status layer and could
+  make adjacent health/storage chips flicker rapidly in Firefox-family
+  browsers such as Zen.
+- **The Graph growth-replay button now responds under reduced-motion.** The
+  graph simulation and camera remain motion-reduced, while the explicitly
+  requested visibility replay starts immediately and exposes correct
+  play/pause state to assistive technology instead of silently ignoring the
+  click.
+
 ### Security (2026-09-01 — RE evidence archive and pilot hardening)
 - **RE evidence archives are confined to a configured server-side root.**
   Export/import paths can no longer write or read arbitrary daemon-visible

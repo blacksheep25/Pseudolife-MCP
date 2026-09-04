@@ -31,6 +31,10 @@ GALAXY_JS = (
     Path(__file__).resolve().parent.parent
     / "pseudolife_memory" / "web" / "static" / "js" / "galaxy.js"
 )
+STYLES_CSS = (
+    Path(__file__).resolve().parent.parent
+    / "pseudolife_memory" / "web" / "static" / "css" / "styles.css"
+)
 
 
 def _extract_call_arg(source: str, call_name: str) -> str:
@@ -141,4 +145,36 @@ def test_devserver_fixture_bank_carries_markup_shaped_entity_name():
     assert any(payload in (e["src"], e["dst"]) for e in edges), (
         "the XSS-probe entity has no edge — it would render off-screen and "
         "never come up in a normal dev-server eyeball check."
+    )
+
+
+def test_topbar_status_dots_are_static():
+    """Operational state must not continuously repaint the blurred topbar.
+
+    Firefox-family browsers can flicker the neighbouring status chips when an
+    animated box-shadow is composited inside a backdrop-filter layer.  A
+    health indicator is a state, not an activity spinner, so the topbar keeps
+    its dot but suppresses the global pulse animation there.
+    """
+    src = STYLES_CSS.read_text(encoding="utf-8")
+    rule = re.search(r"\.topbar-status\s+\.pulse-dot\s*\{([^}]+)\}", src)
+    assert rule, "topbar needs an explicit Firefox-safe pulse-dot override"
+    body = rule.group(1).replace(" ", "")
+    assert "animation:none" in body
+    assert "box-shadow:none" in body
+
+
+def test_graph_replay_is_not_a_silent_noop_under_reduced_motion():
+    """A visible enabled play button must respond when explicitly invoked.
+
+    Reduced motion already disables graph simulation/camera animation.  The
+    time scrubber itself changes visibility without a motion transition, so a
+    user-initiated replay remains safe and must not silently return.
+    """
+    src = GALAXY_JS.read_text(encoding="utf-8")
+    play = src.index('class: "scrub-play"')
+    handler = src[play : play + 500]
+    assert "if (reduce) return" not in handler, (
+        "Graph replay silently ignores clicks when Firefox reports reduced "
+        "motion; keep the explicit replay operable."
     )

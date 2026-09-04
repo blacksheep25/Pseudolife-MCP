@@ -233,6 +233,9 @@ button:focus-visible, a:focus-visible, [tabindex]:focus-visible,
 .pulse-dot { width:7px; height:7px; border-radius:50%; background:currentColor;
   box-shadow:0 0 0 0 currentColor; animation:pulse 2.4s var(--ease) infinite; }
 @keyframes pulse { 0%{box-shadow:0 0 0 0 color-mix(in srgb,currentColor 60%,transparent);} 70%{box-shadow:0 0 0 7px transparent;} 100%{box-shadow:0 0 0 0 transparent;} }
+/* Health is a state, not an activity indicator.  Keeping topbar dots static
+   also avoids Firefox repainting neighbouring chips on the blurred layer. */
+.topbar-status .pulse-dot { animation:none; box-shadow:none; }
 
 /* ── Cards / panels ─────────────────────────────────────────────────────── */
 .panel {
