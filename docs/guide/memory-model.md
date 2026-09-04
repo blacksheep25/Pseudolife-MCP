@@ -113,6 +113,48 @@ verifies the value, re-asserting or correcting at the same slot. The
 `stale: true` flag is the louder, later signal (twice the TTL);
 `correct_with` fires earlier so drift gets fixed at first contact.
 
+**`re_verify` / `re_verify_reason`** is a third, independent signal — a
+*retract-direction* read of the engram cross-index (schema v13;
+`memory.traces.enabled`, on by default — see
+[Built-in defaults](configuration.md#built-in-defaults-tuned-for-claudes-use-case)).
+Where the fields above say a fact is old, `re_verify` says a fact's
+*evidence* moved: a served fact whose source memories were superseded
+(corrected) *after* the fact was last confirmed carries `re_verify: true`
+plus a `re_verify_reason` naming how many source memories were corrected
+since. It surfaces on `memory_fact_get`, `memory_search`'s cortex block,
+and `memory_recall`; on a set-valued slot the comparison is against the
+newest member's confirmation stamp, since a set is served as one grouped
+answer. It is a flag, never a cascade, and deliberately not routed into a
+`correct_with` call: keyed on `last_confirmed`, a slot re-asserted long
+after its retracted contributor still fires it, which on a mature bank is
+common — on the live bank on 2026-09-02 roughly a quarter of current facts
+stood on a source memory contradicted since they were last confirmed.
+Routing that into the same call `correct_with` tells the reader
+to run *now* would turn a common, weak signal into a standing instruction
+to rewrite a quarter of the cortex every session. Re-asserting or
+re-confirming the slot moves `last_confirmed` forward and clears the flag.
+
+The **active** affordance for retracted evidence lives on the correction
+itself: `memory_supersede`'s result carries `derived_flagged` — the
+canonical facts (slots) the dream built on the memories just corrected.
+They are named, not touched: nothing is rewritten, the caller decides
+whether each derivation still holds. Each row carries `has_current_value`
+(a slot with no live value is still blast radius worth seeing, just
+nothing to go re-check), the list is capped at 50 entries with live slots
+first, and `derived_flagged_truncated` / `derived_flagged_total` say
+whether a correction reached further than the cap.
+
+Both signals are **best-effort**, on purpose: they are derived at read
+time from evidence that still exists, so losing the evidence loses the
+flag. `memory_traces.entry_id` is `ON DELETE CASCADE`, a true-drop
+capacity eviction hard-deletes the entry row, and a superseded entry is
+the top eviction candidate (contradiction decay multiplies its surprise by
+0.3) — so a flag can appear and later vanish with no re-verification
+having happened, and `memory_delete`, the strongest retraction of all,
+raises no flag at any point. Both are gated on `memory.traces.enabled`;
+turning it off silences both without changing anything else about how
+facts are served.
+
 Since 2026-07-25 **raw band entries follow the same slot rule.** When a
 stored memory and an earlier one assert different values — or opposite
 polarities — at the same normalised `(entity, attribute)` slot, the earlier
@@ -125,6 +167,49 @@ replacement, state transition), which still handle everything without
 slots. Slot extraction is deliberately precision-gated — about 0.6% of
 conversational turns yield one — so this path mostly serves deliberate,
 fact-shaped writes, and its reach grows with extraction quality.
+
+### Who said it, and how exactly must it survive? (schema v35)
+
+Two labels ride on every entry and every fact, set at write time and
+inherited through supersession unless a later write restates them:
+
+- **`authority`** is the *speech act* of the text — `directive` (an
+  instruction to the agent), `observation` (a plain statement; the
+  default, stored as NULL and served as nothing), `quoted` (reported
+  speech: a document, a paper, a third person). It is deliberately a
+  separate axis from `origin`: `origin` says *who wrote* and is a tier
+  that drives supersession arithmetic (the provenance guard, the two-man
+  rule), while directive-vs-observation is not a tier ordering at all —
+  and the failure this closes (arXiv 2608.01679, *authority collapse*)
+  is exactly a third party's offhand remark consolidating into what reads
+  as a standing user instruction. The pair `(origin, authority)` is what
+  the paper calls authority. A `quoted` source is low-trust for the
+  [consolidation quarantine](dreaming.md#consolidation-quarantine--the-two-man-rule-opt-in).
+- **`distortion_tolerance`** is how exactly the text must survive
+  consolidation (arXiv 2608.22752, *the compaction cliff*): `constraint`
+  (zero — verbatim), `procedural`, `belief`, `preference`, `episodic`.
+  Only `constraint` has consumers today: the dream copies a constraint
+  entry's text verbatim onto a derived fact and a post-dream guard reports
+  any constraint left without a carrier ([dreaming](dreaming.md#constraint-entries-survive-verbatim--typecompact--guard-schema-v35)),
+  and in-scope constraint facts are served *ahead of* the cosine ranking
+  ([retrieval](retrieval.md#constraint-pinning-schema-v35)).
+
+Both are explicit parameters on `memory_store` and `memory_fact_set`;
+the `auto` default is a deterministic form heuristic (no model call on
+the store path) that asserts `constraint` only for rule-sized deontic or
+imperative text (`must`, `shall`, `forbidden`, `rule:`, or an opener like
+`Never run …`), `quoted` on an explicit reporting construction
+(`according to`, `per the`, `the docs say`), and `directive` on an
+instruction addressed to the reader — measured on the live bank before
+shipping (`evals/results/label-heuristic-audit-20260902.json`) and
+re-measured on 2026-09-03 after `must` as a noun or adjective ("a
+must-read series") stopped counting as a deontic
+(`label-heuristic-audit-20260903.json`, plus the chat-text replay in
+`label-heuristic-audit-20260903-beam-chip5.json`). The other four
+fidelity classes are accepted explicitly and carried.
+Neither label ever feeds confidence or supersession routing; a
+`constraint` label is the one label retrieval *ranks* on. Served only
+when set, so an unlabelled record's payload is byte-identical to before.
 
 ## Set-valued slots (schema v26)
 
@@ -338,6 +423,18 @@ own knowledge; your own cortex/episodic facts stay the highest-trust ground
 truth. `memory_search` surfaces matching world facts in a separate block,
 and the Console's world view (`/api/world`) lists them all for audit.
 
+**Retiring a world fact is reversible (schema v37).**
+`memory_forget(scope="world", ...)` retires the slot rather than deleting
+it: the row's `status` becomes `retired` and an FK-free `store_decisions`
+row records who, why, and the verbatim record. The undo is
+`memory_graph_review(action="restore_slot", store="world",
+src="entity|attribute")` — restoring from the retired row while it still
+exists, or from the audit snapshot once compaction has purged it; a bare
+entity in `src` (no `|attribute`) restores every retired aspect of that
+entity. `GET /api/curation/retired` lists what's currently retired across
+both stores, and the Console's undo route is `POST /api/world/restore`.
+Only `scope="memory"` and `scope="fact"` still hard-delete.
+
 > The world cortex here is populated **manually** via `memory_world_set`.
 > The live-web `research_ingest` action (fetch + distil cited world facts
 > automatically) is an agent-side capability that depends on the agent's
@@ -380,6 +477,18 @@ Lessons are also **traversable in the graph**: a task-type becomes an
 `memory_graph("deploy engine to host")` shows what to reach for and what to
 avoid. Retrieval is embedding-on-query (mirrors `memory_world_search`); the
 graph edges power structured traversal.
+
+**Retiring a lesson is reversible (schema v37).**
+`memory_forget(scope="lesson", ...)` retires the slot rather than deleting
+it: the row's `status` becomes `retired` and an FK-free `store_decisions`
+row records who, why, and the verbatim record. The undo is
+`memory_graph_review(action="restore_slot", store="lesson",
+src="entity|attribute")` — restoring from the retired row while it still
+exists, or from the audit snapshot once compaction has purged it; a bare
+entity in `src` (no `|attribute`) restores every retired aspect of that
+entity. `GET /api/curation/retired` lists what's currently retired across
+both stores, and the Console's undo route is `POST /api/lessons/restore`.
+Only `scope="memory"` and `scope="fact"` still hard-delete.
 
 > Single-writer: `memory_outcome` only ever logs a signal — the dream's LLM
 > extractor is the sole writer of lessons. With no extractor configured,
@@ -453,10 +562,15 @@ provenance stamp** so the agent has a real sense of *when* a fact held and
   (the shim's `X-PL-Session` header preferred), so a Codex session, a second
   Claude session, and the dream are all distinguishable.
 
-Reads surface this: serialised facts include the stamp plus a human `age`
+Reads surface this: a serialised fact includes the stamp plus a human `age`
 ("3 days ago"), and **`memory_history(entity, attribute)`** returns the
 full version timeline — current + superseded, oldest→newest, each
-attributed. The supersession log records the writer/session too.
+attributed. The supersession log records the writer/session too. Since
+2026-09-04 the *stamp itself* — `tx_time`, `valid_time`, `writer_id`,
+`session_id` — is served by `memory_fact_get(..., verbose=True)`; the
+default record carries `asserted_at`/`age`, `last_confirmed` and the
+freshness flags, which is what a caller acts on. The REST/Console reads
+(`service.*`) are unchanged.
 
 > **Writer topology.** The live path is a single daemon with a coarse lock
 > (`write_mode=snapshot`) — correct by construction. The schema also lays a

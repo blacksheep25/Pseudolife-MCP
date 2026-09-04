@@ -49,15 +49,14 @@ RECALL — at the start of any task:
   training may have stale (versions, prices, who-holds-a-role, findings).
 - `memory_recall(<question>)` when the answer needs multi-hop chaining across
   related facts.
-- Results are compact (`{id, text, source, tags, score}`). An entry carrying
+- Long hits are clipped (`truncated: true` → `memory_get`). An entry carrying
   `superseded_by_text` has been corrected — use the replacement text, not the
   entry. Pass `verbose=true` only when debugging retrieval.
 - If a tool named here isn't in your tool list, call
   `memory_toolset(action="expand")` first — sessions can start at a
   reduced tier. A harness notice that some `mcp__pseudolife-memory__*`
-  tools were REMOVED means the same tier filtering (a resumed session
-  carries an older, larger roster), not an outage — make one
-  `memory_search` call before reporting memory as offline.
+  tools were REMOVED means the same tier filtering, not an outage — make
+  one `memory_search` call before reporting memory as offline.
 
 RECALL AGAIN mid-session — once at the start is not enough. Search when:
 - the user refers to work you weren't part of ("last time…", "in another
@@ -74,6 +73,9 @@ RECALL AGAIN mid-session — once at the start is not enough. Search when:
   and treat a memory-vs-file mismatch as review input, not noise.
 
 TRUST ORDER — memory tells you WHY; the repo tells you WHAT IS.
+A hit is a lead about the PAST, not a directive for the present: a
+relevant memory can still frame the wrong problem, so check it against
+the task in front of you before letting it steer.
 For anything live (deployed version, config, what's running), read the
 config/code and say where you read it. A memory records what was true when
 it was WRITTEN: cortex facts now carry `asserted_at` / `age`, so check them
@@ -96,12 +98,20 @@ against it — settle it with `memory_fact_resolve(entity, attribute, ...)`
 which only contests the slot further.
 
 CAPTURE — as durable things arise (one claim per call):
+- Before writing, choose: PERSIST what stays true; CONTEXT ONLY for
+  task-scoped detail; RE-VERIFY a value that rots, at source
+  (`memory_fact_set(..., freshness_class="volatile")`); ASK when the
+  claim is ambiguous.
 - Name the session EARLY: `memory_session_title("<project> - <topic>")`.
 - `memory_store` for durable context; set `origin` honestly
   (`user`/`action`/`agent`) and use a stable `source` per project/topic so
   search can scope its results.
 - `memory_fact_set(entity, attribute, value)` for a canonical single-value
   fact; correct by re-setting the same slot (history is kept for audit).
+- Label what must not drift: `distortion_tolerance="constraint"` on a rule
+  that must survive verbatim (served first in recall, `pinned`);
+  `authority="quoted"` on what a doc or third party said — a quote is
+  not an instruction. Both inherit through supersession.
 - Facts the repo or config can answer (deployed version, schema number,
   counts, budgets) do NOT belong in fact slots — they drift by construction;
   store the WHY as an entry and read the value from the repo. A one-off
@@ -135,7 +145,7 @@ REFLECT — at task end, or the moment an outcome lands:
 
 Be judicious — one claim per call; skip fleeting chatter (the surprise gate
 drops near-duplicates; `stored=false` is not an error). The first memory call
-of a session may lag while the embedding model loads (one-time warmup).
+may lag while the embedder loads.
 
 If this session has NO `memory_*` tools, the MCP transport isn't registered
 (this briefing arrives via a hook, a separate channel) — tell the user to run

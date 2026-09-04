@@ -58,7 +58,14 @@ from pseudolife_memory.memory.slots import Slot
 from pseudolife_memory.session_title import (
     GENERIC_TITLE_RE, derive_session_title)
 from pseudolife_memory.writer_context import resolve_writer_detailed
+from pseudolife_memory.memory.labels import (INHERIT, infer_authority,
+                                             infer_distortion_tolerance,
+                                             resolve_authority,
+                                             resolve_distortion,
+                                             strictest_authority,
+                                             strictest_distortion)
 from pseudolife_memory.utils.config import AppConfig, load_config
+from pseudolife_memory.utils.locks import SLOW_LOCK_SECONDS, MonitoredLock
 
 logger = logging.getLogger(__name__)
 
@@ -103,6 +110,12 @@ def _entry_to_dict(
         "episode_title": entry.episode_title,
         "tags": list(entry.tags),
     }
+    # v35 labels: present ONLY when set, so an unlabelled entry serves a
+    # byte-identical payload (the stance precedent).
+    if getattr(entry, "authority", None):
+        out["authority"] = entry.authority
+    if getattr(entry, "distortion_tolerance", None):
+        out["distortion_tolerance"] = entry.distortion_tolerance
     if entry.slots:
         out["slots"] = [
             {"entity": e, "attribute": a, "value": v, "polarity": p}
@@ -191,6 +204,11 @@ def _cortex_record_to_dict(rec, relative_age: bool = True,
     # payload stays byte-identical for every pre-v29 fact.
     if getattr(rec, "stance", None):
         d["stance"] = rec.stance
+    # v35 label pair: same absent-when-default rule.
+    if getattr(rec, "authority", None):
+        d["authority"] = rec.authority
+    if getattr(rec, "distortion_tolerance", None):
+        d["distortion_tolerance"] = rec.distortion_tolerance
     if relative_age:
         d["age"] = _relative_time(rec.tx_time or rec.asserted_at)
     return _apply_stale_policy(d, stale_policy)
@@ -279,6 +297,17 @@ def _lesson_record_to_dict(rec) -> dict[str, Any]:
 # never by splitting on ":".
 _CURATION_STORES = ("lesson", "world")
 
+# How many derived slots ``supersede`` names inline in ``derived_flagged``.
+# The exact-text pass can supersede several entries at once and one verbose
+# memory can seed many slots, so the report is unbounded by construction and
+# lands whole in an MCP response. 50 is a review-batch bound, not a measured
+# one: a correction whose blast radius runs past it is a case for
+# ``MemoryService.derived_from_entries``, the uncapped service-level form
+# (no MCP surface), and ``derived_flagged_truncated`` says when that
+# happened. The list is ordered live-slots-first so the cap keeps the rows a
+# reader can actually act on.
+DERIVED_FLAGGED_CAP = 50
+
 
 def _slot_key(entity_norm: str, attribute_norm: str) -> str:
     """Identity string for a slot: normalized components joined with ``|``.
@@ -288,6 +317,42 @@ def _slot_key(entity_norm: str, attribute_norm: str) -> str:
     (curation_dismiss_duplicate) must build keys through this helper so a
     dismissal always matches the listing that produced it."""
     return f"{entity_norm.replace('|', '-')}|{attribute_norm.replace('|', '-')}"
+
+
+# Junk KEEP tombstones (2026-09-03): a junk proposal rejected as "keep" is
+# recorded in dismissed_pairs as the namespaced self-pair
+# ("junk:<canonical>", "junk:<canonical>") — the rejected entity_proposals
+# row CASCADEs away with its entity, and a re-mint of the same name used to
+# be re-filed and re-judged as if no verdict existed. Keyed on the STORED
+# canonical like every other graph dismissal.
+_JUNK_KEEP_PREFIX = "junk:"
+
+
+def _junk_keep_key(canonical: str) -> str:
+    return _JUNK_KEEP_PREFIX + canonical
+
+
+def _kept_junk_norms(dismissed: set[tuple[str, str]]) -> set[str]:
+    """Canonicals a junk proposal was rejected (kept) for."""
+    n = len(_JUNK_KEEP_PREFIX)
+    return {a[n:] for a, b in dismissed
+            if a == b and a.startswith(_JUNK_KEEP_PREFIX)}
+
+
+def _world_record_snapshot(rec) -> dict[str, Any]:
+    """The verbatim fields of a WorldRecord for the retire/restore audit —
+    no read-time decay or stale policy applied (the snapshot must restore
+    exactly what was retired)."""
+    return {
+        "entity": rec.entity, "attribute": rec.attribute, "value": rec.value,
+        "polarity": rec.polarity, "status": rec.status,
+        "confidence": round(float(rec.confidence), 4), "origin": rec.origin,
+        "source_url": rec.source_url, "source_quote": rec.source_quote,
+        "freshness_class": rec.freshness_class,
+        "retrieved_at": rec.retrieved_at, "content_hash": rec.content_hash,
+        "source_doc_id": rec.source_doc_id, "asserted_at": rec.asserted_at,
+        "last_confirmed": rec.last_confirmed,
+    }
 
 
 def _store_dismissed(dismissed: set[tuple[str, str]], store: str) -> set[tuple[str, str]]:
@@ -375,6 +440,42 @@ def _origin_from_source(source: str | None) -> str | None:
     return _SOURCE_ORIGIN.get((source or "").strip().lower())
 
 
+def _entity_in_query(entity: str | None, query: str | None) -> bool:
+    """The recall-scope test for constraint pinning (TypeRetrieve, arXiv
+    2608.22752): a fact is in scope when the query NAMES its entity. Both
+    sides go through the cortex's own slot normalisation (casefold,
+    separators folded to one hyphen) and the entity must occur as a
+    hyphen-bounded run — so ``payments db`` matches ``payments-db`` but
+    ``db`` does not match ``payments-database``. No embedding pass; the
+    cost is one string scan per constraint-labelled fact.
+
+    Known limit: a RAW-STRING test — it does not resolve graph aliases,
+    so a constraint written under an alias that was later folded into
+    another canonical name is pinned by ``memory_recall`` (whose seeds
+    resolve through the vocabulary) but not here. The one-line fix is to
+    resolve ``r.entity`` through ``graph.alias_canonical_map`` once per
+    ``cortex_search``; that helper arrives with PR #243 and this lands
+    first, so it is a follow-up, not a silent gap."""
+    from pseudolife_memory.memory.cortex import _norm_key
+    e = _norm_key(entity or "")
+    if not e:
+        return False
+    return f"-{e}-" in f"-{_norm_key(query or '')}-"
+
+
+def _inherited_labels(parents, new_text: str) -> tuple[str | None, str | None]:
+    """Inherit-unless-restated for a superseding ENTRY: the new text's own
+    heuristic label wins its axis; otherwise the strictest label across
+    the entries it replaces carries over (never an upgrade — quoted beats
+    directive; a constraint anywhere in the cluster stays a constraint)."""
+    parents = list(parents)
+    auth = infer_authority(new_text) or strictest_authority(
+        getattr(e, "authority", None) for e in parents)
+    dt = infer_distortion_tolerance(new_text) or strictest_distortion(
+        getattr(e, "distortion_tolerance", None) for e in parents)
+    return auth, dt
+
+
 # ── consolidation quarantine (spec 2026-08-09-consolidation-quarantine) ──
 # The two-man rule keys on WHO wrote — persisted entry metadata only (the
 # prereg mandates no schema change, and the entries table stores neither
@@ -388,6 +489,13 @@ def _quarantine_low_trust(claim: dict, src_entry: dict | None,
                           trusted: set[str]) -> bool:
     """True iff the claim's backing is agent-tier and outside ``trusted``."""
     if src_entry is not None:
+        # v35: reported speech is low-trust whoever relayed it — a third
+        # party's remark must not take current on the relayer's tier
+        # (arXiv 2608.01679). The label only ever DEMOTES: promotion stays
+        # keyed on entry metadata, so a note dressed up as a quote gains
+        # nothing but a park.
+        if src_entry.get("authority") == "quoted":
+            return True
         src = src_entry.get("source") or ""
         return _origin_from_source(src) == "agent" and src not in trusted
     return (claim.get("origin") or "agent") == "agent"
@@ -426,7 +534,10 @@ class MemoryService(DreamOps):
         config_path: str | Path | None = None,
         database_url: str | None = None,
     ) -> None:
-        self._lock = Lock()
+        # Monitored so a hold or wait past ~1s names its holder in the log
+        # (2026-09-01: two sessions of external probing to localize one
+        # stall that this line would have named). Drop-in for Lock().
+        self._lock = MonitoredLock("service")
         # Schema v8: when a database URL is configured (param or
         # PSEUDOLIFE_MCP_DATABASE_URL), Postgres is the source of truth
         # and the in-memory bands are a write-through cache. Without it,
@@ -441,6 +552,19 @@ class MemoryService(DreamOps):
         # re-reaped on the next sweep, firing a dream per resume cycle.
         # In-memory only: a restart re-fires the SessionStart hook anyway.
         self._episode_touches: dict[str, float] = {}
+        # Tombstones for EMPTY session roots the reaper's sweep deleted:
+        # id -> (session_key, ended_at, title). A briefing handle presented
+        # after the sweep recreates its episode from here instead of
+        # degrading (2026-09-02 incident). Persisted to storage meta —
+        # unlike the touch map, a mid-break daemon restart must not lose
+        # these.
+        self._episode_tombstones: dict[str, tuple[str, float, str]] = {}
+        # Roots the reaper closed EMPTY (deferred prune): id -> ended_at.
+        # The sweep's candidate set is exactly this map — never the whole
+        # episode log, where "zero live band entries" also matches history
+        # whose memories were evicted or forgotten (review finding,
+        # 2026-09-02). Persisted: the deferral window outlives a restart.
+        self._deferred_empty_roots: dict[str, float] = {}
         # Retrieval-log write failures since process start. Both log paths
         # swallow their exceptions (a logging failure must not break the
         # search it rides on), so without this counter a broken log is
@@ -531,6 +655,8 @@ class MemoryService(DreamOps):
         self._entity_kind_cache: dict[str, str] | None = None
 
     _ACTIVE_SESSION_META_KEY = "active_session_pointer"
+    _EPISODE_TOMBSTONES_META_KEY = "episode_tombstones"
+    _DEFERRED_EMPTY_META_KEY = "deferred_empty_roots"
 
     def _resolve_writer(self) -> tuple[str, str | None]:
         """Identity tiers 1/3/4 (spec 2026-07-18): X-PL-Session header ->
@@ -829,6 +955,21 @@ class MemoryService(DreamOps):
             if isinstance(raw, dict) and raw.get("session_id"):
                 self._active_session = (str(raw["session_id"]),
                                          float(raw.get("ts") or 0.0))
+            # Episode tombstones survive a restart the same way — a handle
+            # presented after a mid-break daemon restart must still recreate
+            # its swept episode.
+            raw_t = self._storage.get_meta(self._EPISODE_TOMBSTONES_META_KEY)
+            if isinstance(raw_t, dict):
+                self._episode_tombstones = {
+                    str(tid): (str(m["session_key"]),
+                               float(m.get("ended_at") or 0.0),
+                               str(m.get("title") or ""))
+                    for tid, m in raw_t.items()
+                    if isinstance(m, dict) and m.get("session_key")}
+            raw_d = self._storage.get_meta(self._DEFERRED_EMPTY_META_KEY)
+            if isinstance(raw_d, dict):
+                self._deferred_empty_roots = {
+                    str(rid): float(ts or 0.0) for rid, ts in raw_d.items()}
         if self._embedder is None:
             # Reused across failed attempts: a retry after a mid-init
             # failure must never rebuild the model (same incident).
@@ -1172,6 +1313,8 @@ class MemoryService(DreamOps):
         tags: list[str] | None = None,
         origin: str | None = None,
         episode: str | None = None,
+        authority: str | None = "auto",
+        distortion_tolerance: str | None = "auto",
     ) -> dict[str, Any]:
         """Embed and store a memory through the CMS pipeline.
 
@@ -1195,7 +1338,18 @@ class MemoryService(DreamOps):
         "cortex_promoted": int}``. Stores can be rejected by either the
         meta-filter (looks like self-reference) or the surprise gate (already
         known) — the ``reason`` field surfaces which.
+
+        ``authority`` / ``distortion_tolerance`` (schema v35): the write-time
+        label pair. ``"auto"`` (default) runs the deterministic heuristic in
+        :mod:`pseudolife_memory.memory.labels` over ``text``; an explicit
+        value is validated (``ValueError`` on junk). A fresh store has
+        nothing to inherit from, so an unresolved ``auto`` is NULL. The
+        applied labels ride back on the result only when set.
         """
+        auth = resolve_authority(authority, text)
+        auth = None if auth is INHERIT else auth
+        dt = resolve_distortion(distortion_tolerance, text)
+        dt = None if dt is INHERIT else dt
         with self._lock:
             self._ensure_init()
             assert self._embedder is not None and self._cms is not None
@@ -1221,6 +1375,7 @@ class MemoryService(DreamOps):
                 text, embedding, source=source, tags=tags,
                 session_key=session_id,
                 attribution_episode_id=resolved[0] if resolved is not None else None,
+                authority=auth, distortion_tolerance=dt,
             )
             reason: str | None = None
             if not stored:
@@ -1239,7 +1394,9 @@ class MemoryService(DreamOps):
             promoted = 0
             cc = self.config.memory.cortex
             if cc.enabled and cc.auto_promote and reason != "filtered_meta":
-                promoted = self._promote_slots(text, source=source, origin=origin)
+                promoted = self._promote_slots(text, source=source, origin=origin,
+                                               authority=auth,
+                                               distortion_tolerance=dt)
                 if promoted and self._storage is not None:
                     self._save_cortex()
             out = {
@@ -1248,6 +1405,10 @@ class MemoryService(DreamOps):
                 "reason": reason,
                 "cortex_promoted": promoted,
             }
+            if auth is not None:
+                out["authority"] = auth
+            if dt is not None:
+                out["distortion_tolerance"] = dt
             # Nudge the agent while the lazily-opened session episode still
             # carries the generic fallback title (the daemon has no project
             # signal of its own; the agent does).
@@ -1260,7 +1421,9 @@ class MemoryService(DreamOps):
                 out["episode_warning"] = "unknown or closed episode handle"
             return out
 
-    def _promote_slots(self, text: str, *, source: str, origin: str | None) -> int:
+    def _promote_slots(self, text: str, *, source: str, origin: str | None,
+                       authority: str | None = None,
+                       distortion_tolerance: str | None = None) -> int:
         """Lift any slot-shaped facts in ``text`` into the cortex deterministically
         (regex ``extract_slots``, no LLM). Caller MUST already hold ``self._lock``
         — writes go straight to ``self._cortex`` (not via ``cortex_write``, which
@@ -1288,6 +1451,12 @@ class MemoryService(DreamOps):
                     hlc=self._hlc.tick(),
                     writer_id=writer_id,
                     session_id=session_id,
+                    # v35: the entry's labels ride onto the promoted fact;
+                    # an unlabelled entry inherits what the slot has.
+                    authority=(authority if authority is not None else INHERIT),
+                    distortion_tolerance=(distortion_tolerance
+                                          if distortion_tolerance is not None
+                                          else INHERIT),
                 )
                 self._ensure_subject_entity(s.entity, propose_dupes=True)
                 written += 1
@@ -1732,16 +1901,36 @@ class MemoryService(DreamOps):
                             superseded_by_text=e.superseded_by_text,
                         )
 
+            # Retract traversal: what the dream derived from the memories
+            # just corrected. Reported, never cascaded — the caller decides
+            # whether a derivation still holds. The same facts also carry
+            # ``re_verify`` on later reads, but that is a BEST-EFFORT read of
+            # still-present evidence and stops the moment the superseded
+            # entry is evicted (see ``_annotate_evidence_supersession``).
+            # This list, named once at the moment of correction, is the
+            # durable half of the affordance — which is why it is capped
+            # rather than truncated silently.
+            derived_total = self._derived_from_entries_locked(
+                [e.db_id for e in superseded_entries])
+            derived = derived_total[:DERIVED_FLAGGED_CAP]
+
             # Always store the correction text as a regular memory so future
-            # retrieval surfaces the new state.
+            # retrieval surfaces the new state. v35: the correction INHERITS
+            # the superseded entries' labels unless its own text restates
+            # one — a corrected rule is still a rule.
+            auth, dt = _inherited_labels(superseded_entries, new_text)
             store_emb = self._embedder.encode_single(new_text)
             stored, surprise = self._cms.store(
                 new_text, store_emb, source="correction",
                 session_key=self._resolve_writer()[1],
+                authority=auth, distortion_tolerance=dt,
             )
             return {
                 "superseded_count": len(superseded),
                 "superseded_texts": superseded,
+                "derived_flagged": derived,
+                "derived_flagged_total": len(derived_total),
+                "derived_flagged_truncated": len(derived) < len(derived_total),
                 "new_memory_stored": stored,
                 "new_memory_surprise": round(float(surprise), 4),
             }
@@ -2016,8 +2205,35 @@ class MemoryService(DreamOps):
         File mode: legacy full-bank torch.save (v0.1 behavior).
         """
         assert self._cms is not None
+        # Per-part durations, warned on a slow save: every persist runs
+        # under the service lock, so a slow part IS a daemon pause — and
+        # the 2026-08-31 probe caught a ~1.5s autosave-correlated stall
+        # that none of the offline-measurable parts explains (weights
+        # ~5ms, access counts ~10-30ms at live size). This breakdown makes
+        # the live daemon name the part next time instead of leaving it to
+        # correlation.
+        t_start = time.perf_counter()
+        timings: dict[str, float] = {}
+
+        def _timed(part, fn):
+            t0 = time.perf_counter()
+            out = fn()
+            timings[part] = round(time.perf_counter() - t0, 3)
+            return out
+
+        def _finish(result):
+            # Wall time, not sum-of-parts: same meaning as the sweep
+            # ledger's total, and it still counts a part that raised.
+            timings["total"] = round(time.perf_counter() - t_start, 3)
+            result["timings"] = timings
+            if timings["total"] >= SLOW_LOCK_SECONDS:
+                logger.warning("%s save held the service lock %.2fs: %s",
+                               kind, timings["total"], timings)
+            return result
+
         if self._storage is not None:
-            self._cms.save_weights(self.config.memory.save_dir)
+            _timed("weights",
+                   lambda: self._cms.save_weights(self.config.memory.save_dir))
             pairs = [
                 (e.db_id, e.access_count)
                 for band in self._cms.bands
@@ -2025,27 +2241,31 @@ class MemoryService(DreamOps):
                 if e.db_id is not None
             ]
             try:
-                self._storage.update_access_counts(pairs)
+                _timed("access_counts",
+                       lambda: self._storage.update_access_counts(pairs))
             except Exception as exc:  # noqa: BLE001
                 logger.warning("access-count sync failed: %s", exc)
             if kind in ("explicit", "flush"):
                 # Full resync on the rare explicit/exit saves — belt and
                 # braces against any dirty-mark gap in the per-slot path.
                 from pseudolife_memory.storage import sync as _sync
-                _sync.snapshot_cortex(self._cortex, self._storage)
+                _timed("cortex",
+                       lambda: _sync.snapshot_cortex(self._cortex, self._storage))
                 if self._world is not None:
-                    _sync.snapshot_world_cortex(self._world, self._storage)
+                    _timed("world", lambda: _sync.snapshot_world_cortex(
+                        self._world, self._storage))
                 if self._lessons is not None:
-                    _sync.snapshot_lessons(self._lessons, self._storage)
+                    _timed("lessons", lambda: _sync.snapshot_lessons(
+                        self._lessons, self._storage))
             else:
-                self._save_cortex()
-                self._save_world()
-                self._save_lessons()
-            return {"saved_to": self.config.memory.save_dir,
-                    "mode": "postgres+weights", "kind": kind}
-        self._cms.save(self.config.memory.save_dir)
-        self._save_cortex()
-        return {"saved_to": self.config.memory.save_dir, "kind": kind}
+                _timed("cortex", self._save_cortex)
+                _timed("world", self._save_world)
+                _timed("lessons", self._save_lessons)
+            return _finish({"saved_to": self.config.memory.save_dir,
+                            "mode": "postgres+weights", "kind": kind})
+        _timed("bank", lambda: self._cms.save(self.config.memory.save_dir))
+        _timed("cortex", self._save_cortex)
+        return _finish({"saved_to": self.config.memory.save_dir, "kind": kind})
 
     def _entity_kind_map(self) -> dict[str, str]:
         """entity_norm -> kind, cached. Order 1k rows and read on every fact
@@ -2074,6 +2294,8 @@ class MemoryService(DreamOps):
         freshness_class: str = "auto",
         force_contend: bool = False,
         stance: str | None = None,
+        authority="auto",
+        distortion_tolerance="auto",
     ) -> dict[str, Any]:
         """Write / confirm / supersede a canonical fact at the
         ``(entity, attribute)`` slot. The claim is embedded through the same
@@ -2100,7 +2322,15 @@ class MemoryService(DreamOps):
         ...record fields}``. On ``"contested"`` the returned record is the parked
         *contender* and a ``"current"`` key carries the canonical value that won,
         so the caller sees both sides of the conflict.
+
+        ``authority`` / ``distortion_tolerance`` (v35): ``"auto"`` runs the
+        deterministic heuristic over ``value`` and falls back to INHERIT
+        (keep what the slot has); the dream passes the source entry's label
+        or INHERIT explicitly and never ``auto`` (labels are a property of
+        the SOURCE, not of model output); ``None`` clears (rollback).
         """
+        auth = resolve_authority(authority, value)
+        dt = resolve_distortion(distortion_tolerance, value)
         with self._lock:
             self._ensure_init()
             if freshness_class == "auto":
@@ -2133,6 +2363,8 @@ class MemoryService(DreamOps):
                     freshness_class=freshness_class,
                     force_contend=force_contend,
                     stance=stance,
+                    authority=auth,
+                    distortion_tolerance=dt,
                 )
             except ValueError as exc:
                 if "holds a set" in str(exc):
@@ -2263,6 +2495,34 @@ class MemoryService(DreamOps):
             self._slot_read_errors += 1
             logger.warning("slot-read telemetry failed", exc_info=True)
 
+    def _alias_retry_names(self, entity: str, node: dict) -> list[str]:
+        """Names to retry a slot miss under after ``entity`` itself: the
+        node's canonical, then its aliases in ``find_entity``'s order —
+        minus any alias that is some OTHER entity's canonical.
+        ``find_entity`` resolves canonical-first, so such an alias row never
+        resolves to this node and a record under that name belongs to the
+        other entity (``graph_alias`` never checks the entities table, and
+        a lesson about an alias used to mint one). Dropping it is the same
+        drop ``graph.alias_canonical_map`` makes for the graph read
+        surfaces, so lookup and attachment agree. Dedup is on the cortex
+        key (``_norm_key``), the space the retry actually probes — a
+        canonical whose graph norm equals the query's but whose cortex key
+        differs (``host:port`` vs ``host-port``) is still worth one probe.
+        Cost: one indexed query, only when the node has aliases. Caller
+        holds the lock."""
+        from pseudolife_memory.memory.cortex import _norm_key
+        aliases = [a for a in (node.get("aliases") or ()) if a]
+        shadowed = (self._storage.canonical_names_among(aliases)
+                    if aliases else set())
+        seen = {_norm_key(entity)}
+        out: list[str] = []
+        for c in (node.get("canonical"), *aliases):
+            if not c or c in shadowed or _norm_key(c) in seen:
+                continue
+            seen.add(_norm_key(c))
+            out.append(c)
+        return out
+
     def cortex_lookup(self, entity: str, attribute: str,
                       track: bool = True) -> dict[str, Any] | None:
         """Exact slot lookup — the one ``current`` fact, or ``None``.
@@ -2271,33 +2531,54 @@ class MemoryService(DreamOps):
         callers whose lookup is verification, not serving (the dream
         rollback's post-revert check).
 
-        Alias-aware: on a direct slot miss, the entity name is resolved through
-        the graph's ``entity_aliases`` (Postgres) and the canonical name is
-        retried, so a fact stored under e.g. ``dev-box`` surfaces regardless of
-        which alias (``4090``) the caller queried — honouring the contract that
-        every fact lookup resolves aliases first.
+        Alias-aware in both directions: on a direct slot miss, the entity
+        name is resolved through the graph's ``entity_aliases`` (Postgres)
+        and the canonical name is retried, then each of the node's aliases.
+        So a fact stored under ``dev-box`` surfaces when the caller queries
+        the alias ``4090``, and a fact the dream wrote under ``pr-235``
+        surfaces under ``PR #235`` once a merge has folded that name into
+        the node — the same attachment ``graph_neighborhood`` makes, so the
+        name recall shows a fact under is a name that fetches it. Order is
+        direct hit, canonical, aliases (``find_entity``'s alias order), so a
+        canonical-keyed record wins over an alias-keyed one at the same
+        attribute; the served record keeps its OWN slot key, which is where
+        its traces, contenders and ``correct_with`` live. An alias that is
+        also another entity's canonical is skipped — ``find_entity`` would
+        resolve it to that entity, so a record under it is theirs (see
+        ``_alias_retry_names``). One ``find_entity`` call per miss plus,
+        only when the node has aliases, one indexed shadow probe — never a
+        per-alias storage query. Aliases are graph norms
+        (``graph.norm_name``), so a record whose entity the cortex normalizer
+        keeps distinct (``host:port`` vs ``host-port``) is not reached this
+        way — the limit the canonical retry has always had.
 
         A set-valued slot has no single ``current`` record to return, so it
         takes a different shape: ``{"kind": "set", "entity", "attribute",
         "members": [...], "removed": [...]}`` (current members / removed
-        audit rows). Checked only on a scalar miss, same alias-resolved name,
-        so a set slot under an alias is still found."""
+        audit rows). Checked only on a scalar miss, over the same name list
+        (query, canonical, aliases), so a set slot under an alias is still
+        found."""
         with self._lock:
             self._ensure_init()
             assert self._cortex is not None
             rec = self._cortex.lookup(entity, attribute)
-            canon = None
+            # Retry list on a miss: the canonical, then the node's aliases
+            # that find_entity would actually resolve here (see
+            # _alias_retry_names) — one find_entity call plus, only when
+            # the node has aliases, one indexed shadow probe.
+            names = [entity]
             if rec is None and self._storage is not None:
                 from pseudolife_memory.graph import norm_name
                 node = self._storage.find_entity(norm_name(entity))
                 if node is not None:
-                    c = node.get("canonical")
-                    if c and norm_name(c) != norm_name(entity):
-                        canon = c
-                        rec = self._cortex.lookup(canon, attribute)
+                    names.extend(self._alias_retry_names(entity, node))
+                    for name in names[1:]:
+                        rec = self._cortex.lookup(name, attribute)
+                        if rec is not None:
+                            break
             if rec is None:
                 ra = self.config.time.relative_age
-                for name in (entity, canon):
+                for name in names:
                     if name and self._cortex.slot_kind(name, attribute) == "set":
                         members = self._cortex.members(name, attribute)
                         removed = [
@@ -2313,7 +2594,7 @@ class MemoryService(DreamOps):
                             from pseudolife_memory.memory.cortex import _norm_key
                             self._track_slot_reads(
                                 [(_norm_key(name), _norm_key(attribute))])
-                        return {
+                        out = {
                             "kind": "set", "entity": name, "attribute": attribute,
                             "members": [_cortex_record_to_dict(
                                 r, relative_age=ra, stale_policy=sp)
@@ -2322,6 +2603,10 @@ class MemoryService(DreamOps):
                                 r, relative_age=ra, stale_policy=sp)
                                 for r in removed],
                         }
+                        if self._storage is not None and track and members:
+                            self._annotate_set_slot_evidence(
+                                out, name, attribute, members)
+                        return out
                 return None
             d = _cortex_record_to_dict(rec, relative_age=self.config.time.relative_age,
                                        stale_policy=self._stale_policy)
@@ -2329,11 +2614,231 @@ class MemoryService(DreamOps):
                 from pseudolife_memory.memory.cortex import _norm_key
                 d["source_entries"] = self._storage.traces_for_slot(
                     _norm_key(rec.entity), _norm_key(rec.attribute))
+                # Serving only. ``track=False`` already declares the lookup a
+                # verification rather than an answer — the dream rollback
+                # (``service_dream._rewrite_prev``) makes one per journal row
+                # and reads only ``value``, so annotating there buys a PG
+                # query per row for a flag nobody reads.
+                if track:
+                    self._annotate_evidence_supersession([d])
             if track:
                 from pseudolife_memory.memory.cortex import _norm_key
                 self._track_slot_reads(
                     [(_norm_key(rec.entity), _norm_key(rec.attribute))])
             return d
+
+    # ── retract-direction traversal (arXiv 2608.10502) ───────────────────
+    # The engram cross-index has only ever been read forwards (slot -> the
+    # entries that formed it). Correcting a source memory therefore left
+    # every fact the dream derived from it standing as current, with nothing
+    # on the served fact saying its evidence had moved. The paper's fix is
+    # to traverse the provenance graph DOWNSTREAM and scope the repair —
+    # not to delete the derivations (which loses benign state) and not to
+    # reset the store. Here that scoping is a FLAG: cascading a correction
+    # through derived facts is a review judgment, which is the same
+    # two-man rule the consolidation quarantine already encodes.
+
+    def _superseded_evidence(self, ids: set[int]) -> dict[int, float]:
+        """``{entry_id: superseded_at}`` for the superseded ones among these
+        source entries, scoped to the ids actually being served.
+
+        ``entries.superseded_at`` is the single authority. An earlier draft
+        also scanned the live band entries, because :meth:`consolidate`
+        stamped its marks in RAM and never wrote them through. PR #239
+        closed that: all three entry-level supersession sites —
+        :meth:`supersede`, ``cms.store``'s contradiction decay, and
+        :meth:`consolidate` — now write through inside the same locked call
+        that sets the mark, so normal operation opens no window in which
+        RAM and the column disagree. The scan was therefore paying an
+        O(bank) pass on every annotated read to cover a state no live path
+        produces, and it went. The consequence is recorded, not hidden:
+        anything that leaves a mark in RAM only is a known miss for this
+        flag — a future site that forgets the write-through, all three
+        existing loops' ``if e.db_id is not None`` guard if an entry could
+        ever reach them unpersisted, and a write-through that raises after
+        the marks are set (loud, but the RAM marks are not rolled back).
+        Pinned by ``test_a_mark_that_never_reached_postgres_does_not_flag``.
+
+        No cached index — the same no-stored-state rule as
+        :meth:`_cortex_change_index`. Caller holds the lock."""
+        if not ids or self._storage is None:
+            return {}
+        return self._storage.superseded_evidence(ids)
+
+    def _annotate_evidence_supersession(self, rows: list[dict]) -> list[dict]:
+        """Read-time flag: a served fact standing on evidence that was
+        corrected AFTER the fact was last confirmed gets ``re_verify`` +
+        ``re_verify_reason`` — the SAME shape lessons already carry for
+        "subject facts changed since"
+        (:meth:`_annotate_lesson_staleness`), not a parallel one.
+
+        The ``last_confirmed`` comparison is what makes the flag mean
+        something and what makes it CLEARABLE. The cross-index is keyed on
+        the slot, so ``source_entries`` lists every entry that ever formed
+        it across the slot's whole supersession history, and trace rows are
+        never deleted. A bare "any source superseded" test would therefore
+        latch on forever — including on slots whose current value was
+        asserted long after the retracted contributor, which on a mature
+        bank is a large fraction of the cortex. Worse, it would latch while
+        routing into ``correct_with``, whose served note tells the reader to
+        write a correction NOW: an unclearable flag there is a standing
+        instruction to rewrite a quarter of the cortex, every session.
+        Keying on ``last_confirmed`` means the documented remedy —
+        re-assert the slot, which confirms it and moves the clock — is
+        exactly what silences it.
+
+        The keys are ABSENT on unaffected facts, keeping their payloads
+        byte-identical (the ``stance`` precedent in
+        ``_cortex_record_to_dict``).
+
+        BEST-EFFORT, and deliberately so. The flag is derived at read time
+        from evidence that still exists, so LOSING the evidence loses the
+        flag: ``memory_traces.entry_id`` is ``ON DELETE CASCADE``, a
+        true-drop capacity eviction hard-deletes the entry row (every
+        eviction under the default flat preset), and a superseded entry is
+        the top eviction candidate because contradiction decay multiplies
+        its surprise by 0.3. So a flag can appear and later vanish with no
+        re-verification having happened, and ``memory_delete`` — the
+        strongest retraction of all — raises no flag at any point. Making
+        the caution outlive its evidence needs durable per-slot state, i.e.
+        a schema change, which is out of scope here; both behaviours are
+        pinned by tests so the limit is a recorded contract rather than a
+        surprise. Caller holds the lock."""
+        if not self.config.memory.traces.enabled:
+            return rows
+        cited = {i for r in rows for i in (r.get("source_entries") or [])}
+        if not cited:
+            return rows                 # nothing to traverse — skip the scan
+        dead = self._superseded_evidence(cited)
+        if not dead:
+            return rows
+        for row in rows:
+            # Fall back to asserted_at only when the record carries no
+            # confirmation stamp at all (legacy rows); never to 0.0, which
+            # would re-open the latch this comparison exists to close.
+            seen = row.get("last_confirmed") or row.get("asserted_at")
+            if not seen:
+                continue
+            hit = [i for i in (row.get("source_entries") or [])
+                   if (ts := dead.get(i)) is not None and ts > seen]
+            if not hit:
+                continue
+            row["re_verify"] = True
+            row["re_verify_reason"] = (
+                f"derived from {len(hit)} source "
+                f"{'memory' if len(hit) == 1 else 'memories'} "
+                "corrected since this fact was last confirmed")
+        return rows
+
+    def _annotate_set_slot_evidence(self, out: dict, entity: str,
+                                    attribute: str, members: list) -> None:
+        """Carry the flag onto a set-valued slot's payload.
+
+        A set slot is served as ONE grouped dict with no scalar record
+        behind it, so this lookup payload carried neither the
+        ``source_entries`` the scalar path fetches nor a confirmation stamp
+        (``cortex_search``'s grouped entry has carried ``last_confirmed``
+        since the Task-6 review; it lacked only the traces). Either way no
+        set slot could carry ``re_verify``, while ``slots_for_entries``
+        (kind-agnostic) named set slots in ``derived_flagged`` and
+        ``memory_fact_get`` promised the flag without qualification.
+
+        The cross-index is keyed on the SLOT, not the member, so one
+        ``traces_for_slot`` answers for the whole set. The slot's
+        confirmation stamp is the newest member's, which makes the flag
+        clearable the way the scalar path's ``last_confirmed`` does — but
+        bluntly: ADDING a member also stamps the slot, so an unrelated add
+        silences the caution for members nobody re-checked. Accepted rather
+        than keyed to confirmations only, because a set slot is a single
+        served answer and a per-member flag on a grouped payload has
+        nowhere to render. ``_annotate_recalled_facts``, where members ARE
+        served individually, matches per member instead. Only the flag keys
+        are merged out, so the set payload does not otherwise change shape.
+        Gated on ``traces.enabled`` before the query, not after: unlike the
+        scalar path — which SERVES its traces as ``source_entries`` and so
+        fetches them either way — this lookup is purely feeding the
+        annotation and discards the result, so with the cross-index off the
+        query is pure waste. ``test_flag_off_when_the_cross_index_is_disabled``
+        states the rule it would break: "the read surface must not pay for
+        one". Caller holds the lock."""
+        if not self.config.memory.traces.enabled:
+            return
+        from pseudolife_memory.memory.cortex import _norm_key
+        probe = {
+            "source_entries": self._storage.traces_for_slot(
+                _norm_key(entity), _norm_key(attribute)),
+            # ``or m.asserted_at`` is the same legacy fallback the scalar
+            # path applies, taken per member so one unstamped member cannot
+            # drag the slot's clock back to nothing.
+            "last_confirmed": max(
+                (s for m in members
+                 if (s := m.last_confirmed or m.asserted_at)),
+                default=None),
+        }
+        self._annotate_evidence_supersession([probe])
+        if probe.get("re_verify"):
+            out["re_verify"] = True
+            out["re_verify_reason"] = probe["re_verify_reason"]
+
+    def _derived_from_entries_locked(self, entry_ids) -> list[dict]:
+        """Slots these source entries helped form, in display vocabulary.
+        Caller holds the lock; :meth:`derived_from_entries` is the public,
+        self-locking form.
+
+        CURRENT records supply the display naming and the rest of the store
+        only fills gaps. ``self._cortex.records`` holds every version of
+        every slot, so a ``setdefault`` over it alone names each slot after
+        whichever version happens to sit oldest — a slot written as
+        "Payments DB / Host" and re-asserted as "payments-db / host" comes
+        back under the name the reader can no longer look up.
+
+        And a trace row outlives the fact it formed (the cross-index is
+        slot-keyed, rows are never deleted, and a slot can end up with no
+        current value at all), so slots are MARKED with
+        ``has_current_value`` rather than filtered: a dead slot is still
+        blast radius worth seeing, it is just not a fact to go re-check.
+
+        Ordered live slots first, then by normalized key. The order is what
+        ``supersede``'s cap slices, and alphabetical order alone would let a
+        correction touching many dead slots spend the whole cap on rows
+        nobody can act on while truncating away the live ones. Note the
+        rows are SORTED on the normalized key but RENDERED with display
+        names, so the result can look unsorted to a reader."""
+        ids = [int(i) for i in (entry_ids or []) if i is not None]
+        if (not ids or self._storage is None
+                or not self.config.memory.traces.enabled):
+            return []
+        from pseudolife_memory.memory.cortex import _norm_key
+        by_slot: dict[tuple[str, str], list[int]] = {}
+        for r in self._storage.slots_for_entries(ids):
+            by_slot.setdefault(
+                (r["entity_norm"], r["attribute_norm"]), []).append(r["entry_id"])
+        disp: dict[tuple[str, str], tuple[str, str]] = {}
+        live: set[tuple[str, str]] = set()
+        if self._cortex is not None:
+            for rec in self._cortex.current_records():
+                key = (_norm_key(rec.entity), _norm_key(rec.attribute))
+                disp.setdefault(key, (rec.entity, rec.attribute))
+                live.add(key)
+            for rec in self._cortex.records:
+                disp.setdefault(
+                    (_norm_key(rec.entity), _norm_key(rec.attribute)),
+                    (rec.entity, rec.attribute))
+        return [{"entity": disp.get(k, k)[0], "attribute": disp.get(k, k)[1],
+                 "has_current_value": k in live,
+                 "source_entry_ids": sorted(set(src))}
+                for k, src in sorted(by_slot.items(),
+                                     key=lambda kv: (kv[0] not in live, kv[0]))]
+
+    def derived_from_entries(self, entry_ids) -> dict[str, Any]:
+        """What the dream derived FROM these source memories — the retract
+        read of the engram cross-index. The blast radius of correcting or
+        removing an entry, reported so a human can scope the repair; nothing
+        here mutates anything."""
+        with self._lock:
+            self._ensure_init()
+            facts = self._derived_from_entries_locked(entry_ids)
+        return {"count": len(facts), "facts": facts}
 
     def cortex_contenders(self, entity: str, attribute: str) -> dict[str, Any]:
         """Active contenders parked at a slot — a conflicting lower-tier / below-
@@ -2490,21 +2995,7 @@ class MemoryService(DreamOps):
             for tag, payload in order:
                 if tag == "scalar":
                     r, s = payload
-                    d = {**_cortex_record_to_dict(
-                        r, stale_policy=self._stale_policy),
-                        "score": round(float(s), 4)}
-                    conts = self._cortex.contenders_for(r.entity, r.attribute)
-                    if conts:
-                        d["contested"] = True
-                        d["contender_value"] = conts[0].value
-                        d["contender_origin"] = conts[0].origin
-                    else:
-                        d["contested"] = False
-                    if self._storage is not None:
-                        from pseudolife_memory.memory.cortex import _norm_key
-                        d["source_entries"] = self._storage.traces_for_slot(
-                            _norm_key(r.entity), _norm_key(r.attribute))
-                    entries.append(d)
+                    entries.append(self._scalar_fact_entry(r, s))
                 else:
                     from pseudolife_memory.memory.cortex import compose_set_value
                     key = payload
@@ -2532,11 +3023,25 @@ class MemoryService(DreamOps):
                     anchor = max(
                         ((m.tx_time or m.asserted_at) for m in all_members),
                         default=None)
+                    # The cross-index is slot-keyed, so one lookup answers for
+                    # the whole set — the same per-row cost the scalar branch
+                    # above already pays, and without it the grouped entry is
+                    # the one served fact shape that can never carry
+                    # ``re_verify`` (the annotation below reads this key).
+                    # Ungated on ``traces.enabled`` to match that branch:
+                    # ``source_entries`` is served provenance in its own
+                    # right, and the knob gates the FLAG, not the display.
+                    set_traces = []
+                    if self._storage is not None:
+                        from pseudolife_memory.memory.cortex import _norm_key
+                        set_traces = self._storage.traces_for_slot(
+                            _norm_key(entity), _norm_key(attribute))
                     entries.append({
                         "kind": "set",
                         "entity": entity,
                         "attribute": attribute,
                         "value": value,
+                        "source_entries": set_traces,
                         "members": [_cortex_record_to_dict(
                             m, stale_policy=self._stale_policy)
                             for m in all_members],
@@ -2547,12 +3052,110 @@ class MemoryService(DreamOps):
                         "asserted_at": anchor,
                         "age": _relative_time(anchor) if anchor else None,
                     })
+            # TypeRetrieve (arXiv 2608.22752): in-scope CONSTRAINT facts are
+            # pinned ahead of the cosine ranking, inside the same top_k.
+            if getattr(self.config.memory.cortex, "pin_constraints", True):
+                entries = self._pin_constraint_facts(query, emb, entries, top_k,
+                                                     min_score)
             _demote_stale(entries, self._stale_policy)
+            self._annotate_evidence_supersession(entries)
             from pseudolife_memory.memory.cortex import _norm_key
             self._track_slot_reads(sorted({
                 (_norm_key(e["entity"]), _norm_key(e["attribute"]))
                 for e in entries}))
             return {"count": len(entries), "entries": entries}
+
+    def _scalar_fact_entry(self, r, s) -> dict[str, Any]:
+        """One served scalar fact for ``cortex_search`` (caller holds the
+        lock): the record dict plus score, contender flags and the slot's
+        source entries. Shared by the ranked path and the pinned path so a
+        pinned fact is served in exactly the shape a ranked one is."""
+        d = {**_cortex_record_to_dict(r, stale_policy=self._stale_policy),
+             "score": round(float(s), 4)}
+        conts = self._cortex.contenders_for(r.entity, r.attribute)
+        if conts:
+            d["contested"] = True
+            d["contender_value"] = conts[0].value
+            d["contender_origin"] = conts[0].origin
+        else:
+            d["contested"] = False
+        if self._storage is not None:
+            from pseudolife_memory.memory.cortex import _norm_key
+            d["source_entries"] = self._storage.traces_for_slot(
+                _norm_key(r.entity), _norm_key(r.attribute))
+        return d
+
+    def _pin_constraint_facts(self, query: str, emb, entries: list[dict],
+                              top_k: int, min_score: float = 0.0) -> list[dict]:
+        """TypeRetrieve (arXiv 2608.22752) for the cortex block. Caller
+        holds the lock.
+
+        In scope = the query names the fact's entity (``_entity_in_query``
+        — one string scan per constraint-labelled current scalar; no
+        second embedding pass, no index to keep fresh). In-scope
+        constraints go FIRST, marked ``pinned: True``, ahead of better-
+        scoring ranked facts — but pinning is exemption from RANKING, not
+        from relevance: a pin must clear the caller's ``min_score`` floor
+        (``memory_search`` passes ``guard_min_score``, whose whole job is
+        to stop weak facts being asserted as canonical), pins take at most
+        ``max(1, top_k // 2)`` of the budget so the ranked answer always
+        keeps the rest, and among pins the best cosine wins the slots
+        (the least relevant rules are dropped, not the newest). The
+        peer review of 2026-09-02 reproduced the unbounded version: six
+        rules on one entity displaced the whole block at cosine ~0.37
+        against a 0.5 floor. A pinned fact that never made the ranked
+        list is served in the identical shape with its true cosine as
+        ``score``, so the reader can see that it was pinned. No constraint
+        labels in the bank → the input is returned untouched, so an
+        unlabelled bank is served byte-identically. Set members carry no
+        labels in v1 and are never pinned. Runs BEFORE ``_demote_stale``
+        on purpose: under ``stale_policy="demote"`` a stale (slow /
+        volatile) constraint sinks below the fresh ranked facts — the
+        staleness policy is a trust decision and outranks the pin; the
+        default ``evergreen`` never goes stale, so this only bites on a
+        constraint the writer also marked transient."""
+        import torch  # noqa: PLC0415 - no module-level torch in service.py
+        pins = [r for r in self._cortex.current_records()
+                if r.kind == "scalar"
+                and r.distortion_tolerance == "constraint"
+                and _entity_in_query(r.entity, query)]
+        if not pins:
+            return entries
+        k = max(1, int(top_k))
+        cap = max(1, k // 2)
+        floor = float(min_score or 0.0)
+        keyed = {(e["entity"], e["attribute"]): e for e in entries
+                 if e.get("kind") != "set"}
+        q = emb.detach().reshape(1, -1).to("cpu", torch.float32)
+        scored: list[tuple[float, int, Any]] = []
+        for i, r in enumerate(pins):
+            d = keyed.get((r.entity, r.attribute))
+            if d is not None:
+                score = float(d["score"])
+            elif r.embedding is not None:
+                v = r.embedding.detach().reshape(1, -1).to("cpu", torch.float32)
+                score = float(torch.nn.functional.cosine_similarity(q, v).item())
+            else:
+                score = 0.0
+            if score < floor:
+                continue
+            scored.append((score, i, r))
+        scored.sort(key=lambda t: (-t[0], t[1]))   # best cosine, then record order
+        pins = [r for _s, _i, r in scored[:cap]]
+        if not pins:
+            return entries
+        pinned: list[dict] = []
+        for score, _i, r in scored[:cap]:
+            d = keyed.get((r.entity, r.attribute))
+            if d is None:
+                d = self._scalar_fact_entry(r, score)
+            d["pinned"] = True
+            pinned.append(d)
+        pinned_keys = {(r.entity, r.attribute) for r in pins}
+        rest = [e for e in entries
+                if e.get("kind") == "set"
+                or (e["entity"], e["attribute"]) not in pinned_keys]
+        return (pinned + rest)[:k]
 
     def _cortex_bm25_fuse(self, query, hits, cfg, top_k):
         """Fuse dense cortex hits with a lexical pool over composed fact
@@ -2675,14 +3278,63 @@ class MemoryService(DreamOps):
             _demote_stale(rows, self._stale_policy)
             return {"count": len(rows), "entries": rows}
 
-    def world_forget(self, entity: str, attribute: str | None = None) -> dict[str, Any]:
+    def world_forget(self, entity: str, attribute: str | None = None, *,
+                     decided_by: str = "human",
+                     reason: str | None = None) -> dict[str, Any]:
+        """Retire the current world fact(s) at an entity or one slot — the
+        rows stay (status ``retired``) and an FK-free ``store_decisions``
+        row carries who, why, and the verbatim record; ``world_restore``
+        is the undo. ``removed`` is kept for callers of the old hard-delete
+        contract and counts the retired records."""
+        import time as _t
         with self._lock:
             self._ensure_init()
             assert self._world is not None
-            removed = self._world.forget(entity, attribute)
-            if removed:
+            now = _t.time()
+            recs = self._world.retire(entity, attribute, now=now)
+            if recs:
+                for r in recs:
+                    self._record_store_decision(
+                        "world", r, "retire", decided_by, reason, now)
                 self._save_world()
-            return {"removed": removed, "entity": entity, "attribute": attribute}
+            return {"removed": len(recs), "retired": len(recs),
+                    "entity": entity, "attribute": attribute}
+
+    def world_restore(self, entity: str, attribute: str | None = None, *,
+                      decided_by: str = "human") -> dict[str, Any]:
+        """Undo a ``world_forget``: bring the newest retired record back at
+        every retired slot of the entity (or the one slot) that is not live
+        again. Once compaction has purged the retired row, the audit
+        snapshot is re-written instead (``source: audit_snapshot``)."""
+        import time as _t
+        from pseudolife_memory.memory.cortex import _norm_key
+        with self._lock:
+            self._ensure_init()
+            assert self._world is not None
+            now = _t.time()
+            recs = self._world.restore(entity, attribute)
+            if recs:
+                for r in recs:
+                    self._record_store_decision(
+                        "world", r, "restore", decided_by, None, now)
+                self._save_world()
+            # Slots the in-memory pass could not cover (compaction purged
+            # the retired row) fall back to their audit snapshot in the
+            # SAME call — "every retired slot" is the contract, and the two
+            # populations coexist under a whole-entity restore.
+            ne = _norm_key(entity)
+            na = _norm_key(attribute) if attribute is not None else None
+            live = {k for k in self._world._current
+                    if k[0] == ne and (na is None or k[1] == na)}
+            snaps = [] if self._storage is None else [
+                d for d in self._storage.retired_slots("world", entity_norm=ne)
+                if (na is None or d["attribute_norm"] == na) and d.get("record")
+                and (d["entity_norm"], d["attribute_norm"]) not in live]
+        entries = [_world_record_to_dict(r, stale_policy=self._stale_policy)
+                   for r in recs]
+        return self._restore_result(
+            "world", recs, entries, snaps, decided_by, live,
+            {"entity": entity, "attribute": attribute})
 
     # ------------------------------------------------------------------
     # Procedural / outcome memory — lessons (schema v10)
@@ -2748,6 +3400,7 @@ class MemoryService(DreamOps):
                      polarity: str = "+", confidence: float = 0.6,
                      origin: str = "agent",
                      provenance: set[str] | list[str] | None = None,
+                     support: set[str] | list[str] | None = None,
                      now: float | None = None,
                      valid_time: float | None = None) -> dict[str, Any]:
         """Write / confirm / supersede a lesson at the ``(task, aspect)`` slot and
@@ -2764,7 +3417,8 @@ class MemoryService(DreamOps):
             action, rec = self._lessons.write_fact(
                 task, aspect, lesson, emb, about=about, outcome=outcome,
                 polarity=polarity, confidence=confidence, origin=origin,
-                provenance=provenance, now=now, valid_time=valid_time,
+                provenance=provenance, support=support, now=now,
+                valid_time=valid_time,
                 hlc=self._hlc.tick(), writer_id=writer_id, session_id=session_id)
             self._link_lesson_graph(task, rec.about, rec.polarity)
             self._save_lessons()
@@ -2777,17 +3431,33 @@ class MemoryService(DreamOps):
         if self._storage is None:
             return
         from pseudolife_memory.graph import norm_name
-        st = self._storage
         tn = norm_name(task)
         if not tn:
             return
-        tid = st.ensure_entity(tn, display=task.strip(), etype="task-type")
+        # Resolve through the alias table before upserting by canonical:
+        # ensure_entity alone minted a fresh canonical for a name that was
+        # already an alias (a lesson about "pr-235" after that node was
+        # folded into "PR #235"), and that shadow then out-resolved the
+        # alias everywhere find_entity is consulted — the graph detached
+        # the surviving node's alias-keyed facts while cortex_lookup's
+        # retry, before it learned to skip shadowed aliases, kept serving
+        # them. Same alias-aware find-then-create every other write uses.
+        tid = self._resolve_or_create_entity(task, etype="task-type")["id"]
         if not about:
             return
         an = norm_name(about)
         if not an or an == tn:
             return
-        oid = st.ensure_entity(an, display=about.strip())
+        # The write-time junk gate every other write path applies (plus a
+        # spaced "A / B" or "A + B" joiner, which names two things): a
+        # list-, compound- or sentence-shaped ``about`` keeps its text on
+        # the lesson but gets no graph node — 11 of the 20 pending junk
+        # proposals on 2026-09-02 were exactly these mints.
+        from pseudolife_memory.memory.graph_consolidation import (
+            _compound_halves, junk_name_reason)
+        if junk_name_reason(about) or _compound_halves(about) is not None:
+            return          # same compound predicate the junk detector uses
+        oid = self._resolve_or_create_entity(about)["id"]
         relation = "avoids" if polarity == "-" else "prefers"
         self._graph.upsert_edge(tid, relation, oid, confidence=0.7, origin="action")
 
@@ -2962,14 +3632,187 @@ class MemoryService(DreamOps):
                     f"facts about {name} changed since this lesson")
         return rows
 
-    def lesson_forget(self, task: str, aspect: str | None = None) -> dict[str, Any]:
+    def lesson_forget(self, task: str, aspect: str | None = None, *,
+                      decided_by: str = "human",
+                      reason: str | None = None) -> dict[str, Any]:
+        """Retire the current lesson(s) at a task or one ``(task, aspect)``
+        slot — the rows stay (status ``retired``) and an FK-free
+        ``store_decisions`` row carries who, why, and the verbatim record;
+        ``lesson_restore`` is the undo. The 2026-09-02 triage hard-deleted
+        three lessons nothing could bring back — a forget is now reversible
+        by construction. ``removed`` is kept for callers of the old contract
+        and counts the retired records. Best-effort like every store write:
+        the in-memory retire lands first, then the audit row, then the
+        per-slot sync — a persistence failure raises ``PersistenceError``
+        and the in-memory state stands until the next successful sync."""
+        import time as _t
         with self._lock:
             self._ensure_init()
             assert self._lessons is not None
-            removed = self._lessons.forget(task, aspect)
-            if removed:
+            now = _t.time()
+            recs = self._lessons.retire(task, aspect, now=now)
+            if recs:
+                for r in recs:
+                    self._record_store_decision(
+                        "lesson", r, "retire", decided_by, reason, now)
                 self._save_lessons()
-            return {"removed": removed, "task": task, "aspect": aspect}
+            return {"removed": len(recs), "retired": len(recs),
+                    "task": task, "aspect": aspect}
+
+    def lesson_restore(self, task: str, aspect: str | None = None, *,
+                       decided_by: str = "human") -> dict[str, Any]:
+        """Undo a ``lesson_forget``: bring the newest retired record back at
+        every retired slot of the task (or the one slot) that is not live
+        again — provenance, stamps and embedding intact. Once compaction
+        has purged the retired row, the audit snapshot is re-written
+        through ``lesson_write`` instead (``source: audit_snapshot``)."""
+        import time as _t
+        from pseudolife_memory.memory.cortex import _norm_key
+        with self._lock:
+            self._ensure_init()
+            assert self._lessons is not None
+            now = _t.time()
+            recs = self._lessons.restore(task, aspect)
+            if recs:
+                for r in recs:
+                    self._record_store_decision(
+                        "lesson", r, "restore", decided_by, None, now)
+                    self._link_lesson_graph(r.entity, r.about, r.polarity)
+                self._save_lessons()
+            # Slots the in-memory pass could not cover (compaction purged
+            # the retired row) fall back to their audit snapshot in the
+            # SAME call — "every retired slot" is the contract, and the two
+            # populations coexist under a whole-task restore.
+            ne = _norm_key(task)
+            na = _norm_key(aspect) if aspect is not None else None
+            live = {k for k in self._lessons._current
+                    if k[0] == ne and (na is None or k[1] == na)}
+            snaps = [] if self._storage is None else [
+                d for d in self._storage.retired_slots("lesson", entity_norm=ne)
+                if (na is None or d["attribute_norm"] == na) and d.get("record")
+                and (d["entity_norm"], d["attribute_norm"]) not in live]
+        entries = [_lesson_record_to_dict(r) for r in recs]
+        return self._restore_result(
+            "lesson", recs, entries, snaps, decided_by, live,
+            {"task": task, "aspect": aspect})
+
+    def _restore_result(self, store: str, recs: list, entries: list[dict],
+                        snaps: list[dict], decided_by: str, live: set,
+                        label: dict[str, Any]) -> dict[str, Any]:
+        """Combine the in-memory restore with the snapshot fallback for the
+        slots it could not cover. Lock-free (the fallback writes through
+        the locked store writers). ``source`` is ``retired_record``,
+        ``audit_snapshot`` or ``mixed``."""
+        fb = (self._restore_from_snapshot(store, snaps, decided_by)
+              if snaps else {"restored": 0, "entries": []})
+        total = len(recs) + fb["restored"]
+        if not total:
+            return {"restored": 0, **label,
+                    "reason": "slot_live" if live else "nothing_retired"}
+        source = ("retired_record" if not fb["restored"]
+                  else "audit_snapshot" if not recs else "mixed")
+        return {"restored": total, "source": source, **label,
+                "entries": entries + fb["entries"]}
+
+    def _record_store_decision(self, store: str, rec, action: str,
+                               decided_by: str | None, reason: str | None,
+                               now: float) -> None:
+        """Audit row for a lesson/world retire or restore, carrying the
+        verbatim record. Caller holds the lock; no-op in file mode."""
+        if self._storage is None:
+            return
+        snapshot = ({**_lesson_record_to_dict(rec), "support": sorted(rec.support)}
+                    if store == "lesson" else _world_record_snapshot(rec))
+        ne, na = rec.key
+        self._storage.record_store_decision(
+            store, ne, na, action, decided_by=decided_by, reason=reason,
+            record=snapshot, now=now)
+
+    def _restore_from_snapshot(self, store: str, snaps: list[dict],
+                               decided_by: str) -> dict[str, Any]:
+        """Re-write retired slots from their audit snapshots — the fallback
+        once compaction has purged the retired rows. Lock-free: the store
+        writers take the lock themselves, so a concurrent write landing on
+        the slot between the caller's slot check and the write here is
+        superseded by the snapshot value (narrow; the retired-record path
+        under the lock has no such window). What a snapshot restore cannot
+        bring back: the HLC / writer / session / tx_time / valid_time
+        stamps (re-minted at write time) and, for world facts, polarity
+        (``world_write`` has none; no negative world facts exist)."""
+        import time as _t
+        restored: list[dict] = []
+        for d in snaps:
+            rec = d["record"]
+            if store == "lesson":
+                out = self.lesson_write(
+                    rec["task"], rec["aspect"], rec["lesson"],
+                    about=rec.get("about"),
+                    outcome=rec.get("outcome") or "success",
+                    polarity=rec.get("polarity") or "+",
+                    confidence=float(rec.get("confidence") or 0.6),
+                    origin=rec.get("origin") or "agent",
+                    provenance=rec.get("provenance") or None,
+                    support=rec.get("support") or None)
+            else:
+                # world_write has no polarity parameter: a negative world
+                # fact (none exist today) would come back positive here.
+                out = self.world_write(
+                    rec["entity"], rec["attribute"], rec["value"],
+                    confidence=float(rec.get("confidence") or 0.7),
+                    source_url=rec.get("source_url") or "",
+                    source_quote=rec.get("source_quote") or "",
+                    freshness_class=rec.get("freshness_class") or "volatile",
+                    retrieved_at=rec.get("retrieved_at"),
+                    content_hash=rec.get("content_hash"),
+                    source_doc_id=rec.get("source_doc_id"))
+            if out.get("action") == "rejected":
+                continue
+            restored.append(d)
+        with self._lock:
+            self._ensure_init()
+            if self._storage is not None:
+                now = _t.time()
+                for d in restored:
+                    self._storage.record_store_decision(
+                        store, d["entity_norm"], d["attribute_norm"],
+                        "restore", decided_by=decided_by,
+                        reason="from audit snapshot", record=d["record"],
+                        now=now)
+        return {"restored": len(restored), "source": "audit_snapshot",
+                "entries": [d["record"] for d in restored]}
+
+    def curation_retired(self, store: str | None = None,
+                         limit: int = 100) -> dict[str, Any]:
+        """Slots a forget retired that are still retired (newest first),
+        with who/why and the verbatim record — the listing behind the
+        restore route. ``store`` None = both stores."""
+        if store is not None and store not in _CURATION_STORES:
+            return {"error": "bad_store", "store": store,
+                    "stores": list(_CURATION_STORES)}
+        stores = (store,) if store else _CURATION_STORES
+        with self._lock:
+            self._ensure_init()
+            rows: list[dict] = []
+            if self._storage is not None:
+                for st in stores:
+                    rows.extend(self._storage.retired_slots(st, limit=limit))
+            # A retired slot the dream re-minted is live again (the common
+            # case for lessons): nothing writes a decision row for that, so
+            # the listing checks the live slot index the way restore does —
+            # a restore there could only answer ``slot_live``.
+            live: set[tuple] = set()
+            if self._lessons is not None:
+                live |= {("lesson", *k) for k in self._lessons._current}
+            if self._world is not None:
+                live |= {("world", *k) for k in self._world._current}
+            rows = [d for d in rows
+                    if (d["store"], d["entity_norm"], d["attribute_norm"]) not in live]
+        rows.sort(key=lambda d: (-float(d["decided_at"]), -int(d["id"])))
+        rows = rows[: max(0, int(limit))]
+        for d in rows:      # the key restore_slot / the routes take back
+            d["key"] = _slot_key(d["entity_norm"], d["attribute_norm"])
+        return {"count": len(rows), "entries": rows, "store": store,
+                "limit": limit}
 
     def _synthesized_lesson_duplicate(self, task: str, aspect: str,
                                       lesson: str, polarity: str,
@@ -3015,6 +3858,7 @@ class MemoryService(DreamOps):
                     d["entity_id"] = emap.get(norm_name(d["entity"]))
                     d["source_entries"] = self._storage.traces_for_slot(
                         _norm_key(d["entity"]), _norm_key(d["attribute"]))
+                self._annotate_evidence_supersession(rows)
             return {"count": len(rows), "entries": rows}
 
     def compact_superseded(self) -> dict[str, Any]:
@@ -3144,9 +3988,13 @@ class MemoryService(DreamOps):
         """Causal chain — "what led to X": dated events about an entity,
         merged from four streams (canonical fact assertions + supersessions,
         source entries, graph edges, lessons) and sorted oldest→newest.
-        Alias-aware; streams degrade independently (no graph node → facts +
-        lessons only). Returns ``{found, entity, count, events}`` with events
-        ``{t, kind: fact_set|superseded|entry|edge|lesson, summary, refs}``."""
+        Alias-aware in both directions — the fact and lesson streams key on
+        the queried name, its canonical AND the node's aliases, so slot
+        history written under a name a later merge folded into the node is
+        the node's history too. Streams degrade independently (no graph
+        node → facts + lessons only). Returns ``{found, entity, count,
+        events}`` with events ``{t, kind:
+        fact_set|superseded|entry|edge|lesson, summary, refs}``."""
         from pseudolife_memory.memory.cortex import _norm_key
         with self._lock:
             self._ensure_init()
@@ -3162,7 +4010,13 @@ class MemoryService(DreamOps):
                 node = self._storage.find_entity(norm_name(name))
                 if node is not None:
                     display = node["display"]
-                    keys.add(_norm_key(node.get("canonical") or ""))
+                    # Canonical plus the aliases find_entity resolves to
+                    # this node (a merge folds the absorbed canonical into
+                    # them without rewriting the records written under it);
+                    # an alias shadowed by another entity's canonical is
+                    # that entity's history, not this one's.
+                    keys.update(_norm_key(n) for n in
+                                self._alias_retry_names(name, node))
             events: list[dict] = []
             # 1. canonical fact history — assertions and supersessions.
             for r in self._cortex.records:
@@ -3293,7 +4147,10 @@ class MemoryService(DreamOps):
                  "rank": rank,
                  "score": f.get("score"),
                  "kind": f.get("kind", "scalar"),
-                 "contested": bool(f.get("contested", False))}
+                 "contested": bool(f.get("contested", False)),
+                 # v35: a pinned fact sits at rank 0 by policy, not by
+                 # score — a reranker trained on this log must know.
+                 "pinned": bool(f.get("pinned", False))}
                 for rank, f in enumerate(facts)
             ]
             with self._lock:
@@ -3655,6 +4512,7 @@ class MemoryService(DreamOps):
 
     def _close_session_locked(
         self, session_key: str | None, run_dream: bool,
+        prune_empty: bool = True,
     ) -> tuple[dict[str, Any], bool, bool]:
         """Cascade-close the session root for ``session_key`` and prune the
         subtree if it captured zero entries. Caller MUST hold the lock and have
@@ -3663,13 +4521,23 @@ class MemoryService(DreamOps):
         ``(result_dict, should_fire_dream, found)``; ``result_dict`` is ``{}``
         when nothing matched OR the subtree was pruned empty — ``found``
         disambiguates the two (``False`` only when no root matched
-        ``session_key`` at all)."""
+        ``session_key`` at all).
+
+        ``prune_empty=False`` (the idle reaper) closes an empty subtree but
+        KEEPS it: deleting it here orphaned the session's briefing handle
+        mid-break (2026-09-02) — the reaper's sweep deletes it with a
+        tombstone once past the resume window instead. An explicit end
+        (shim exit, ``episode_end``) keeps the immediate prune: the session
+        affirmatively finished, so no handle can legitimately return. An
+        empty close never fires a dream and is never auto-titled, deferred
+        or not."""
         assert self._cms is not None
         em = self._cms.episodes
         closed = em.end_session(session_key)
         found = closed is not None
         result = self._episode_to_dict(closed) if closed is not None else {}
         pruned = False
+        empty = False
         if closed is not None:
             subtree = {closed.id} | {
                 e.id for e in em.episodes.values()
@@ -3677,16 +4545,22 @@ class MemoryService(DreamOps):
             }
             counts = self._episode_entry_counts()
             if sum(counts.get(i, 0) for i in subtree) == 0:
-                for i in subtree:
-                    em.remove(i)
-                    self._delete_episode_row(i)
-                pruned = True
+                empty = True
+                if prune_empty:
+                    for i in subtree:
+                        em.remove(i)
+                        self._delete_episode_row(i)
+                    pruned = True
+                else:
+                    self._deferred_empty_roots[closed.id] = float(
+                        closed.ended_at or 0.0)
+                    self._persist_deferred_empty()
             else:
                 self._auto_title_locked(closed, subtree)
                 result = self._episode_to_dict(closed)
         if not pruned:
             self._persist_episodes()
-        fire = bool(run_dream and result and not pruned)
+        fire = bool(run_dream and result and not pruned and not empty)
         return ({} if pruned else result), fire, found
 
     def reap_idle_sessions(
@@ -3695,11 +4569,14 @@ class MemoryService(DreamOps):
         """Close session episodes with no activity for ``idle_seconds``.
 
         In the direct-HTTP transport there is no session-end signal, so a
-        session episode is closed here once idle: empty ones are pruned, and
-        non-empty ones are closed (firing one end-of-session dream so outcome
-        signals become lessons). A later store from the same client lazily
-        opens a fresh episode. ``now`` is injectable for tests. Returns
-        ``{"reaped": int, "session_keys": [...]}``."""
+        session episode is closed here once idle: non-empty ones are closed
+        (firing one end-of-session dream so outcome signals become lessons),
+        and empty ones are closed but KEPT until past the resume window —
+        the session may only be on a break, and its briefing handle must
+        stay resumable (2026-09-02) — then swept with a tombstone. A later
+        store from the same client lazily opens a fresh episode. ``now`` is
+        injectable for tests. Returns
+        ``{"reaped": int, "session_keys": [...], "swept": int}``."""
         now = time.time() if now is None else now
         reaped: list[str] = []
         fired_any = False
@@ -3728,12 +4605,137 @@ class MemoryService(DreamOps):
                 if now - activity >= idle_seconds:
                     targets.append(root.session_key)
             for sk in targets:
-                _result, fire, _found = self._close_session_locked(sk, run_dream=True)
+                _result, fire, _found = self._close_session_locked(
+                    sk, run_dream=True, prune_empty=False)
                 reaped.append(sk)
                 fired_any = fired_any or fire
+            swept = self._sweep_stale_empty_roots_locked(now)
         if fired_any:
             self._fire_and_forget_dream()
-        return {"reaped": len(reaped), "session_keys": reaped}
+        return {"reaped": len(reaped), "session_keys": reaped, "swept": swept}
+
+    def _sweep_stale_empty_roots_locked(self, now: float) -> int:
+        """Delete session roots the reaper closed EMPTY (deferred prune)
+        once ``ended_at`` is past the session resume window, leaving a
+        tombstone so the always-pass briefing handle can still be honored
+        by recreating the episode (:meth:`_resolve_episode_handle`).
+        Deferred from the reaper's close because an immediate prune made
+        the handle unknown rather than resumable — the 2026-09-02
+        incident: a session that only read before a long break lost its
+        attribution.
+
+        Candidates come ONLY from ``_deferred_empty_roots`` — never from a
+        scan of the episode log, where "zero live band entries" also
+        matches real history whose memories were evicted (the flat
+        preset's capacity eviction is a true drop) or forgotten; sweeping
+        those would silently delete session records (review finding,
+        2026-09-02). A deferred root that was resumed, explicitly pruned,
+        or gained entries since is dropped from the map, not swept.
+        Caller holds the lock. Returns the number of roots swept."""
+        assert self._cms is not None
+        em = self._cms.episodes
+        retention = float(os.environ.get(
+            "PSEUDOLIFE_SESSION_RESUME_SECONDS", "21600"))
+        counts: dict[str, int] | None = None
+        swept = 0
+        map_changed = False
+        for rid in list(self._deferred_empty_roots):
+            root = em.episodes.get(rid)
+            if root is None or root.ended_at is None:
+                # explicitly pruned, or resumed — no longer deferred
+                del self._deferred_empty_roots[rid]
+                map_changed = True
+                continue
+            if now - root.ended_at <= retention:
+                continue
+            subtree = {rid} | {
+                e.id for e in em.episodes.values()
+                if em._descends_from(e, rid)}
+            if counts is None:
+                counts = self._episode_entry_counts()
+            if sum(counts.get(i, 0) for i in subtree) != 0:
+                # gained entries after a resume: real history now
+                del self._deferred_empty_roots[rid]
+                map_changed = True
+                continue
+            if root.session_key:
+                self._episode_tombstones[rid] = (root.session_key,
+                                                 float(root.ended_at),
+                                                 root.title or "")
+            for i in subtree:
+                em.remove(i)
+                self._delete_episode_row(i)
+            del self._deferred_empty_roots[rid]
+            map_changed = True
+            swept += 1
+        if swept:
+            self._expire_tombstones_locked(now)
+            self._persist_tombstones()
+        if map_changed:
+            self._persist_deferred_empty()
+        return swept
+
+    def _expire_tombstones_locked(self, now: float) -> None:
+        """Drop tombstones past the handle-resume window, and cap the map so
+        a bank reaping many empty sessions can't grow meta without bound.
+        Caller holds the lock; caller persists."""
+        window = self._handle_resume_window()
+        if window <= 0:
+            self._episode_tombstones.clear()
+            return
+        for tid in [t for t, meta in self._episode_tombstones.items()
+                    if now - meta[1] > window]:
+            del self._episode_tombstones[tid]
+        cap = 200
+        if len(self._episode_tombstones) > cap:
+            newest = sorted(self._episode_tombstones.items(),
+                            key=lambda kv: kv[1][1], reverse=True)[:cap]
+            self._episode_tombstones = dict(newest)
+
+    def _persist_tombstones(self) -> None:
+        """Write-through the tombstone map (small; best-effort like the
+        active-session pointer). No-op in file mode."""
+        if self._storage is None:
+            return
+        try:
+            self._storage.set_meta(
+                self._EPISODE_TOMBSTONES_META_KEY,
+                {tid: {"session_key": key, "ended_at": ended, "title": title}
+                 for tid, (key, ended, title)
+                 in self._episode_tombstones.items()})
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("episode tombstone write-through failed: %s", exc)
+
+    def _persist_deferred_empty(self) -> None:
+        """Write-through the deferred-empty-root map (small; best-effort
+        like the tombstones). No-op in file mode."""
+        if self._storage is None:
+            return
+        try:
+            self._storage.set_meta(self._DEFERRED_EMPTY_META_KEY,
+                                   dict(self._deferred_empty_roots))
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("deferred-empty write-through failed: %s", exc)
+
+    @staticmethod
+    def _handle_resume_window() -> float:
+        """The explicit-handle resume window (seconds). Separate from — and
+        much longer than — the session-key window, because a presented
+        handle is a daemon-minted id only that session's briefing carried:
+        an explicit identity claim, not an inference. Default 30 days so a
+        session deferred for lack of GPU time (or just parked) still
+        attributes on return (2026-09-02); ``0`` disables closed-handle
+        resume and tombstone recreation. Parses defensively: this sits on
+        the handle-resolution path, which promises never to raise (a stale
+        handle must not lose a memory), so a typo'd env var falls back to
+        the default instead of failing every handle-carrying write."""
+        try:
+            return float(os.environ.get(
+                "PSEUDOLIFE_HANDLE_RESUME_SECONDS", "2592000"))
+        except ValueError:
+            logger.warning("PSEUDOLIFE_HANDLE_RESUME_SECONDS is not a "
+                           "number; using the 30-day default")
+            return 2592000.0
 
     def _persist_episodes(self) -> None:
         """Write-through the episode log (small; a full upsert sweep is the
@@ -3773,11 +4775,14 @@ class MemoryService(DreamOps):
             resume: bool = True) -> tuple[str, str | None] | None:
         """Identity tier 2 (spec 2026-07-18): match ``handle`` (a daemon-minted
         episode id or an unambiguous prefix, >=8 chars) against an OPEN root
-        episode — or a recently-reaped one (within
-        ``PSEUDOLIFE_SESSION_RESUME_SECONDS``), which is reopened: the
-        briefing advertises the handle as always-pass, so the idle reaper
-        closing the root mid-session must not defeat it (observed live
-        2026-08-10). Unlike a session-key resume, a handle resume never moves
+        episode — or a reaped one (within
+        ``PSEUDOLIFE_HANDLE_RESUME_SECONDS``, its own window, far longer
+        than the session-key one), which is reopened, or a swept-empty one,
+        which is recreated from its tombstone: the briefing advertises the
+        handle as always-pass, so neither the idle reaper closing the root
+        mid-session (observed live 2026-08-10) nor the sweep deleting an
+        empty root during a multi-day break (2026-09-02) may defeat it.
+        Unlike a session-key resume, a handle resume never moves
         ``current_id`` — the writer may be a different session. Caller MUST
         hold the lock. Returns ``(episode_id, session_key)`` on exactly one
         match; ``None`` on any miss — callers warn-and-degrade, never raise
@@ -3803,24 +4808,47 @@ class MemoryService(DreamOps):
         # end on a closed session refuses instead of resurrecting it.
         if not resume:
             return None
-        resume_window = float(os.environ.get(
-            "PSEUDOLIFE_SESSION_RESUME_SECONDS", "21600"))
+        resume_window = self._handle_resume_window()
         if resume_window <= 0:
             return None
+        now = time.time()
         closed = [e for e in self._cms.episodes.episodes.values()
                   if e.parent_id is None and e.ended_at is not None
                   and e.session_key and e.id.startswith(handle)]
-        if len(closed) != 1:
+        if len(closed) > 1:
             return None
-        ep = closed[0]
-        if time.time() - ep.ended_at > resume_window:
+        if len(closed) == 1:
+            ep = closed[0]
+            if now - ep.ended_at > resume_window:
+                return None
+            ep.ended_at = None
+            ep.closed_by_new_start = False
+            self._episode_touches[ep.id] = now
+            self._persist_episodes()
+            logger.info("resumed session episode %s via handle", ep.id)
+            return (ep.id, ep.session_key)
+        # Tombstone recreation: the sweep deleted this root as an empty husk
+        # while its session was on a long break. The handle proves the
+        # session is back — recreate the episode under its original id so
+        # attribution lands where the briefing promised.
+        tomb = [(tid, meta) for tid, meta in self._episode_tombstones.items()
+                if tid.startswith(handle)]
+        if len(tomb) != 1:
             return None
-        ep.ended_at = None
-        ep.closed_by_new_start = False
-        self._episode_touches[ep.id] = time.time()
+        tid, (skey, ended_at, title) = tomb[0]
+        if now - ended_at > resume_window:
+            return None
+        from pseudolife_memory.memory.episodes import Episode
+        ep = Episode(id=tid,
+                     title=title or time.strftime("session - %Y-%m-%d %H:%M"),
+                     started_at=now, session_key=skey)
+        self._cms.episodes.episodes[tid] = ep    # never moves current_id
+        del self._episode_tombstones[tid]
+        self._persist_tombstones()
+        self._episode_touches[tid] = now
         self._persist_episodes()
-        logger.info("resumed session episode %s via handle", ep.id)
-        return (ep.id, ep.session_key)
+        logger.info("recreated swept session episode %s via handle", tid)
+        return (tid, skey)
 
     def _ensure_session_episode(self, session_key: str | None) -> str | None:
         """Daemon-owned lazy episode open. In the direct-HTTP transport there is
@@ -4369,6 +5397,7 @@ class MemoryService(DreamOps):
 
             now = time.time()
             superseded: list[str] = []
+            superseded_entries: list[MemoryEntry] = []
             for old_text in replaces:
                 marked_this_round = False
                 # Exact-text pass for this specific replacement.
@@ -4381,6 +5410,7 @@ class MemoryService(DreamOps):
                             entry.superseded_at = now
                             entry.superseded_by_text = new_text
                             superseded.append(entry.text)
+                            superseded_entries.append(entry)
                             marked_this_round = True
                 if marked_this_round:
                     continue
@@ -4393,9 +5423,28 @@ class MemoryService(DreamOps):
                         target.superseded_at = now
                         target.superseded_by_text = new_text
                         superseded.append(target.text)
+                        superseded_entries.append(target)
+
+            # Write-through the supersession marks, exactly as ``supersede``
+            # does. Postgres is the source of truth across a restart and
+            # ``_persist_all`` syncs only ``access_count`` for entries — a
+            # mark left in RAM is lost at the next ``hydrate_cms`` and the
+            # consolidated-away entry comes back looking current.
+            if self._storage is not None:
+                for e in superseded_entries:
+                    if e.db_id is not None:
+                        self._storage.update_entry(
+                            e.db_id,
+                            superseded_at=e.superseded_at,
+                            superseded_by_text=e.superseded_by_text,
+                        )
 
             # Always store the consolidated entry — source defaults to
-            # ``"consolidation"`` for audit / filtering.
+            # ``"consolidation"`` for audit / filtering. v35: the note
+            # inherits the STRICTEST label across the cluster unless its
+            # own text restates one (TypeDecompose: an in-scope rule is
+            # replicated into the partition, never summarised away).
+            auth, dt = _inherited_labels(superseded_entries, new_text)
             store_emb = self._embedder.encode_single(new_text)
             stored, surprise = self._cms.store(
                 new_text,
@@ -4403,6 +5452,7 @@ class MemoryService(DreamOps):
                 source=source or "consolidation",
                 tags=tags,
                 session_key=self._resolve_writer()[1],
+                authority=auth, distortion_tolerance=dt,
             )
             return {
                 "superseded_count": len(superseded),
@@ -4856,7 +5906,15 @@ class MemoryService(DreamOps):
         call: identity + attribution, canonical facts, cited world facts,
         relations (in/out, derived marked), provenance mentions, a merged
         newest-first chronology, and open review flags. Read-only; never
-        creates entities and never runs the full review scan."""
+        creates entities and never runs the full review scan.
+
+        The ``facts`` here deliberately carry NO ``re_verify``: the dossier
+        is a Console review view over one entity, reached beside the
+        ``mentions`` list and the review queues that show the same
+        correction directly, and every fact it lists is also reachable
+        through ``memory_search``/``memory_fact_get``, which do carry the
+        flag. ``recall`` is annotated because it ANSWERS with facts; this
+        page describes an entity."""
         from pseudolife_memory import graph as G
         with self._lock:
             self._ensure_init()
@@ -4875,10 +5933,17 @@ class MemoryService(DreamOps):
                             if eid in (p.get("entity_id"), p.get("into_id"))]
             edge_props = [p for p in st.pending_proposals()
                           if eid in (p.get("src_id"), p.get("dst_id"))]
+            # Facts attach by resolving the record's entity through the
+            # alias table (find_entity precedence), not by exact canonical
+            # match: a record written under a name a later merge folded
+            # into this node is this node's fact. One map per call, from
+            # the graph already loaded above.
+            amap = G.alias_canonical_map(g["entities"], g["aliases"])
             facts = []
             if self._cortex is not None:
                 for rec in self._cortex.current_records():
-                    if G.norm_name(rec.entity) != e["canonical"]:
+                    n = G.norm_name(rec.entity)
+                    if amap.get(n, n) != e["canonical"]:
                         continue
                     facts.append({
                         "attribute": rec.attribute, "value": rec.value,
@@ -4889,7 +5954,8 @@ class MemoryService(DreamOps):
             world_facts = []
             if self._world is not None:
                 for rec in self._world.current_records():
-                    if G.norm_name(rec.entity) != e["canonical"]:
+                    n = G.norm_name(rec.entity)
+                    if amap.get(n, n) != e["canonical"]:
                         continue
                     world_facts.append({
                         "attribute": rec.attribute, "value": rec.value,
@@ -5057,8 +6123,13 @@ class MemoryService(DreamOps):
             src_map = self._storage.entity_sources_map()
             facts_by_norm: dict[str, list[dict]] = {}
             if include_facts and self._cortex is not None:
+                # Keyed by the record entity RESOLVED through the alias table
+                # (graph.alias_canonical_map) so the per-canonical lookup
+                # below also finds facts written under an alias of the node.
+                amap = G.alias_canonical_map(g["entities"], g["aliases"])
                 for rec in self._cortex.current_records():
-                    facts_by_norm.setdefault(G.norm_name(rec.entity), []).append({
+                    n = G.norm_name(rec.entity)
+                    facts_by_norm.setdefault(amap.get(n, n), []).append({
                         "attribute": rec.attribute, "value": rec.value,
                         "origin": rec.origin,
                         "confidence": round(float(rec.confidence), 4)})
@@ -5108,7 +6179,10 @@ class MemoryService(DreamOps):
     ) -> dict[str, Any]:
         """Subgraph within ``depth`` hops (cap 3): nodes with their current
         facts, edges (derived ones marked with rule provenance), plus the
-        shortest path when ``to`` names a second entity.
+        shortest path when ``to`` names a second entity. A node's facts are
+        the cortex records whose entity resolves to it through the alias
+        table (``find_entity`` precedence), not only exact canonical
+        matches.
 
         When ``entity`` is ``None`` (or falsy), returns the whole graph
         filtered to ``scope`` (a source name; ``None`` / ``"all"`` = no
@@ -5145,15 +6219,28 @@ class MemoryService(DreamOps):
 
             facts_by_norm: dict[str, list[dict]] = {}
             if include_facts and self._cortex is not None:
+                # Keyed by the record entity RESOLVED through the alias table
+                # (graph.alias_canonical_map) so a fact written under a name
+                # a merge later folded into a node lands on that node. The
+                # map comes from the graph the subgraph read already loaded
+                # (no extra query) and current_records() order is kept, so
+                # alias-keyed facts interleave by write order.
+                amap = G.alias_canonical_map(by_id.values(), aliases)
                 for rec in self._cortex.current_records():
-                    facts_by_norm.setdefault(
-                        G.norm_name(rec.entity), [],
-                    ).append({
+                    fd = {
                         "attribute": rec.attribute,
                         "value": rec.value,
                         "origin": rec.origin,
                         "confidence": round(float(rec.confidence), 4),
-                    })
+                    }
+                    # v35 labels, absent when unset (recall pins on them).
+                    if rec.authority:
+                        fd["authority"] = rec.authority
+                    if rec.distortion_tolerance:
+                        fd["distortion_tolerance"] = rec.distortion_tolerance
+                    # #243: attach under the alias-resolved canonical name.
+                    n = G.norm_name(rec.entity)
+                    facts_by_norm.setdefault(amap.get(n, n), []).append(fd)
 
             nodes = []
             for nid in sorted(sub["nodes"]):
@@ -5393,7 +6480,8 @@ class MemoryService(DreamOps):
         current evidence is the truth being tracked."""
         return (into, frm) if evidence(frm) > evidence(into) else (frm, into)
 
-    def graph_propose_links(self, proposals: list[dict]) -> dict[str, Any]:
+    def graph_propose_links(self, proposals: list[dict], *,
+                            source: str = "deep-dream") -> dict[str, Any]:
         """Ingest Step-C subagent link proposals. Each is gated by the SAME mechanism
         production uses (resolve_relation -> closed vocab; edge_confidence; drop hard
         type-violations) and inserted into edge_proposals — never into edges."""
@@ -5421,14 +6509,22 @@ class MemoryService(DreamOps):
                 conf = edge_confidence(src, relation, dst)
                 pid = self._storage.insert_proposal(
                     se["id"], relation, de["id"], conf,
-                    p.get("similarity"), p.get("rationale"), "deep-dream", _t.time())
+                    p.get("similarity"), p.get("rationale"), source, _t.time())
                 if pid is not None:
                     proposed += 1
                 else:
                     skipped += 1
         return {"proposed": proposed, "skipped": skipped}
 
-    def graph_accept_proposal(self, proposal_id: int) -> dict[str, Any]:
+    def graph_accept_proposal(self, proposal_id: int, *,
+                              decided_by: str | None = None,
+                              relation: str | None = None) -> dict[str, Any]:
+        """Promote a pending link proposal to a live edge. ``relation``
+        overrides the proposed relation (the link judge's retype verdict);
+        the row is then marked ``retyped`` rather than ``accepted`` so the
+        audit shows the edge differs from what was filed."""
+        import time as _t
+        from pseudolife_memory import graph as G
         with self._lock:
             self._ensure_init()
             if self._storage is None:
@@ -5436,25 +6532,54 @@ class MemoryService(DreamOps):
             prop = self._storage.get_proposal(proposal_id)
             if prop is None or prop["status"] != "pending":
                 return {"accepted": False, "reason": "not_pending", "id": proposal_id}
+            rel = prop["relation"]
+            status = "accepted"
+            if relation and relation != rel:
+                # The same gate graph_propose_links applies: the lesson
+                # relations are never edge material, and a hard type
+                # violation is never written — a retype is an unattended
+                # write path and must not be looser than the filing one.
+                from pseudolife_memory.memory.relation_quality import (
+                    is_hard_type_violation)
+                registry = [r["name"] for r in self._graph.load_relations()
+                            if r["name"] not in ("prefers", "avoids")]
+                resolved, _ = G.resolve_relation(registry, relation)
+                if resolved is None:
+                    return {"accepted": False, "reason": "unknown_relation",
+                            "id": proposal_id, "relation": relation}
+                disp0 = {e["id"]: e["display"]
+                         for e in self._storage.load_graph()["entities"]}
+                if is_hard_type_violation(disp0.get(prop["src_id"], ""),
+                                          resolved,
+                                          disp0.get(prop["dst_id"], "")):
+                    return {"accepted": False, "reason": "type_violation",
+                            "id": proposal_id, "relation": resolved}
+                rel, status = resolved, "retyped"
             # A reviewed edge is no longer dubious: floor its confidence above
             # the dubious_edges threshold AND store it as a confirming action —
             # origin "agent" would be recaptured by the next apply's
             # rescore_edges (pure name-based recompute, e.g. related-to back
             # to 0.45) and re-flagged, undoing the verdict.
             conf = max(float(prop["confidence"] or 0.0), self._REVIEWED_EDGE_MIN_CONF)
-            self._graph.upsert_edge(prop["src_id"], prop["relation"], prop["dst_id"],
+            self._graph.upsert_edge(prop["src_id"], rel, prop["dst_id"],
                                     confidence=conf, origin="action")
-            self._storage.set_proposal_status(proposal_id, "accepted")
+            self._storage.set_proposal_status(
+                proposal_id, status, decided_by=decided_by, decided_at=_t.time())
             disp = {e["id"]: e["display"] for e in self._storage.load_graph()["entities"]}
         return {"accepted": True, "src": disp.get(prop["src_id"]),
-                "relation": prop["relation"], "dst": disp.get(prop["dst_id"])}
+                "relation": rel, "dst": disp.get(prop["dst_id"]),
+                "status": status}
 
-    def graph_reject_proposal(self, proposal_id: int) -> dict[str, Any]:
+    def graph_reject_proposal(self, proposal_id: int, *,
+                              decided_by: str | None = None) -> dict[str, Any]:
+        import time as _t
         with self._lock:
             self._ensure_init()
             if self._storage is None:
                 return dict(self._GRAPH_UNAVAILABLE)
-            ok = self._storage.set_proposal_status(proposal_id, "rejected")
+            ok = self._storage.set_proposal_status(
+                proposal_id, "rejected", decided_by=decided_by,
+                decided_at=_t.time())
         return {"rejected": ok, "id": proposal_id}
 
     def graph_accept_entity_merge(self, proposal_id: int, *,
@@ -5527,13 +6652,35 @@ class MemoryService(DreamOps):
             prop = self._storage.get_entity_proposal(proposal_id)
             ok = self._storage.set_entity_proposal_status(
                 proposal_id, "rejected", decided_by=decided_by, decided_at=now)
-            if ok and prop is not None and prop.get("kind") == "merge":
-                disp = {e["id"]: e["display"]
-                        for e in self._storage.load_graph()["entities"]}
-                self._storage.record_merge_decision(
-                    proposal_id, disp.get(prop["entity_id"], "?"),
-                    disp.get(prop["into_id"], "?"), "rejected",
-                    prop.get("score"), prop.get("reason"), decided_by, now)
+            if ok and prop is not None:
+                g = self._storage.load_graph()
+                disp = {e["id"]: e["display"] for e in g["entities"]}
+                canon = {e["id"]: e["canonical"] for e in g["entities"]}
+                # The verdict outlives the row: entity_proposals CASCADEs
+                # with its entity, so the durable record is the FK-free
+                # merge_decisions row plus a TEXT-keyed tombstone in
+                # dismissed_pairs (stored canonicals, the key every filing
+                # gate consults) — a merge reject means "distinct", a junk
+                # reject means "keep", and neither is re-filed after the
+                # entity churns and re-mints.
+                if prop.get("kind") == "merge":
+                    self._storage.record_merge_decision(
+                        proposal_id, disp.get(prop["entity_id"], "?"),
+                        disp.get(prop["into_id"], "?"), "rejected",
+                        prop.get("score"), prop.get("reason"), decided_by, now)
+                    a = canon.get(prop["entity_id"])
+                    b = canon.get(prop["into_id"])
+                    if a and b and a != b:
+                        self._storage.dismiss_pair(a, b)
+                elif prop.get("kind") == "junk":
+                    self._storage.record_merge_decision(
+                        proposal_id, disp.get(prop["entity_id"], "?"), None,
+                        "rejected", prop.get("score"),
+                        f"junk keep: {prop.get('reason')}", decided_by, now)
+                    c = canon.get(prop["entity_id"])
+                    if c:
+                        self._storage.dismiss_pair(_junk_keep_key(c),
+                                                   _junk_keep_key(c))
         return {"rejected": ok, "id": proposal_id}
 
     def _recall_vocab(self) -> list[str]:
@@ -5599,6 +6746,164 @@ class MemoryService(DreamOps):
             degree_fn=(degrees.get if cfg.hub_gate else None),
             hub_threshold=threshold,
             expand_budget=(cfg.expand_budget or None),
+            # Search fan-out caps; 0 means off, and ``run_recall`` takes
+            # None for off, so an operator zeroing a knob gets exactly the
+            # pre-cap walk.
+            max_searches_per_hop=cfg.max_searches_per_hop or None,
+            max_total_searches=cfg.max_total_searches or None,
+            time_budget_seconds=cfg.time_budget_seconds or None,
+            skip_part_of_expansion=bool(cfg.skip_part_of_expansion),
         )
+        if getattr(cfg, "pin_constraints", None) is None:
+            pin = getattr(self.config.memory.cortex, "pin_constraints", True)
+        else:  # pragma: no cover — recall has no knob of its own
+            pin = bool(cfg.pin_constraints)
+        if pin:
+            self._pin_recalled_constraints(state)
+        self._annotate_recalled_facts(state.entity_facts)
         return recall_state_to_dict(state, query, hops)
+
+    @staticmethod
+    def _pin_recalled_constraints(state) -> None:
+        """TypeRetrieve for ``memory_recall``: on each SEED entity (hop 0 —
+        the entities the query itself resolved to, which is the scope
+        definition here), move constraint-labelled facts to the front of
+        its facts list and mark them ``pinned``, so the per-entity fact cap
+        downstream can never drop an in-scope rule behind five plainer
+        facts. Hop-discovered entities are context, not scope, and stay in
+        record order. In place, on dicts ``graph_neighborhood`` built for
+        this call."""
+        for name in state.seeds:
+            facts = state.entity_facts.get(name)
+            if not facts:
+                continue
+            pins = [f for f in facts
+                    if f.get("distortion_tolerance") == "constraint"]
+            if not pins:
+                continue
+            for f in pins:
+                f["pinned"] = True
+            state.entity_facts[name] = pins + [
+                f for f in facts
+                if f.get("distortion_tolerance") != "constraint"]
+
+    def _annotate_recalled_facts(self, entity_facts) -> None:
+        """Carry ``re_verify`` onto the facts ``recall`` serves, in place.
+
+        ``recall`` reaches canonical facts through the graph projection, not
+        the cortex block, so without this the SAME fact reads as cautioned
+        via ``memory_search`` and clean via ``memory_recall`` — an
+        inconsistency between adjacent read paths that is worse than either
+        behaviour alone.
+
+        Annotated HERE rather than in ``graph_neighborhood``, which recall
+        composes: that method also backs the Console's Atlas and the whole-
+        graph view, where the facts are a label on a node rather than an
+        answer being acted on, and where the node set is capped in the
+        hundreds. Scoping the work to recall keeps it to one batched trace
+        query plus one evidence query per call, whatever the graph's size.
+
+        Facts are matched back to their slot on ``(entity, attribute,
+        VALUE)``. The entity side is the record's entity RESOLVED through
+        the alias table — the same name ``graph_neighborhood`` attached the
+        fact under. The node's entity is the canonical and the record's may
+        be an alias of it (a merge folds the absorbed canonical into the
+        survivor's aliases without rewriting the record), and ``norm_name``
+        of the two differ, so keying on the raw record entity would miss
+        exactly the alias-attached facts and silently drop their caution.
+        The recall side of the key is a node's DISPLAY name (``run_recall``
+        keys ``entity_facts`` by ``node["entity"]``), which a later display
+        enrichment can leave normalizing to neither canonical nor alias
+        (``GND (Enshrouded server)`` over ``gnd``), so that side resolves
+        canonical → alias → display; the record side keeps ``find_entity``
+        semantics, since a record's entity is an arbitrary string rather
+        than a node label. The value is what makes the match sound. The
+        graph normalizes
+        names with ``graph.norm_name`` and the cross-index with
+        ``cortex._norm_key``, and the two fold DIFFERENT separator classes —
+        ``norm_name`` folds ``:``, ``_norm_key`` folds ``-`` and leaves
+        ``:`` alone — so ``host:port`` and ``host-port`` are two distinct
+        cortex slots hanging off ONE graph node, and
+        ``graph_neighborhood`` puts both slots' facts on it. Matching on
+        entity and attribute alone therefore annotates both against
+        whichever slot won the tie: a missed correction on one, a
+        correction from the wrong slot's evidence on the other. The value
+        separates them, and where it does not (two records identical in all
+        three) the slots are interchangeable for this purpose anyway. Alias
+        resolution widens that tie a little: two slots that differ only by
+        the alias they were written under (``pr-235`` and ``pr-#235``, same
+        attribute and value) now share a key, and post-merge those are the
+        same fact written twice, so the same tie-break applies. A set
+        slot's members each match on their own value, so a member is
+        cleared by ITS own re-confirmation rather than the slot's newest.
+
+        Only the flag keys are written onto the served fact; the
+        ``source_entries`` the traversal needs stay on a probe, since a
+        recalled fact is a label and would double in size carrying them.
+
+        Cost: one graph load for the alias table (the same load
+        ``graph_neighborhood`` makes per hop), one batched trace query and
+        one evidence query per call — and one pass over
+        ``current_records()`` with two normalizations per record, which is
+        the same sweep ``graph_neighborhood`` has already made to assemble
+        these facts. ``recall`` holds no lock of its own, so this takes
+        it."""
+        if not entity_facts or not self.config.memory.traces.enabled:
+            return
+        from pseudolife_memory import graph as G
+        from pseudolife_memory.memory.cortex import _norm_key
+        with self._lock:
+            self._ensure_init()
+            if self._storage is None or self._cortex is None:
+                return
+            g = self._storage.load_graph()
+            amap = G.alias_canonical_map(g["entities"], g["aliases"])
+            # The recall side of the key is a node's DISPLAY name (run_recall
+            # keys entity_facts by node["entity"]), and a display enriched
+            # after minting no longer normalizes to its canonical ("GND
+            # (Enshrouded server)" over "gnd", the shape
+            # graph_dismiss_duplicate records). That side resolves canonical
+            # -> alias -> display, the precedence its canon_by_norm applies;
+            # the record side stays find_entity's, since a record's entity
+            # is an arbitrary string, not a node label.
+            node_of: dict[str, str] = {e["canonical"]: e["canonical"]
+                                       for e in g["entities"]}
+            for alias, canonical in amap.items():
+                node_of.setdefault(alias, canonical)
+            for e in g["entities"]:
+                node_of.setdefault(G.norm_name(e["display"]), e["canonical"])
+            # (alias-resolved entity, attribute, value) -> slot key +
+            # confirmation stamp. ``max`` on the stamp only settles records
+            # identical in all three. The slot key stays the record's OWN
+            # norms — that is where the dream wrote its trace.
+            resolved: dict[tuple[str, str, str], tuple[tuple[str, str], float]] = {}
+            for rec in self._cortex.current_records():
+                n = G.norm_name(rec.entity)
+                node_key = (amap.get(n, n), rec.attribute, rec.value)
+                seen = rec.last_confirmed or rec.asserted_at
+                prev = resolved.get(node_key)
+                if prev is None or (seen or 0) > (prev[1] or 0):
+                    resolved[node_key] = (
+                        (_norm_key(rec.entity), _norm_key(rec.attribute)), seen)
+            targets: list[tuple[dict, tuple[str, str], float]] = []
+            for entity, facts in entity_facts.items():
+                n = G.norm_name(entity)
+                for fact in facts or []:
+                    hit = resolved.get((node_of.get(n, n),
+                                        fact.get("attribute"),
+                                        fact.get("value")))
+                    if hit is not None:
+                        targets.append((fact, hit[0], hit[1]))
+            if not targets:
+                return
+            traces = self._storage.traces_for_slots(
+                sorted({slot for _f, slot, _s in targets}))
+            probes = [{"source_entries": traces.get(slot, []),
+                       "last_confirmed": stamp}
+                      for _f, slot, stamp in targets]
+            self._annotate_evidence_supersession(probes)
+            for probe, (fact, _slot, _stamp) in zip(probes, targets):
+                if probe.get("re_verify"):
+                    fact["re_verify"] = True
+                    fact["re_verify_reason"] = probe["re_verify_reason"]
 

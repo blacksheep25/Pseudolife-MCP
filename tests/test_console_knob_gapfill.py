@@ -95,7 +95,7 @@ def test_session_digest_knobs_surfaced_default_off():
     assert knob["restart"] is False
 
     target = _knob("memory.dream.digest_target_chars")
-    assert target["type"] == "int" and target["default"] == 800
+    assert target["type"] == "int" and target["default"] == 1200
     assert target["restart"] is False
     ctx = _knob("memory.dream.digest_context_chars")
     assert ctx["type"] == "int" and ctx["default"] == 24000
@@ -117,7 +117,9 @@ def test_deep_dream_judge_mode_knob_surfaced_default_shadow():
     # help text instead of the default changing.
     knob = _knob("memory.deep_dream.judge_mode")
     assert knob["type"] == "enum"
-    assert knob["options"] == ["off", "shadow", "auto-reject"]
+    # "auto" added 2026-09-02: guarded two-vote auto-accept (see
+    # test_review_queue_judge_knobs).
+    assert knob["options"] == ["off", "shadow", "auto-reject", "auto"]
     assert knob["default"] == "shadow"
     # deep_dream_judge re-reads service.config on every sweep batch.
     assert knob["restart"] is False
@@ -143,6 +145,16 @@ def test_gated_off_capabilities_stay_out_of_console():
         # separate decision after the gate-3 friction estimate.
         "memory.dream.quarantine_low_trust",
         "memory.dream.trusted_sources",
+        # Candidate-pool shape (2026-09-04). Both ship at today's behaviour
+        # and both went through a judged run and FAILED it: multiplier 4
+        # costs naive RAG 0.115 under rrf and 0.077 under weighted_sum on
+        # the LongMemEval knowledge-update oracle slice, while serving a
+        # third to a half more context tokens (table in evals/README.md,
+        # "Judged verdict (2026-09-04)"). A measured loser is a stronger
+        # reason to keep a live retrieval-ranking switch off the Console
+        # than an unmeasured one, not a weaker one.
+        "memory.search.candidate_pool_multiplier",
+        "memory.search.fusion",
     ):
         assert path not in _BY_PATH, f"gated-off knob surfaced: {path}"
 
@@ -158,3 +170,56 @@ def test_registry_paths_all_resolve_against_appconfig():
             assert hasattr(cur, part), (
                 f"{knob['path']}: AppConfig has no attribute {part!r}")
             cur = getattr(cur, part)
+
+
+def test_extractor_reasoning_effort_knob():
+    # Applies at the next dream (build_extractor constructs fresh from
+    # config per invocation), hence restart False; provider-specific extras
+    # (codex "minimal", claude "max") ride the suggestions, not an enum.
+    k = _knob("memory.dream.extractor_reasoning_effort")
+    assert k["group"] == "Extractor"
+    assert k["type"] == "string"
+    assert k["default"] is None
+    assert k["restart"] is False
+    for v in ("low", "medium", "high", "xhigh"):
+        assert v in k["suggestions"]
+
+
+def test_review_queue_judge_knobs():
+    # 2026-09-02 review-queue autonomy: every queue's judge gets a mode
+    # switch in the Console (the gates stay config-file knobs like
+    # judge_reject_min_confidence). Defaults are the shipped ones: shadow
+    # everywhere a verdict deletes or writes, off for the candidate judge,
+    # on for the two mechanical apply additions.
+    for path, options, default in (
+            ("memory.deep_dream.link_judge_mode", ["off", "shadow", "auto"], "shadow"),
+            ("memory.deep_dream.junk_judge_mode", ["off", "shadow", "auto"], "shadow"),
+            ("memory.deep_dream.curation_judge_mode",
+             ["off", "shadow", "auto-distinct", "auto"], "shadow"),
+            ("memory.deep_dream.candidate_judge_mode", ["off", "shadow", "auto"], "off")):
+        knob = _knob(path)
+        assert knob["type"] == "enum" and knob["options"] == options, path
+        assert knob["default"] == default and knob["restart"] is False, path
+    for path in ("memory.deep_dream.judges_enabled",
+                 "memory.deep_dream.judge_second_opinion",
+                 "memory.deep_dream.analyzer_file_duplicates"):
+        knob = _knob(path)
+        assert knob["type"] == "bool" and knob["default"] is True, path
+        assert knob["restart"] is False
+    # The one destructive switch ships OFF (review finding, 2026-09-02).
+    orphan = _knob("memory.deep_dream.orphan_sweep")
+    assert orphan["type"] == "bool" and orphan["default"] is False
+
+
+def test_judge_second_model_knob():
+    # 2026-09-03: the merge judge's second-opinion model was a config-file
+    # field only, so the one flip that makes the two-vote gates a
+    # two-MODEL check (judge_mode "auto" refuses same-model accepts by
+    # design) needed a container edit and a restart. The judge reads it
+    # from service.config on every batch, so it is a live string knob like
+    # extractor_model_override, with the same suggestion list shape.
+    knob = _knob("memory.deep_dream.judge_second_model")
+    assert knob["type"] == "string" and knob["default"] is None
+    assert knob["restart"] is False and knob["group"] == "Deep dream"
+    assert "claude-fable-5" in knob["suggestions"]
+    assert "different" in knob["help"].lower()   # says why it exists

@@ -127,6 +127,26 @@ KNOBS: list[dict[str, Any]] = [
      "min": 60, "max": 86400, "step": 60, "restart": False,
      "help": "A get/reinforce this long after a search still labels that "
              "search's served entry as used."},
+    # ── MCP payloads (agent-side token cost, 2026-09-04 ledger) ───────────
+    {"path": "memory.mcp.compact_payloads", "group": "MCP payloads",
+     "label": "Compact tool payloads", "type": "bool", "default": True,
+     "restart": False,
+     "help": "Shape MCP responses for the agent's context window: search "
+             "entry text truncated (memory_get returns it whole), the "
+             "cortex block sized to the caller's top_k, and "
+             "memory_fact_get's bookkeeping keys behind verbose=True. Off "
+             "restores the pre-2026-09-04 payloads. Projection only — "
+             "ranking and every eval number are unaffected."},
+    {"path": "memory.mcp.entry_text_chars", "group": "MCP payloads",
+     "label": "Search entry text cap", "type": "int", "default": 600,
+     "min": 80, "max": 10000, "step": 20, "restart": False,
+     "help": "Chars of a search hit's text served before truncation "
+             "(marked truncated: true; memory_get returns it whole). "
+             "Ignored when compact payloads are off. 600 (~150 tokens) "
+             "clipped 88% of hits on the 2026-09-04 ledger bank and halved "
+             "the served entry text; raise it for long-form notes whose "
+             "tail carries the answer. Never applies to superseded_by_text, "
+             "which is served whole."},
     # ── Cortex ─────────────────────────────────────────────────────────────
     {"path": "memory.cortex.search_first", "group": "Cortex",
      "label": "Cortex-first search", "type": "bool", "default": True,
@@ -157,6 +177,12 @@ KNOBS: list[dict[str, Any]] = [
      "help": "Dream-path slot resolver: a paraphrased claim adopts an existing "
              "slot when its value-free embedding cosine ≥ this. 0 = exact-key "
              "only."},
+    {"path": "memory.cortex.pin_constraints", "group": "Cortex",
+     "label": "Pin constraint facts", "type": "bool", "default": True,
+     "restart": False,
+     "help": "Serve in-scope constraint-labelled facts ahead of cosine "
+             "ranking in search's cortex block and recall (schema v35). "
+             "Off = plain ranking; an unlabelled bank is unaffected."},
     # ── Dream ──────────────────────────────────────────────────────────────
     {"path": "memory.dream.enabled", "group": "Dream", "label": "Dream sweep",
      "type": "bool", "default": True, "restart": True,
@@ -253,12 +279,14 @@ KNOBS: list[dict[str, Any]] = [
              "backfills all history, digest_max_per_cycle (4) episodes per "
              "dream."},
     {"path": "memory.dream.digest_target_chars", "group": "Dream",
-     "label": "Digest length target (chars)", "type": "int", "default": 800,
+     "label": "Digest length target (chars)", "type": "int", "default": 1200,
      "min": 200, "max": 4000, "step": 100, "restart": False,
-     "help": "Prose length target passed to the digest prompt (the bundled "
-             "E4B sidecar overshoots it ~1.8x in practice — 2026-08-27 "
-             "probe). 800 doubles the ~400-char distillation shape from the "
-             "2026-08-22 BEAM competitor analysis for our smaller top-k."},
+     "help": "Prose length target passed to the digest prompt. Re-targeted "
+             "from 800 to 1200 after the 2026-08-27 sidecar probe (9 "
+             "digests, 3 runs): the extractor wrote 1019-1908 chars against "
+             "the 800 target, and the overrun carried retrievable specifics "
+             "(versions, deadline changes, error names) — the target now "
+             "states the observed natural length instead of fighting it."},
     {"path": "memory.dream.digest_context_chars", "group": "Dream",
      "label": "Digest context cap (chars)", "type": "int", "default": 24000,
      "min": 1000, "max": 200000, "step": 1000, "restart": False,
@@ -270,19 +298,128 @@ KNOBS: list[dict[str, Any]] = [
     # Read from service.config on every sweep batch (deep_dream_judge).
     {"path": "memory.deep_dream.judge_mode", "group": "Deep dream",
      "label": "Step-C merge judge", "type": "enum",
-     "options": ["off", "shadow", "auto-reject"], "default": "shadow",
+     "options": ["off", "shadow", "auto-reject", "auto"], "default": "shadow",
      "restart": False,
      "help": "How the autonomous Step-C judge handles pending merge "
              "proposals: \"shadow\" records verdicts without applying them; "
              "\"auto-reject\" additionally applies reject verdicts at/above "
-             "the confidence gate (judge_reject_min_confidence, 0.8 — "
-             "accepts are never auto-applied). Caveat: auto-reject is only "
-             "measured-safe on an Opus-class judge endpoint (live precision "
-             "1.000, evals/results/judge-shadow-live-20260821.json); the "
+             "the confidence gate (judge_reject_min_confidence, 0.8) and, "
+             "with the second opinion on, two agreeing rejects at mean >= "
+             "judge_reject_min_confidence_2 (0.7); \"auto\" additionally "
+             "folds a pair when two independent accepts agree on "
+             "non-low-differential evidence at mean >= "
+             "judge_accept_min_confidence (0.6) and only when the two "
+             "opinions come from different models (judge_second_model) — "
+             "the only path that ever auto-applies an accept (6/6 on the "
+             "2026-09-02 panel, evals/results/queue-judge-panel-20260902.json"
+             "). Caveat: both "
+             "auto modes are only measured-safe on an Opus-class judge "
+             "endpoint (live auto-reject precision 1.000, "
+             "evals/results/judge-shadow-live-20260821.json); the "
              "2026-08-16 judge ladder shows weaker judges mis-reject with "
              "confident scores (local Qwen 0.918, confidence "
              "uninformative), so leave \"shadow\" unless the dream "
              "extractor or judge_url resolves to an Opus-class model."},
+    {"path": "memory.deep_dream.judges_enabled", "group": "Deep dream",
+     "label": "Review-queue judges (all)", "type": "bool", "default": True,
+     "restart": False,
+     "help": "The one switch for every judge stage (merge, link, junk, "
+             "store-curation, candidates): off = no model verdicts at all, "
+             "the mechanical tick keeps running. The two apply-time "
+             "mechanics keep their own switches (analyzer_file_duplicates, "
+             "orphan_sweep)."},
+    {"path": "memory.deep_dream.judge_snippet_max_chars", "group": "Deep dream",
+     "label": "Merge-judge snippet chars", "type": "int", "default": 240,
+     "min": 0, "max": 20000, "step": 100, "restart": False,
+     "help": "Per-snippet cap on the evidence the merge judge reads, "
+             "separate from the review surfaces' snippet_max_chars. 0 = "
+             "unbounded. Leave at 240 (the cap every published judge number "
+             "was measured at): the 2026-09-03 ladder rerun at 3000 chars "
+             "made the judge accept more and be wrong more often (accept "
+             "precision 0.70 vs 0.85; two-vote auto-fold 6/7 vs 4/4; "
+             "evals/results/queue-judge-ladder-20260903-fulllen.json). "
+             "Raise it only behind a new ladder run."},
+    {"path": "memory.deep_dream.judge_second_opinion", "group": "Deep dream",
+     "label": "Merge judge second opinion", "type": "bool", "default": True,
+     "restart": False,
+     "help": "Re-judge a pending merge proposal once more in a fresh batch "
+             "(optionally judge_second_model) after its first verdict sat "
+             "below the single-vote gate; the two-vote gates above apply "
+             "only when this is on."},
+    {"path": "memory.deep_dream.judge_second_model", "group": "Deep dream",
+     "label": "Merge judge second model", "type": "string", "default": None,
+     "restart": False,
+     "suggestions": ["claude-fable-5", "claude-opus-5", "claude-sonnet-5",
+                     "gpt-5.6-terra", "gpt-5.6-luna"],
+     "help": "Model for the merge judge's SECOND opinion, served by the same "
+             "endpoint as the first (judge_url, else the dream extractor; the "
+             "CLI shims honour claude-* / gpt-* names per request). Empty = "
+             "the same model in a fresh batch, which is enough to double-check "
+             "a reject but never authorizes a fold: \"auto\" accepts require "
+             "the two opinions to come from DIFFERENT models (2026-09-02 "
+             "panel: claude-fable-5 as the second voter went 6/6 accepts, 8/8 "
+             "rejects on the 63-row ladder). Read on every sweep batch; each "
+             "second opinion is one call to this model."},
+    {"path": "memory.deep_dream.link_judge_mode", "group": "Deep dream",
+     "label": "Link judge", "type": "enum",
+     "options": ["off", "shadow", "auto"], "default": "shadow",
+     "restart": False,
+     "help": "Autonomous verdicts on pending link proposals (schema v36): "
+             "\"shadow\" records; \"auto\" promotes accept verdicts "
+             "at/above link_accept_min_confidence (0.8) to live edges and "
+             "rejects at/above link_reject_min_confidence (0.8); a retype "
+             "is recorded with its corrected relation but never auto-written "
+             "(first ladder: retype 0/1). Edges are "
+             "reversible (memory_graph_unrelate), which is why this queue "
+             "may run auto; measured per arm by evals/queue_judge_ladder.py."},
+    {"path": "memory.deep_dream.junk_judge_mode", "group": "Deep dream",
+     "label": "Junk judge", "type": "enum",
+     "options": ["off", "shadow", "auto"], "default": "shadow",
+     "restart": False,
+     "help": "Autonomous verdicts on the evidence-bearing junk proposals the "
+             "zero-structure auto-delete skips: \"auto\" keeps at/above "
+             "junk_keep_min_confidence (0.8) and deletes at/above "
+             "junk_delete_min_confidence (0.85) ONLY under the evidence bar "
+             "(degree <= junk_max_auto_degree, at most one fact slot); "
+             "richer nodes stay pending with the verdict attached."},
+    {"path": "memory.deep_dream.curation_judge_mode", "group": "Deep dream",
+     "label": "Store-curation judge", "type": "enum",
+     "options": ["off", "shadow", "auto-distinct", "auto"], "default": "shadow",
+     "restart": False,
+     "help": "Autonomous verdicts on the lesson/world duplicate listings: "
+             "\"auto-distinct\" applies distinct verdicts (a reversible "
+             "dismissal) at/above curation_distinct_min_confidence (0.8); "
+             "\"auto\" additionally forgets the losing slot of a duplicate "
+             "verdict at/above curation_forget_min_confidence (0.9) after "
+             "folding the judge's carry-over into the survivor (lessons)."},
+    {"path": "memory.deep_dream.candidate_judge_mode", "group": "Deep dream",
+     "label": "Step-C candidate judge", "type": "enum",
+     "options": ["off", "shadow", "auto"], "default": "off",
+     "restart": False,
+     "help": "Once per deep apply, judge the dream's link CANDIDATES: "
+             "\"shadow\" logs the verdict tally; \"auto\" files proposals "
+             "(then settled by the link judge) or dismisses co-mention "
+             "pairs, at/above candidate_min_confidence (0.6). A dismissal "
+             "marks the pair distinct for the merge analyzer too, so the "
+             "prompt leaves same-referent pairs alone rather than "
+             "dismissing them."},
+    {"path": "memory.deep_dream.analyzer_file_duplicates", "group": "Deep dream",
+     "label": "File analyzer duplicates", "type": "bool", "default": True,
+     "restart": False,
+     "help": "Each deep apply files the Console's live duplicate findings "
+             "into the merge queue (file/concept pairs into the link queue as "
+             "implements), so the judges see them; they were never filed "
+             "anywhere before 2026-09-02."},
+    {"path": "memory.deep_dream.orphan_sweep", "group": "Deep dream",
+     "label": "Unreachable-orphan sweep", "type": "bool", "default": False,
+     "restart": False,
+     "help": "Each deep apply deletes entities that carry no evidence at all "
+             "(no edge — superseded included —, fact, lesson, alias, scope, "
+             "proposal or mentioning entry) once older than "
+             "orphan_min_age_days (7), at most orphan_max_per_apply (50) per "
+             "pass. Off by default: the one destructive switch that would "
+             "fire on the first apply after an upgrade. Audited as "
+             "dream-auto / deleted."},
     # ── Extractor ──────────────────────────────────────────────────────────
     # All live: build_extractor() constructs the client fresh on every dream
     # invocation from service.config.
@@ -300,6 +437,20 @@ KNOBS: list[dict[str, Any]] = [
              "request and the Codex CLI shim gpt-* names; the fallback "
              "sidecar is never affected. Empty = the endpoint's own "
              "default."},
+    {"path": "memory.dream.extractor_reasoning_effort", "group": "Extractor",
+     "label": "Dreamer reasoning effort", "type": "string", "default": None,
+     "restart": False,
+     "suggestions": ["low", "medium", "high", "xhigh"],
+     "help": "Reasoning effort for the primary extractor, sent per request "
+             "as reasoning_effort. Empty = never sent — the endpoint's own "
+             "default serves (for the CLI shims that is the host CLI "
+             "config). The Claude CLI shim maps it to claude --effort "
+             "(low/medium/high/xhigh/max), the Codex CLI shim to "
+             "model_reasoning_effort (minimal/low/medium/high/xhigh); "
+             "OpenAI-compatible servers read the field natively; most local "
+             "runtimes ignore the unknown field, though a hosted API may "
+             "reject an unsupported value with a clear 400. The fallback "
+             "sidecar is never affected."},
     {"path": "memory.dream.extractor_source", "group": "Extractor",
      "label": "Settings source", "type": "enum", "default": "env",
      "options": ["env", "config"], "restart": False,
@@ -405,6 +556,30 @@ KNOBS: list[dict[str, Any]] = [
     {"path": "memory.recall.default_top_k", "group": "Recall",
      "label": "Recall top-k", "type": "int", "default": 5, "min": 1, "max": 50,
      "step": 1, "restart": False, "help": "Results per internal recall search."},
+    {"path": "memory.recall.max_searches_per_hop", "group": "Recall",
+     "label": "Re-queries per hop", "type": "int", "default": 6, "min": 0,
+     "max": 50, "step": 1, "restart": False,
+     "help": "Per hop, re-query only the top N newly discovered entities "
+             "(seed-hit mentions first, then lowest degree). The rest are "
+             "still returned with their facts. 0 = unlimited."},
+    {"path": "memory.recall.max_total_searches", "group": "Recall",
+     "label": "Search ceiling per call", "type": "int", "default": 31,
+     "min": 0, "max": 200, "step": 1, "restart": False,
+     "help": "Hard cap on searches per recall call, seed search included. "
+             "On reaching it the walk stops and the response is flagged "
+             "truncated. 31 = 1 + 6 x 5, a backstop above the most the "
+             "per-hop cap can spend at the tool's max 5 hops. "
+             "0 = no ceiling."},
+    {"path": "memory.recall.time_budget_seconds", "group": "Recall",
+     "label": "Recall time budget (s)", "type": "float", "default": 20.0,
+     "min": 0.0, "max": 300.0, "step": 1.0, "restart": False,
+     "help": "Return what the walk has, flagged truncated, once it has run "
+             "this long. 0 = no budget."},
+    {"path": "memory.recall.skip_part_of_expansion", "group": "Recall",
+     "label": "Skip part-of re-queries", "type": "bool", "default": False,
+     "restart": False,
+     "help": "Entities reached only by part-of edges are returned with "
+             "their facts but never spend a search."},
     # ── Retention ──────────────────────────────────────────────────────────
     {"path": "memory.compaction.enabled", "group": "Retention",
      "label": "Superseded-row compaction", "type": "bool", "default": True,

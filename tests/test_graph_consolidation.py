@@ -251,6 +251,97 @@ def test_candidate_pairs_skips_excluded_ids():
     assert {(c["src_id"], c["dst_id"]) for c in out} == {(1, 2)}
 
 
+def test_candidate_pairs_matches_naive_reference_on_random_graph():
+    """Equivalence pin for the vectorized similarity prefilter (2026-09-01).
+
+    candidate_pairs was a pure-Python O(n^2) pair loop — 4.2s per deep
+    tick at the live bank's 2,070 vector-eligible entities and quadratic
+    in entity count — replaced by a matmul prefilter plus per-survivor
+    exact scoring. The refactor's contract is bit-identical OUTPUT (the
+    per-pair filters, the reported similarity values from the same
+    np.dot, ordering and top-k), so this test runs the shipped function
+    against a verbatim naive reference over a seeded random graph that
+    exercises every filter class at once."""
+    rng = np.random.default_rng(20260901)
+    n = 90
+    ents = [{"id": i, "canonical": f"ent {i}", "display": f"ent {i}",
+             "etype": None} for i in range(n)]
+    # Clustered vectors so many pairs land near the threshold from both
+    # sides; a couple of exact-duplicate names to exercise the dup filter;
+    # one name-contained pair for the containment exemption.
+    base = rng.normal(size=(6, 24))
+    vecs = {}
+    for i in range(n):
+        v = base[i % 6] + rng.normal(scale=0.4, size=24)
+        # float32, like the live embeddings — so the fixture exercises the
+        # matmul-vs-dot accumulation error the prefilter margins absorb.
+        vecs[i] = (v / np.linalg.norm(v)).astype(np.float32)
+    ents[7]["canonical"] = ents[3]["canonical"]      # exact-dup pair
+    ents[11]["display"] = "ent 4 service"
+    ents[11]["canonical"] = "ent 4 service"          # name-contains ent 4
+    edges = [{"id": 1000 + k, "src_id": int(a), "dst_id": int(b),
+              "relation": "related-to", "confidence": 0.5, "origin": "agent"}
+             for k, (a, b) in enumerate(
+                 rng.integers(0, n, size=(40, 2)).tolist()) if a != b]
+    mentions = {i: frozenset(rng.integers(0, 60, size=rng.integers(1, 6)).tolist())
+                for i in range(n) if i % 5}          # some ids have no mentions
+    scope = {i: (["p1"] if i % 3 == 0 else ["p2"] if i % 3 == 1 else [])
+             for i in range(0, n, 2)}                # some unattributed
+    dismissed = {tuple(sorted((f"ent {a}", f"ent {b}")))
+                 for a, b in rng.integers(0, n, size=(15, 2)).tolist()}
+    pending = {frozenset((int(a), int(b)))
+               for a, b in rng.integers(0, n, size=(10, 2)).tolist()
+               if a != b}
+    excluded = {int(x) for x in rng.integers(0, n, size=5)}
+    kwargs = dict(min_similarity=0.55, top_k=25, dismissed=dismissed,
+                  max_support_overlap=0.8, pending_pairs=pending,
+                  excluded_ids=excluded)
+
+    def naive(vectors, edges, entities, scope_map, mention_map, *,
+              min_similarity, top_k, dismissed, max_support_overlap,
+              pending_pairs, excluded_ids):
+        # Verbatim pre-2026-09-01 loop body.
+        disp = {e["id"]: e["display"] for e in entities}
+        canon = {e["id"]: e["canonical"] for e in entities}
+        linked = {frozenset((e["src_id"], e["dst_id"])) for e in edges}
+        linked |= pending_pairs or set()
+        excl = excluded_ids or set()
+        dup = {frozenset(p) for p in gc.exact_duplicate_pairs(entities, edges)}
+        ids = sorted(i for i in vectors if i not in excl)
+        scored = []
+        for i in range(len(ids)):
+            for j in range(i + 1, len(ids)):
+                u, v = ids[i], ids[j]
+                key = frozenset((u, v))
+                if key in linked or key in dup:
+                    continue
+                if dismissed and tuple(sorted((canon.get(u, ""), canon.get(v, "")))) in dismissed:
+                    continue
+                mu, mv = mention_map.get(u), mention_map.get(v)
+                if (mu and mv
+                        and (len(mu & mv) / min(len(mu), len(mv))
+                             >= max_support_overlap)
+                        and not gc._name_contains(disp.get(u, ""), disp.get(v, ""))):
+                    continue
+                su, sv = set(scope_map.get(u, [])), set(scope_map.get(v, []))
+                if su and sv and not (su & sv):
+                    continue
+                sim = float(np.dot(vectors[u], vectors[v]))
+                if sim < min_similarity:
+                    continue
+                scored.append({"src_id": u, "dst_id": v,
+                               "src": disp.get(u, str(u)),
+                               "dst": disp.get(v, str(v)),
+                               "similarity": round(sim, 4)})
+        scored.sort(key=lambda c: (-c["similarity"], c["src_id"], c["dst_id"]))
+        return scored[:top_k]
+
+    expect = naive(vecs, edges, ents, scope, mentions, **kwargs)
+    got = gc.candidate_pairs(vecs, edges, ents, scope, mentions, **kwargs)
+    assert len(expect) > 5, "fixture too sparse to prove anything"
+    assert got == expect
+
+
 def test_partition_candidates_merge_vs_link():
     ents = [
         {"id": 1, "canonical": "atlas review", "display": "Atlas Review", "etype": None},
@@ -625,7 +716,9 @@ def test_junk_entities_flags_metric_readings_and_lists():
 
 def test_junk_entities_flags_resolvable_compounds_only():
     from pseudolife_memory.memory.graph_consolidation import junk_entities
-    ents = [{"id": 1, "display": "memory_lesson_search/world_search"},
+    # Slash compounds must be SPACED since 2026-09-02 (an unspaced slash is
+    # a ref/path/route separator — see _COMPOUND_SEP).
+    ents = [{"id": 1, "display": "memory_lesson_search / world_search"},
             {"id": 2, "display": "pg+extractor"},
             {"id": 3, "display": "ops/backup.ps1"},       # extension-exempt
             {"id": 4, "display": "C++"}]                  # empty right side
@@ -633,7 +726,7 @@ def test_junk_entities_flags_resolvable_compounds_only():
                        "extractor", "ops", "backup-ps1"})
     out = junk_entities(ents, [], max_degree=1, known_norms=known)
     reasons = {j["display"]: j["reason"] for j in out}
-    assert reasons.get("memory_lesson_search/world_search") == "compound-artifact"
+    assert reasons.get("memory_lesson_search / world_search") == "compound-artifact"
     assert reasons.get("pg+extractor") == "compound-artifact"
     assert "ops/backup.ps1" not in reasons
     assert "C++" not in reasons
@@ -679,3 +772,69 @@ def test_variant_tokens_quarter_labels_not_variants():
     assert variant_tokens("Q1 2027 roadmap") == frozenset()
     # Q4_K forms ARE variants
     assert "q4-k" in variant_tokens("Q4_K 2026 quant")
+
+
+# ── 2026-09-02 junk-judge feedback: shape classes with a measured FP tail ──
+
+def test_slot_key_artifact_spares_code_symbols_and_versions():
+    # The 2026-09-02 junk panel scored slot-key-artifact at 3/10 precision:
+    # seven flags were dotted CODE/CONFIG paths whose prefix happened to be
+    # a known entity (cortex._norm_key, cms.store, nomem_arm.nomem_system,
+    # lme.RAG_TOP_K, memory.dream.extractor_reasoning_effort) or a version
+    # dot (gpt-5.6-luna). A flattened slot key came through the cortex
+    # normalizer, so its tail is lowercase-hyphenated prose; a code symbol
+    # keeps underscores / capitals / a leading underscore, and a version
+    # dot sits between digits.
+    ents = [
+        {"id": 1, "canonical": "cortex", "display": "cortex", "etype": None},
+        {"id": 2, "canonical": "cortex-norm-key", "display": "cortex._norm_key", "etype": None},
+        {"id": 3, "canonical": "nomem-arm", "display": "nomem_arm", "etype": None},
+        {"id": 4, "canonical": "nomem-arm-nomem-system", "display": "nomem_arm.nomem_system", "etype": None},
+        {"id": 5, "canonical": "lme", "display": "lme", "etype": None},
+        {"id": 6, "canonical": "lme-rag-top-k", "display": "lme.RAG_TOP_K", "etype": None},
+        {"id": 7, "canonical": "gpt-5", "display": "gpt-5", "etype": None},
+        {"id": 8, "canonical": "gpt-5-6-luna", "display": "gpt-5.6-luna", "etype": None},
+        {"id": 9, "canonical": "memory-dream", "display": "memory.dream", "etype": None},
+        {"id": 10, "canonical": "memory-dream-extractor-reasoning-effort",
+         "display": "memory.dream.extractor_reasoning_effort", "etype": None},
+        # still a slot-key artifact: normalized prose tail under a known head
+        {"id": 11, "canonical": "qwen38-migration", "display": "qwen38-migration", "etype": None},
+        {"id": 12, "canonical": "qwen38-migration-deferred-work",
+         "display": "qwen38-migration.deferred-work", "etype": None},
+        {"id": 13, "canonical": "gpu-window-queue-pending-slot",
+         "display": "gpu-window-queue.pending slot", "etype": None},
+        {"id": 14, "canonical": "gpu-window-queue", "display": "gpu-window-queue", "etype": None},
+    ]
+    known = frozenset(e["canonical"] for e in ents)
+    out = {j["entity_id"]: j["reason"]
+           for j in gc.junk_entities(ents, [], max_degree=1, known_norms=known)}
+    for spared in (2, 4, 6, 8, 10):
+        assert out.get(spared) != "slot-key-artifact", ents[spared - 1]["display"]
+    assert out.get(12) == "slot-key-artifact"
+    assert out.get(13) == "slot-key-artifact"
+
+
+def test_compound_artifact_requires_spaced_slash():
+    # origin/master and fix/autostart-elevation-guidance were flagged as
+    # compounds because both halves are known entities — but an unspaced
+    # slash is a ref/path separator. A genuine slash compound in the corpus
+    # is spaced ("codex-cli / multi-provider-installer"); "+" compounds
+    # (pg+extractor, 2026-07-11) stay flagged either way.
+    ents = [
+        {"id": 1, "canonical": "origin", "display": "origin", "etype": None},
+        {"id": 2, "canonical": "master", "display": "master", "etype": None},
+        {"id": 3, "canonical": "origin-master", "display": "origin/master", "etype": None},
+        {"id": 4, "canonical": "codex-cli", "display": "codex-cli", "etype": None},
+        {"id": 5, "canonical": "multi-provider-installer", "display": "multi-provider-installer", "etype": None},
+        {"id": 6, "canonical": "codex-cli-multi-provider-installer",
+         "display": "codex-cli / multi-provider-installer", "etype": None},
+        {"id": 7, "canonical": "pg", "display": "pg", "etype": None},
+        {"id": 8, "canonical": "extractor", "display": "extractor", "etype": None},
+        {"id": 9, "canonical": "pg-extractor", "display": "pg+extractor", "etype": None},
+    ]
+    known = frozenset(e["canonical"] for e in ents)
+    out = {j["entity_id"]: j["reason"]
+           for j in gc.junk_entities(ents, [], max_degree=1, known_norms=known)}
+    assert out.get(3) != "compound-artifact"
+    assert out.get(6) == "compound-artifact"
+    assert out.get(9) == "compound-artifact"

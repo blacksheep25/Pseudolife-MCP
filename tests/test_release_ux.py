@@ -66,6 +66,16 @@ _EXPECTED_ENUMS = [
     # Literal edit that silently drops it breaks the inferred-default contract.
     ("memory_fact_set", "freshness_class",
      ["auto", "evergreen", "slow", "volatile"]),
+    # v35 write-time label pair — "auto" is the deterministic-heuristic
+    # sentinel; dropping it from either Literal breaks the default contract.
+    ("memory_store", "authority",
+     ["auto", "directive", "observation", "quoted"]),
+    ("memory_store", "distortion_tolerance",
+     ["auto", "constraint", "procedural", "belief", "preference", "episodic"]),
+    ("memory_fact_set", "authority",
+     ["auto", "directive", "observation", "quoted"]),
+    ("memory_fact_set", "distortion_tolerance",
+     ["auto", "constraint", "procedural", "belief", "preference", "episodic"]),
 ]
 
 
@@ -327,7 +337,17 @@ def test_readme_documents_the_agents_md_standard() -> None:
 # The needles are assembled from fragments so this file passes its own check.
 _IDENT_NEEDLES = (("HAM" "O9").lower().encode(),
                   ("pseudogiant" + "92").encode(),
-                  ("192.168." + "0.").encode())
+                  ("192.168." + "0.").encode(),
+                  ("brendan" "-hermes").encode(),
+                  ("pseudo" "-pc").encode())
+# The two hostnames were added 2026-09-04: a graph artifact published the
+# first one as an entity name because the redactor's tracked-tree check
+# vouched for it — the tree already carried it, in a judge-eval fixture built
+# from real bank memories. The maintainer's bare given name is deliberately
+# NOT a needle: it occurs as a book author and a film character inside the
+# LongMemEval and BEAM corpora, where a scrub would corrupt benchmark payloads
+# that must stay byte-identical. Hostname shape is the identifier; the token
+# alone is not.
 # Pattern classes (2026-08-10 audit): the needle list only catches the
 # identifiers that already leaked once — a differently-shaped future leak
 # (another username, subnet, or a credential) sailed through. The classes

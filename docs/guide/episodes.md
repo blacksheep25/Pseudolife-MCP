@@ -60,8 +60,11 @@ reliably — without the agent having to remember:
      handle) still get episodes: the daemon **lazily opens** one on the
      first store of a new session (so empty sessions never leave a husk)
      and the **idle reaper** closes it once inactive — firing the
-     end-of-session dream, or pruning it if empty
-     (`PSEUDOLIFE_SESSION_IDLE_SECONDS`, default 30 min). One open episode
+     end-of-session dream for non-empty sessions
+     (`PSEUDOLIFE_SESSION_IDLE_SECONDS`, default 30 min). An episode that
+     is *empty* at reap time is closed but kept until it is also past the
+     resume window (the session may only be on a break), then deleted with
+     a **tombstone** left behind. One open episode
      is tracked *per resolved identity*, so concurrent sessions (e.g.
      different projects) don't clobber each other, subject to tier 3's
      last-start-wins limitation (see Configuration).
@@ -69,12 +72,24 @@ reliably — without the agent having to remember:
    A store arriving after the reaper closed the episode **resumes** it —
    same identity, same episode — rather than opening a new husk
    (`PSEUDOLIFE_SESSION_RESUME_SECONDS`, default 6 h; `0` disables). The
-   same window applies to the briefing's `episode="<id>"` handle: a write
-   carrying a handle whose root the reaper closed reopens that episode
-   (without moving the current-episode pointer — the writer may be a
-   different session), so the always-pass handle stays valid across long
-   pauses. Past the window, or on an ambiguous prefix, the write proceeds
-   under normal identity with an `episode_warning`.
+   briefing's `episode="<id>"` handle resumes under its **own, far longer
+   window** (`PSEUDOLIFE_HANDLE_RESUME_SECONDS`, default 30 days; `0`
+   disables): a handle is a daemon-minted id only that session's briefing
+   carried — an explicit identity claim, not an inference — so a session
+   parked for days (a deferred benchmark, a long weekend) still attributes
+   correctly on return. A write carrying a handle whose root the reaper
+   closed reopens that episode (without moving the current-episode
+   pointer — the writer may be a different session); one whose empty root
+   the sweep already deleted **recreates it from the tombstone under the
+   original id** (keeping an agent-set title), so the always-pass handle
+   stays valid across long pauses either way. Only roots the *reaper*
+   closed empty are ever swept — an old episode whose entries were later
+   evicted or forgotten is history, not a husk, and is never touched. The
+   one deliberate gap in the promise is the manual prune
+   (`POST /api/episodes/prune`): an explicit operator action that deletes
+   empty closed episodes without a tombstone. Past the handle window, or
+   on an ambiguous prefix, the write proceeds under normal identity with
+   an `episode_warning`.
    Direct-HTTP titles start generic
    (`session - YYYY-MM-DD HH:MM`, since the daemon has no project `cwd`) —
    name the session with `memory_session_title` (store responses carry an
@@ -139,6 +154,14 @@ and does nothing if the daemon is down — it can't slow or break session
 start. Tune the briefing budget with `--max-unsure N` / `--max-lessons N` /
 `--max-world N` (default 3 each). The briefing content is also available on
 demand via the CLI or the Console's `/api/briefing` route.
+
+This installs the *briefing* and the per-turn discipline line — not the
+identity registration. `pseudolife-mcp briefing` reads `/api/briefing` and
+forwards no session id, and no SessionEnd hook is written, so an install
+wired this way has no hook-registered identity (tier 3) and no hook-driven
+episode close: the idle reaper closes the episode instead, and the
+briefing's `episode="<id>"` handle is the concurrency-correct attribution
+channel. For the full lifecycle, use the plugin.
 
 ## Episodes + tags
 

@@ -191,36 +191,80 @@ def candidate_pairs(vectors: dict[int, np.ndarray], edges: list[dict],
     dup = {frozenset(p) for p in exact_duplicate_pairs(entities, edges)}
     ids = sorted(i for i in vectors if i not in excl)
     scored: list[dict] = []
-    for i in range(len(ids)):
-        for j in range(i + 1, len(ids)):
-            u, v = ids[i], ids[j]
-            key = frozenset((u, v))
-            if key in linked or key in dup:
-                continue
-            if dismissed and tuple(sorted((canon.get(u, ""), canon.get(v, "")))) in dismissed:
-                continue
-            mu, mv = mentions.get(u), mentions.get(v)
-            # Containment, not Jaccard: when the SMALLER side's mentions sit
-            # almost wholly inside the other's, its context IS the
-            # co-mention — one shared note pair generated ten cross-product
-            # candidates at Jaccard 0.67 on 2026-08-12, all noise. EXEMPT:
-            # name-contained pairs (the MERGE-shaped class) co-occur by
-            # construction — the scan fallback makes the shorter name's
-            # mentions a superset of the longer's — so the drop would
-            # silently disable merge-candidate discovery for them.
-            if (mu and mv
-                    and (len(mu & mv) / min(len(mu), len(mv))
-                         >= max_support_overlap)
-                    and not _name_contains(disp.get(u, ""), disp.get(v, ""))):
-                continue                           # shared support -> co-occurrence
-            su, sv = set(scope_map.get(u, [])), set(scope_map.get(v, []))
-            if su and sv and not (su & sv):       # disjoint, both attributed
-                continue
-            sim = float(np.dot(vectors[u], vectors[v]))
-            if sim < min_similarity:
-                continue
-            scored.append({"src_id": u, "dst_id": v, "src": disp.get(u, str(u)),
-                           "dst": disp.get(v, str(v)), "similarity": round(sim, 4)})
+    n = len(ids)
+    if n < 2:
+        return scored
+    # Descending-similarity scan with early exit (2026-09-01). The
+    # per-pair Python loop this replaces was O(n^2) in interpreter time —
+    # measured 4.2s per deep tick at the live bank's 2,070 eligible
+    # entities and quadratic in entity growth — and the similarity
+    # threshold alone cannot prune it: on that bank 64% of ALL pairs sit
+    # at >= 0.55 (crowded embedding space), so a threshold prefilter
+    # keeps 1.37M pairs. What bounds the work is the OUTPUT: only the
+    # top_k survivors ship, so ranking pairs by similarity first (blocked
+    # matmul + one argsort, GIL-releasing numpy) lets the Python filter
+    # chain run on just the top-of-ranking prefix until top_k survive —
+    # ~0.5s at live scale, and the worst case (every pair filtered)
+    # degenerates to the old full scan, never worse. The REPORTED value
+    # stays the same per-pair np.dot, and the scan continues through the
+    # k-th survivor's rounded-similarity tie band before stopping (any
+    # pair rounding strictly below it sorts after every survivor), so
+    # output is identical to the loop it replaced — equivalence-pinned
+    # against a verbatim copy in tests/test_graph_consolidation.py. The
+    # margins absorb matmul-vs-dot accumulation differences (f32-safe).
+    # Memory note: the candidate index/sim arrays are O(pairs-past-thresh)
+    # at ~20 bytes each — ~27MB at the live bank's 1.37M such pairs. Runs
+    # OUTSIDE the service lock (an allocation cost, never a daemon pause).
+    # `block` only shapes the transient matmul slab (block x n floats),
+    # not a tuned trade-off.
+    mat = np.stack([vectors[i] for i in ids])
+    thresh = min_similarity - 1e-3
+    block = 1024
+    cand: list[tuple[np.ndarray, np.ndarray, np.ndarray]] = []
+    for lo in range(0, n, block):
+        sims = mat[lo:lo + block] @ mat.T          # (block, n)
+        bi, bj = np.nonzero(sims >= thresh)
+        keep = bj > bi + lo                        # upper triangle only
+        cand.append((bi[keep] + lo, bj[keep], sims[bi[keep], bj[keep]]))
+    ci = np.concatenate([c[0] for c in cand])
+    cj = np.concatenate([c[1] for c in cand])
+    cs = np.concatenate([c[2] for c in cand])
+    stop_below: float | None = None    # raw floor once top_k survivors held
+    for idx in np.argsort(-cs, kind="stable").tolist():
+        if stop_below is not None and float(cs[idx]) < stop_below:
+            break
+        u, v = ids[int(ci[idx])], ids[int(cj[idx])]
+        key = frozenset((u, v))
+        if key in linked or key in dup:
+            continue
+        if dismissed and tuple(sorted((canon.get(u, ""), canon.get(v, "")))) in dismissed:
+            continue
+        mu, mv = mentions.get(u), mentions.get(v)
+        # Containment, not Jaccard: when the SMALLER side's mentions sit
+        # almost wholly inside the other's, its context IS the
+        # co-mention — one shared note pair generated ten cross-product
+        # candidates at Jaccard 0.67 on 2026-08-12, all noise. EXEMPT:
+        # name-contained pairs (the MERGE-shaped class) co-occur by
+        # construction — the scan fallback makes the shorter name's
+        # mentions a superset of the longer's — so the drop would
+        # silently disable merge-candidate discovery for them.
+        if (mu and mv
+                and (len(mu & mv) / min(len(mu), len(mv))
+                     >= max_support_overlap)
+                and not _name_contains(disp.get(u, ""), disp.get(v, ""))):
+            continue                           # shared support -> co-occurrence
+        su, sv = set(scope_map.get(u, [])), set(scope_map.get(v, []))
+        if su and sv and not (su & sv):       # disjoint, both attributed
+            continue
+        sim = float(np.dot(vectors[u], vectors[v]))
+        if sim < min_similarity:
+            continue
+        scored.append({"src_id": u, "dst_id": v, "src": disp.get(u, str(u)),
+                       "dst": disp.get(v, str(v)), "similarity": round(sim, 4)})
+        if stop_below is None and len(scored) >= top_k:
+            # The k-th survivor (smallest raw sim so far, hence smallest
+            # rounded) sets the boundary; finish its rounded tie band.
+            stop_below = scored[-1]["similarity"] - 5e-5 - 1e-3
     scored.sort(key=lambda c: (-c["similarity"], c["src_id"], c["dst_id"]))
     return scored[:top_k]
 
@@ -427,15 +471,21 @@ def _is_list_artifact(name: str) -> bool:
     return sum(1 for p in _split_outside_parens(str(name)) if p) >= 2
 
 
-_COMPOUND_SEP = re.compile(r"[+/]")
+# A slash joins a compound only when SPACED ("codex-cli / installer"): every
+# unspaced slash in the live bank is a ref, branch, path, route or repo slug
+# (origin/master, fix/…, /api/graph/merge, owner/repo — 106 of 106 sampled
+# on 2026-09-02, and every slash-joined junk tombstone was spaced), so the
+# unspaced form is a name, not a join. "+" joins either way (pg+extractor).
+_COMPOUND_SEP = re.compile(r"\s/\s|\+")
 _FILE_EXTENSION = re.compile(r"\.[A-Za-z0-9]{1,4}$")
 
 
 def _compound_halves(name: str) -> tuple[str, str] | None:
-    """Split at the FIRST ``/`` or ``+``; both halves must be non-empty and
-    carry alphanumeric content, and neither may end in a dot-extension (file
-    paths are exempt: ``ops/backup.ps1``). Detection-only feeder — a compound
-    is junk-PROPOSED, never write-dropped (2026-07-11: ``pg+extractor``)."""
+    """Split at the FIRST spaced ``/`` or any ``+``; both halves must be
+    non-empty and carry alphanumeric content, and neither may end in a
+    dot-extension (file paths are exempt: ``ops/backup.ps1``). Detection-only
+    feeder — a compound is junk-PROPOSED, never write-dropped (2026-07-11:
+    ``pg+extractor``)."""
     s = str(name)
     m = _COMPOUND_SEP.search(s)
     if not m:
@@ -555,6 +605,23 @@ def partition_candidates(pairs: list[dict], entities: list[dict], edges: list[di
     return merges, links
 
 
+# A flattened slot key came through the cortex normalizer, so its tail is
+# lowercase-hyphenated prose ("deferred-work", "pending slot"). A dotted
+# CODE/CONFIG path keeps what the normalizer would have folded: underscores,
+# capitals, a leading underscore (cortex._norm_key, lme.RAG_TOP_K,
+# nomem_arm.nomem_system, memory.dream.extractor_reasoning_effort), and a
+# version dot sits between digits (gpt-5.6-luna). The 2026-09-02 junk panel
+# scored the class at 3/10 precision before this exclusion: every false
+# positive was one of those two shapes.
+_CODE_TAIL = re.compile(r"^_|[A-Z_]")
+
+
+def _is_code_dotted(head: str, tail: str) -> bool:
+    if _CODE_TAIL.search(tail):
+        return True
+    return bool(head and head[-1].isdigit() and tail[:1].isdigit())
+
+
 def junk_entities(entities: list[dict], edges: list[dict], *,
                   max_degree: int = 1,
                   known_norms: frozenset[str] | None = None) -> list[dict]:
@@ -588,7 +655,8 @@ def junk_entities(entities: list[dict], edges: list[dict], *,
             # so real dotted names survive — `llama.cpp` is flagged only if an
             # entity `llama` exists, `host.docker.internal` never is.
             head, dot, tail = d.rpartition(".")
-            if dot and head and tail and not _CODE_OR_DATA_EXT.match(tail):
+            if (dot and head and tail and not _CODE_OR_DATA_EXT.match(tail)
+                    and not _is_code_dotted(head, tail)):
                 nh = norm_name(head)
                 if nh and nh in known_norms and nh != norm_name(d):
                     out.append({"entity_id": e["id"], "display": e["display"],

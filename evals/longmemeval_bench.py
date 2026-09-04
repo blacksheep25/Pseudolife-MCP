@@ -23,6 +23,8 @@ Phases (``--phase``) decouple GPU tenancy: ``extract`` ingests + dreams +
 persists the retrieval contexts per question (only the extractor endpoint is
 needed); ``answer`` fills in answers + judgements from the persisted contexts
 (only the Qwen endpoint is needed); ``full`` (default) does both in one pass.
+One exception: ``--refind`` plans its search with the ANSWERER model, so an
+extract phase carrying that arm needs the Qwen endpoint too (probed up front).
 
 Dataset: HuggingFace ``xiaowu0162/longmemeval-cleaned`` JSONs downloaded into
 ``evals/data/`` (gitignored): ``longmemeval_oracle.json`` (evidence sessions
@@ -52,6 +54,7 @@ import sys
 import tempfile
 import time
 import urllib.request
+import warnings
 from datetime import datetime
 from pathlib import Path
 
@@ -61,8 +64,14 @@ os.environ.setdefault("CUDA_VISIBLE_DEVICES", "-1")                # embedder on
 os.environ.setdefault("HF_HUB_OFFLINE", "1")
 os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
 
-from ladder_sweep import approx_tokens, build_service, probe  # noqa: E402
+from context_format import hybrid_context  # noqa: E402
+from ladder_sweep import (approx_tokens, build_service,  # noqa: E402
+                          pool_env_knobs, probe)
 from replicate import cascade_correct, cascade_context_tokens  # noqa: E402
+import answerability_probe  # noqa: E402
+import leak_check  # noqa: E402
+import nomem_arm  # noqa: E402
+import refind_arm  # noqa: E402
 
 DATA_DIR = Path(__file__).resolve().parent / "data"
 RESULTS_DIR = Path(__file__).resolve().parent / "results"
@@ -125,6 +134,24 @@ HYBRID_TOP_K = 6     # raw turns added to cortex facts in the hybrid arm
 CORTEX_TOP_K = 24
 CORTEX_MIN_SCORE = 0.2
 ARMS = ("rag", "cortex", "hybrid")
+# Token-matched rag arms (2026-09-04 review, lever 1). Every published
+# comparison so far pits a small fact context against a large raw-turn one
+# and reports accuracy and tokens as two separate findings — when they are
+# one trade-off. Measured: cortex 96.7 tokens vs rag 1184.1 on the
+# ceiling-v38 LongMemEval run (78 questions), and 551 vs 5539 on BEAM
+# chip12-b16 (400 rows) — a 10x cost gap nobody has ever held constant to
+# see what the non-consolidating arm scores at it. These two knobs
+# serve the rag arm's EXACT retrieval, ranking and formatting at a
+# narrower budget, so a non-consolidating comparator can be read at the
+# fact spine's token cost. Empty/None = inert: no new context keys, not
+# one extra model call, every prior artifact byte-identical.
+#   RAG_LITE_TOP_KS  -> arms rag1, rag2, ... (first K ranked turns)
+#   RAG_BUDGET_TOKENS -> arm ragb<N> (the ranked turns that fit N tokens)
+# Read at CALL time by build_contexts (the HYBRID_TOP_K contract), so both
+# harnesses widen together and a knob set by either CLI reaches the same
+# single implementation.
+RAG_LITE_TOP_KS: tuple[int, ...] = ()
+RAG_BUDGET_TOKENS: int | None = None
 # Session-digest arm (spec 2026-08-24). OFF: every search call in
 # build_contexts is byte-identical to the pre-digest protocol, so all
 # prior artifacts pair exactly. ON (beam_adapter --digest): the searches
@@ -203,6 +230,13 @@ def bench_env_knobs() -> dict:
         or None,
         "sampler": os.environ.get("PSEUDOLIFE_BENCH_SAMPLER", "").strip()
         or None,
+        # Associative retrieval knobs (memory.search). Applied by
+        # ladder_sweep.build_service, which every bench service goes
+        # through; None means the shipped default. They reach ONLY the
+        # arms that call svc.search() (rag, hybrid's raw-turn block), and
+        # only on a --phase extract run — rebuild_contexts.py copies the
+        # associative context verbatim and cannot honour them.
+        "candidate_pool": pool_env_knobs(),
     }
 
 
@@ -329,6 +363,11 @@ def dump_bank(svc, q: dict, path: Path) -> list[dict]:
     facts = svc.cortex_dump().get("entries", [])
     for f in facts:
         f.pop("source_entries", None)             # bulky, not needed offline
+        # Read-time annotations over those same traces: absent from the
+        # offline replay, and present or not depending on when the dump ran,
+        # so leaving them in churns committed bank artifacts for no signal.
+        f.pop("re_verify", None)
+        f.pop("re_verify_reason", None)
         try:
             versions = svc.history(f["entity"], f["attribute"]).get("versions", [])
             f["history"] = [v.get("value") for v in versions]  # oldest→newest
@@ -377,6 +416,201 @@ def rewrite_rows(path: Path, rows: list[dict]) -> None:
     tmp.replace(path)
 
 
+def _chronological_sessions(q: dict) -> list[tuple[str, list]]:
+    """The haystack in ingest order. Both the ingest path and the ReFind
+    archive read it through here so their turn ordering cannot drift."""
+    return sorted(zip(q["haystack_dates"], q["haystack_sessions"]),
+                  key=lambda pair: _parse_date(pair[0]))
+
+
+def archive_from_lme_question(q: dict) -> refind_arm.LexicalArchive:
+    """The ReFind arm's lexical archive for one question, built from the
+    SAME haystack turns, in the same order and the same stored text as
+    ``ingest_and_dream`` writes into the bank — so a refind-vs-rag delta
+    is about the retrieval loop and not a different corpus. Pinned
+    turn-for-turn against the ingest path by
+    ``test_archive_mirrors_what_ingest_stores_turn_for_turn``."""
+    records, ordinal = [], 0
+    for index, (date, session) in enumerate(_chronological_sessions(q), 1):
+        for turn in session:
+            content = (turn.get("content") or "").strip()
+            if not content:
+                continue
+            ordinal += 1
+            records.append(refind_arm.ArchiveRecord(
+                text=f"[{date}] {turn['role']}: {content}",
+                session=str(index), ordinal=ordinal,
+                date=refind_arm.parse_anchor(date)))
+    return refind_arm.LexicalArchive(records)
+
+
+def rag_lite_arm_names(top_ks: tuple[int, ...],
+                       budget_tokens: int | None) -> tuple[str, ...]:
+    """The arm names a given rag-lite config serves, in served order.
+
+    One implementation for both harnesses: the BEAM adapter needs the
+    names up front (its answer loop iterates a fixed arm tuple) while
+    LongMemEval discovers them from the persisted contexts, and a name
+    minted differently in the two places would pair two different arms.
+    """
+    names = tuple(f"rag{k}" for k in top_ks)
+    if budget_tokens is not None:
+        names += (f"ragb{budget_tokens}",)
+    return names
+
+
+def validate_rag_lite(top_ks: tuple[int, ...], budget_tokens: int | None,
+                      rag_width: int) -> None:
+    """Reject a rag-lite config before any bench global moves.
+
+    A width at or above the rag control's would serve a byte-identical
+    copy of the control under a second name — a judged arm that measures
+    nothing and costs a full answer+judge pass per question.
+
+    The BUDGET path carries no equivalent near-duplicate guard, and
+    cannot: what a token budget resolves to is a property of the data,
+    not of the flag. A budget above the control's cost serves a copy of
+    the control (``ragb100000`` on a 1,200-token run) and a budget below
+    the cost of one turn serves exactly ``rag1`` (measured: ``ragb100``
+    equalled ``rag1`` on 74 of the 78 raglite-v38 rows). Only the run's
+    recorded ``{arm}_context_tokens`` mean can say which happened, which
+    is why ``rag_lite_contexts`` warns at serve time and both summaries
+    carry ``budget_overshoot_rows``.
+    """
+    for k in top_ks:
+        if k < 1:
+            raise SystemExit("--rag-lite-top-k values must be positive")
+        if k >= rag_width:
+            raise SystemExit(
+                f"--rag-lite-top-k {k} is not narrower than the rag "
+                f"control's width {rag_width}; it would serve a copy of "
+                "the control under another name")
+    if len(set(top_ks)) != len(top_ks):
+        raise SystemExit("--rag-lite-top-k lists a width twice")
+    if budget_tokens is not None and budget_tokens < 1:
+        raise SystemExit("--rag-budget-tokens must be positive")
+
+
+def parse_rag_lite_top_ks(spec: str | None,
+                          flag: str = "--rag-lite-top-k"
+                          ) -> tuple[int, ...]:
+    """``"1,2"`` -> ``(1, 2)``; empty/None -> ``()`` (arm off).
+
+    ``flag`` only names the flag in the error: rag_lite_rebuild.py
+    parses its budget list with the same function.
+    """
+    if not spec:
+        return ()
+    try:
+        return tuple(int(part) for part in spec.split(",") if part.strip())
+    except ValueError:
+        raise SystemExit(
+            f"{flag} takes a comma-separated list of integers, "
+            f"got {spec!r}") from None
+
+
+def rag_lite_contexts(raw_texts: list[str], top_ks: tuple[int, ...],
+                      budget_tokens: int | None) -> dict[str, str]:
+    """The token-matched rag arms for one question.
+
+    Built from the rag control's OWN ranked turn list and joined with the
+    control's separator, so every arm here is a strict prefix of
+    ``contexts["rag"]`` — same retrieval, same ranking, same formatting,
+    same answer prompt and judge, only fewer turns. That prefix property
+    is what makes a rag-vs-rag1 delta a budget effect and nothing else;
+    ``test_rag_lite_arms.py`` pins it.
+
+    The budget arm grows the prefix while the SERVED context still fits
+    ``budget_tokens`` under ``approx_tokens`` (the len//4 convention the
+    row's ``{arm}_context_tokens`` is recorded in) — measured on the
+    joined block, not summed per turn, so the recorded number is the one
+    that was bounded. At least one turn is always served: an arm that can
+    serve empty would silently become a second no-memory control.
+    """
+    out: dict[str, str] = {}
+    for k in top_ks:
+        out[f"rag{k}"] = "\n\n".join(raw_texts[:k])
+    if budget_tokens is not None:
+        kept: list[str] = []
+        for text in raw_texts:
+            candidate = kept + [text]
+            if kept and approx_tokens("\n\n".join(candidate)) > budget_tokens:
+                break
+            kept = candidate
+        served = "\n\n".join(kept)
+        name = f"ragb{budget_tokens}"
+        out[name] = served
+        if approx_tokens(served) > budget_tokens:
+            # Loud, because on LongMemEval this is the COMMON case, not
+            # an edge one: a single raw turn is already ~200 tokens, so
+            # a 100-token budget served a mean 219.2 tokens over the 78
+            # raglite-v38 rows (36 of them above the budget) and was
+            # byte-identical to rag1 on 74 of them. An arm named for a
+            # budget it misses by 2.2x is not a token-matched
+            # comparator, and its name is the only place that says 100.
+            # The message text is constant so Python's default filter
+            # prints it once per run, not once per question.
+            warnings.warn(
+                f"the {name} arm's served block exceeds its budget: "
+                "one ranked turn alone is over budget and the arm's "
+                "floor is one turn, so it serves more than "
+                f"{budget_tokens} approximate tokens. Read the run's "
+                f"measured {name}_context_tokens mean and its "
+                "budget_overshoot_rows count, not the arm's name.",
+                stacklevel=2)
+    return out
+
+
+def budget_overshoot(rows: list[dict], arm: str) -> int | None:
+    """How many rows a ``ragb<N>`` arm served ABOVE its own budget.
+
+    ``None`` for every other arm: only a budget arm has a budget to
+    miss. Both harnesses' summaries carry it beside the arm's mean
+    cost, so a reader of the artifact meets the overshoot without
+    recomputing it — the runbook's 2026-09-04 correction (ragb100
+    served 2.2x its name) had to be measured by hand because nothing
+    published it.
+    """
+    m = re.fullmatch(r"ragb(\d+)", arm)
+    if not m:
+        return None
+    budget = int(m.group(1))
+    key = f"{arm}_context_tokens"
+    return sum(1 for r in rows if int(r.get(key, 0)) > budget)
+
+
+def serve_comparator_arms(contexts: dict, question: str, *, archive=None,
+                          refind: bool = False, nomem: bool = False,
+                          refind_kwargs: dict | None = None,
+                          chat=None) -> dict | None:
+    """Add the comparator arms to a context dict; returns the ReFind trace
+    (None when that arm is off).
+
+    Shared by both harnesses — the BEAM adapter calls it too, so the two
+    cannot drift into serving these arms differently. Off by default and
+    inert when off: no new context keys and not one extra model call, so
+    every pre-existing artifact stays byte-identical.
+    """
+    trace = None
+    if refind:
+        if archive is None:
+            raise SystemExit("the refind arm needs an archive — "
+                             "build one from the question's raw turns first")
+        kwargs = dict(refind_kwargs or {})
+        if kwargs.get("top_k") is None:
+            # Budget-matched to the rag control, read HERE rather than at
+            # flag-parse time — the same call-time contract HYBRID_TOP_K
+            # carries, so --rag-top-k style widening reaches both arms.
+            kwargs["top_k"] = RAG_TOP_K
+        contexts["refind"], trace = refind_arm.refind_search(
+            archive, question, chat=chat or _chat, **kwargs)
+    if nomem:
+        # Recorded as an explicit empty context: the artifact has to show
+        # the arm was served nothing (leak_check.py checks exactly that).
+        contexts["nomem"] = ""
+    return trace
+
+
 def ingest_and_dream(svc, extractor, q: dict, ex_url: str) -> dict:
     """Store every turn session-by-session in chronological order, dreaming
     after each session — the product cadence (consolidation fires between
@@ -384,10 +618,7 @@ def ingest_and_dream(svc, extractor, q: dict, ex_url: str) -> dict:
     tally = {"turns": 0, "claims": 0, "inserted": 0, "superseded": 0,
              "extract_seconds": 0.0}
     held = 0
-    sessions = sorted(
-        zip(q["haystack_dates"], q["haystack_sessions"]),
-        key=lambda pair: _parse_date(pair[0]))
-    for date, session in sessions:
+    for date, session in _chronological_sessions(q):
         for turn in session:
             content = (turn.get("content") or "").strip()
             if not content:
@@ -584,15 +815,19 @@ def build_contexts(svc, question: str, variants: bool = False,
             f, versions, enumerated=(FACT_RENDER == "enum")))
 
     def _hyb(facts: list[str], mems: list[str]) -> str:
-        return ("Known facts:\n" + "\n".join(facts) +
-                "\n\nRelevant memories:\n" +
-                "\n\n".join(mems[:HYBRID_TOP_K]))
+        return hybrid_context(facts, mems[:HYBRID_TOP_K])
 
     ctx = {
         "rag": "\n\n".join(raw_texts),
         "cortex": "\n".join(fact_lines),
         "hybrid": _hyb(fact_lines, mem_texts),
     }
+    # Token-matched rag arms, from the control's OWN ranked turns
+    # (both harnesses reach build_contexts, so they cannot drift into
+    # serving these differently). Knobs read at call time; the default
+    # empty config adds no keys at all.
+    ctx.update(rag_lite_contexts(raw_texts, RAG_LITE_TOP_KS,
+                                 RAG_BUDGET_TOKENS))
     digest_texts: list[str] = []
     if DIGEST_ARM and not variants:
         # The digest-eligible arm reuses the widened mem call WITH digests
@@ -690,6 +925,28 @@ def build_contexts(svc, question: str, variants: bool = False,
     return ctx
 
 
+def answer_call(arm: str, question: str, question_date, ctx: str
+                ) -> tuple[str, str]:
+    """The (system, prompt) pair for one arm's answer call.
+
+    Every memory arm shares the answerer and context block, and that
+    prompt text is a CONTRACT — the regression gate re-answers pinned
+    contexts with it, so it is reproduced here byte for byte. The
+    no-memory arm shares the question framing (date prefix included) and
+    drops the context clauses entirely rather than serving an "(empty)"
+    block, which is itself a framing the other arms do not see.
+    """
+    if arm == "nomem":
+        # Built with THIS harness's length policy: its judge grades on
+        # containment, so a no-memory arm told to answer completely would
+        # get more shots at the gold than the one-sentence arms it bounds.
+        return (nomem_arm.nomem_system(nomem_arm.LENGTH_ONE_SENTENCE),
+                nomem_arm.nomem_prompt(question, question_date))
+    return _ANSWER_SYSTEM, (f"Question date: {question_date}\n"
+                            f"Question: {question}\n\n"
+                            f"Memory context:\n{ctx or '(empty)'}")
+
+
 def answer_and_judge(row: dict) -> dict:
     """Fill the answer/judge fields on a row from its persisted contexts."""
     # Missing question_type (pre---types files) falls back to the KU judge
@@ -703,9 +960,9 @@ def answer_and_judge(row: dict) -> dict:
     # hybrid_* arms.
     for arm in row["contexts"]:
         ctx = row["contexts"].get(arm, "")
-        prompt = (f"Question date: {row['question_date']}\n"
-                  f"Question: {row['question']}\n\nMemory context:\n{ctx or '(empty)'}")
-        response = _chat(_ANSWER_SYSTEM, prompt)
+        system, prompt = answer_call(arm, row["question"],
+                                     row["question_date"], ctx)
+        response = _chat(system, prompt)
         verdict = _chat(judge_system, (
             f"Question: {row['question']}\n"
             f"Correct answer: {row['answer']}\n"
@@ -740,12 +997,30 @@ def run_extract(dataset: str, limit: int | None, extractor_name: str,
                 events_prompt_file: str | None = None,
                 qids: str | None = None,
                 types: tuple[str, ...] = DEFAULT_TYPES,
-                variants: bool = False) -> None:
+                variants: bool = False,
+                refind: bool = False, nomem: bool = False,
+                refind_kwargs: dict | None = None,
+                rag_lite_top_ks: tuple[int, ...] = (),
+                rag_budget_tokens: int | None = None) -> None:
     ex_url = EXTRACTORS[extractor_name]
+    # Validated (and the bench globals moved) before a single question
+    # is ingested: a width the arms cannot serve must fail here, not
+    # after paying an ingest, and never half-applied.
+    validate_rag_lite(rag_lite_top_ks, rag_budget_tokens, RAG_TOP_K)
+    global RAG_LITE_TOP_KS, RAG_BUDGET_TOKENS
+    RAG_LITE_TOP_KS = rag_lite_top_ks
+    RAG_BUDGET_TOKENS = rag_budget_tokens
     if not probe(ex_url):
         sys.exit(f"no extractor server at {ex_url} — start it first")
-    if do_answer and not probe(QWEN_URL):
-        sys.exit(f"no answer/judge server at {QWEN_URL} — start it first")
+    # --refind drives the ANSWERER model during the EXTRACT phase (its
+    # search loop is planned by that model), so the phase split's usual
+    # "extractor endpoint only" no longer holds for it. Probing here is
+    # what stops a run dying mid-question after paying a full ingest and
+    # writing no row to resume from.
+    if (do_answer or refind) and not probe(QWEN_URL):
+        why = "" if do_answer else " (the --refind search loop plans on it)"
+        sys.exit(f"no answer/judge server at {QWEN_URL}{why} "
+                 "— start it first")
     from pseudolife_memory.memory.dream import OpenAICompatExtractor
 
     slug = types_slug(types)
@@ -776,6 +1051,15 @@ def run_extract(dataset: str, limit: int | None, extractor_name: str,
                                     events_prompt_file)
         tally = ingest_and_dream(svc, extractor, q, ex_url)
         contexts = build_contexts(svc, q["question"], variants=variants)
+        # Comparator arms (off by default): the ReFind loop searches the
+        # same haystack turns the bank just ingested; the no-memory arm is
+        # served nothing. Both contexts are PERSISTED like every other
+        # arm, so the answer phase (and a later rebuild_contexts re-answer)
+        # replays them without re-paying extraction.
+        refind_trace = serve_comparator_arms(
+            contexts, q["question"],
+            archive=archive_from_lme_question(q) if refind else None,
+            refind=refind, nomem=nomem, refind_kwargs=refind_kwargs)
         facts = dump_bank(svc, q, bank_dir(dataset, extractor_name, tag,
                                            slug)
                           / f"{q['question_id']}.json.gz")
@@ -793,6 +1077,19 @@ def run_extract(dataset: str, limit: int | None, extractor_name: str,
             "contexts": contexts,
             "consolidation": tally,
             "wall_seconds": round(time.perf_counter() - t_start, 1),
+            # SR-TTT guard (arXiv 2603.06642): a question that already
+            # names its gold answer scores on every arm and measures no
+            # retrieval. leak_check.py reads this to report each arm's
+            # mean with those rows excluded; None = gold too short or
+            # generic to test.
+            "gold_in_question": leak_check.answer_present(q["question"],
+                                                          q["answer"]),
+            # Self-describing rows: only ReFind runs carry these, so every
+            # legacy artifact keeps its exact shape.
+            **({"refind_trace": refind_trace,
+                "refind_top_k": refind_trace["top_k"],
+                "refind_rounds": refind_trace["rounds_budget"]}
+               if refind_trace is not None else {}),
             **diagnose_bank(facts, q["answer"]),
         }
         marks = "extracted"
@@ -839,11 +1136,31 @@ def report(dataset: str, extractor_name: str, tag: str = "",
                # say which config produced it is unauditable afterwards.
                "bench_env": bench_env_knobs(),
                "arms": {}}
+    # rag_lite_rebuild.py --limit stamps partial=true on every row it
+    # writes. Carry it into the summary: the rows said so, but a summary
+    # reading "n": 5 beside normal-looking means is exactly what a reader
+    # mistakes for a complete run of 5 questions.
+    if any(r.get("partial") for r in rows):
+        summary["partial"] = True
+        print(f"PARTIAL run: {n} rows carry partial=true — a limited "
+              "rebuild, not a complete run")
     # Variant arms (hybrid_ctg etc.) are detected from the rows so old
     # three-arm artifacts report identically.
     extra_arms = tuple(sorted(
         {k.removesuffix("_correct") for k in rows[0] if k.endswith("_correct")}
         - set(ARMS)))
+    # Rows must agree on their arms. A file resumed with different arm
+    # flags than it started with would otherwise either KeyError below or
+    # (if arms were intersected) quietly drop an arm from the table.
+    for r in rows:
+        missing = [a for a in extra_arms if f"{a}_correct" not in r]
+        if missing:
+            sys.exit(
+                f"{out_path.name}: row {r.get('question_id')} is missing "
+                f"the {', '.join(missing)} arm(s) that other rows carry — "
+                "the file mixes runs with different arm flags. Re-run the "
+                "answer phase over the whole file, or report the runs "
+                "separately.")
     for arm in ARMS + extra_arms + ("cascade",):
         if arm == "cascade":
             # Derived commit-gated cascade — cortex answer when that arm
@@ -857,10 +1174,41 @@ def report(dataset: str, extractor_name: str, tag: str = "",
             tok = sum(r[f"{arm}_context_tokens"] for r in rows) / n
         summary["arms"][arm] = {"accuracy": round(acc, 3),
                                 "context_tokens": round(tok, 1)}
-        print(f"{arm:<10}{acc:>10.3f}{tok:>12.1f}")
+        # A ragb<N> arm is named for a budget it does not always keep —
+        # the always-serve-one-turn floor overshoots whenever one ranked
+        # turn is already over budget, which on LongMemEval is the common
+        # case. Published beside the mean so the artifact says it.
+        over = budget_overshoot(rows, arm)
+        if over is not None:
+            summary["arms"][arm]["budget_overshoot_rows"] = over
+        print(f"{arm:<10}{acc:>10.3f}{tok:>12.1f}"
+              + (f"  ({over}/{n} over budget)" if over else ""))
     sup = sum(r["consolidation"]["superseded"] for r in rows)
     print(f"supersessions across runs: {sup}")
     summary["superseded_total"] = sup
+    # Runs that recorded the per-row SR-TTT flag carry the leak check:
+    # how many questions named their own gold answer, and every arm's
+    # mean with those rows excluded. Legacy artifacts have no flag and
+    # their summaries stay unchanged.
+    if any(leak_check.FLAG_KEY in r for r in rows):
+        summary["leak_check"] = leak_check.check_rows(rows)
+        n_leaked = summary["leak_check"]["n_leaked"]
+        print(f"gold-answer leaks: {n_leaked} of {n} questions"
+              + (" (arm means beside them exclude these rows)"
+                 if n_leaked else ""))
+    # Rows with persisted contexts carry the answerability + pathway
+    # cross-tab (AWM/PAST-Bench); legacy context-less artifacts report
+    # unchanged. One implementation, shared with the BEAM adapter.
+    ans_block = answerability_probe.report_block(rows)
+    if ans_block:
+        summary["answerability"] = ans_block
+        for arm, a in ans_block["arms"].items():
+            pw = a["pathway"]
+            examined = pw["supported"] + pw["unsupported"] + pw["spanning"]
+            print(f"answerability {arm}: red-flag "
+                  f"{a['cells']['unanswerable_correct']}"
+                  f"/{a['n_testable']} testable, pathway supported "
+                  f"{pw['supported']}/{examined} of correct")
     # Per-type breakdown, only when the run spans more than one type.
     by_type: dict[str, list[dict]] = {}
     for r in rows:
@@ -939,6 +1287,45 @@ def main() -> int:
                          "bench service (pair with --system-prompt-file "
                          "ku_op_prompt_v7_events.txt) and add the hybrid_ev "
                          "context arm (hybrid + served events block)")
+    ap.add_argument("--refind", action="store_true",
+                    help="add the ReFind comparator arm: an agentic "
+                         "LEXICAL search loop over the same haystack turns "
+                         "(temporal narrowing, skip-inspected, "
+                         "session-aware fusion), budget-matched to the rag "
+                         "control (arXiv 2608.12888)")
+    ap.add_argument("--nomem", action="store_true",
+                    help="add the no-memory control arm: the question "
+                         "alone, same task framing, no context "
+                         "(MemTrapBench, arXiv 2608.20202)")
+    ap.add_argument("--refind-rounds", type=int,
+                    default=refind_arm.DEFAULT_ROUNDS,
+                    help="search rounds the ReFind agent may take")
+    ap.add_argument("--refind-top-k", type=int, default=None,
+                    help="raw-turn budget the ReFind arm serves (default: "
+                         "RAG_TOP_K — budget-matched to the control)")
+    ap.add_argument("--refind-per-round-k", type=int,
+                    default=refind_arm.DEFAULT_PER_ROUND_K,
+                    help="turns each ReFind query may inspect")
+    ap.add_argument("--refind-max-queries", type=int,
+                    default=refind_arm.DEFAULT_MAX_QUERIES,
+                    help="searches the ReFind agent may issue per round")
+    ap.add_argument("--refind-session-weight", type=float,
+                    default=refind_arm.SESSION_FUSION_WEIGHT,
+                    help="weight of the session-aware fusion term "
+                         "(0 = pure lexical ranking)")
+    ap.add_argument("--rag-lite-top-k", default=None,
+                    help="comma-separated narrower rag budgets, e.g. "
+                         "'1,2': adds arms rag1, rag2 — the rag "
+                         "control's exact retrieval, ranking and "
+                         "formatting truncated to the first K ranked "
+                         "turns, so accuracy and tokens read as one "
+                         "trade-off instead of two findings")
+    ap.add_argument("--rag-budget-tokens", type=int, default=None,
+                    help="adds arm ragb<N>: the rag ranking truncated "
+                         "to the turns that fit N approximate tokens "
+                         "(len//4), so a run can match the cortex or "
+                         "cascade budget exactly rather than by turn "
+                         "count")
     ap.add_argument("--ev-variants", action="store_true",
                     help="aggregation-serving variants (2026-08-06 design): "
                          "add hybrid_ev_agg (events on either cue, full "
@@ -947,6 +1334,36 @@ def main() -> int:
     args = ap.parse_args()
     if args.ev_variants and not args.chronicle:
         ap.error("--ev-variants requires --chronicle")
+    rag_lite_top_ks = parse_rag_lite_top_ks(args.rag_lite_top_k)
+    if args.phase == "answer" and (args.refind or args.nomem
+                                   or rag_lite_top_ks
+                                   or args.rag_budget_tokens is not None):
+        # The answer phase only replays PERSISTED contexts, so these flags
+        # would do nothing at all — silently, and the user would read the
+        # resulting table as if the arms had run.
+        ap.error("--refind/--nomem/--rag-lite-top-k/--rag-budget-tokens "
+                 "build contexts, so they belong to the extract phase; "
+                 "--phase answer only answers what was already "
+                 "persisted")
+    try:
+        validate_rag_lite(rag_lite_top_ks, args.rag_budget_tokens,
+                          RAG_TOP_K)
+    except SystemExit as e:                       # argparse-shaped usage
+        ap.error(str(e))
+    if args.refind_top_k is not None and args.refind_top_k < 1:
+        ap.error("--refind-top-k must be positive")
+    for _flag, _value in (("--refind-rounds", args.refind_rounds),
+                          ("--refind-per-round-k", args.refind_per_round_k),
+                          ("--refind-max-queries", args.refind_max_queries)):
+        if _value < 1:
+            ap.error(f"{_flag} must be positive")
+    if not 0.0 <= args.refind_session_weight <= 1.0:
+        ap.error("--refind-session-weight must be in [0, 1]")
+    refind_kwargs = {"rounds": args.refind_rounds,
+                     "top_k": args.refind_top_k,
+                     "per_round_k": args.refind_per_round_k,
+                     "max_queries": args.refind_max_queries,
+                     "session_weight": args.refind_session_weight}
     global FACT_RENDER, HYBRID_CONTIG, HYBRID_TIMELINE, CHRONICLE, EV_VARIANTS
     FACT_RENDER = args.fact_render
     HYBRID_CONTIG = args.contiguity
@@ -967,7 +1384,11 @@ def main() -> int:
                     window=args.window,
                     system_prompt_file=args.system_prompt_file,
                     events_prompt_file=args.events_prompt_file,
-                    qids=args.qids, types=types, variants=args.variants)
+                    qids=args.qids, types=types, variants=args.variants,
+                    refind=args.refind, nomem=args.nomem,
+                    refind_kwargs=refind_kwargs,
+                    rag_lite_top_ks=rag_lite_top_ks,
+                    rag_budget_tokens=args.rag_budget_tokens)
     if args.phase != "extract":
         report(args.dataset, args.extractor, args.tag, types)
     return 0

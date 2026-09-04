@@ -81,11 +81,14 @@ gold_recoverable 1.0 / stale_leak 0.0, matching the Claude ceiling rungs,
 at 13.1 tokens/query (`terra`, artifact `results/terra.json`) and
 14.6 tokens/query (`luna`, artifact `results/luna.json`) — inside the
 ≤60%-of-naive gate but roughly 10× the Claude rungs' 1.4: both write
-wordier slot values. Reproducibility caveat: neither shim pins reasoning
-effort — the Codex shim inherits the host's `~/.codex/config.toml`
+wordier slot values. Reproducibility caveat: these runs predate the
+shims' `--reasoning-effort` flag, so neither pinned an effort — the Codex
+shim inherited the host's `~/.codex/config.toml`
 (`model_reasoning_effort = "high"` for these runs) and the Claude shim
-the `claude` CLI's per-model default — so cross-machine reruns may
-measure a different effort setting.
+the `claude` CLI's per-model default. Cross-machine reruns may measure a
+different effort setting; a rerun wanting comparability should pin it
+with the flag (or the request-level `reasoning_effort` field both shims
+now honour).
 
 Every `:8081` rung shares that **one** endpoint: the operator swaps the served
 GGUF between runs (see below). Run one, then the next.
@@ -329,6 +332,134 @@ rag 0.321±0.027, commit precision 0.76±0.05).
 > worth measuring — but any cascade number must name the answerer it was
 > measured with. See
 > [the benchmarks guide](../docs/guide/benchmarks.md#the-knowledge-update-slice-78-of-the-500).
+
+### Comparator arms — `--refind` and `--nomem` (added 2026-09-01, smoke-run)
+
+The same two arms the BEAM adapter grew, wired into this harness as well
+(they share one implementation — `serve_comparator_arms` in
+`longmemeval_bench.py`, which the BEAM adapter calls too, so the harnesses
+cannot drift into serving them differently). Smoke-run 2026-09-01 on 5
+oracle questions — see "First smoke" in the BEAM section for what that
+does and does not establish:
+
+| arm | flag | context |
+|-----|------|---------|
+| `refind` | `--refind` | an agentic **lexical** loop over the same haystack turns the bank ingested, budget-matched to the rag control ([ReFind](https://arxiv.org/abs/2608.12888)) |
+| `nomem` | `--nomem` | nothing — the question, its date, and this harness's own task framing, including its one-sentence answer cap ([MemTrapBench](https://arxiv.org/abs/2608.20202)) |
+
+Both contexts are **persisted like every other arm**, so the split
+extract/answer flow still works: `--phase extract` builds them once,
+`--phase answer` (and a later `rebuild_contexts.py` re-answer) replays
+them without re-paying extraction. One caveat the split does not survive
+untouched — `--refind` plans its searches with the **answerer** model, so
+an extract phase carrying that arm needs the Qwen endpoint up as well
+(probed up front, rather than dying mid-question after paying an ingest).
+`--phase answer --refind` is rejected outright: it would silently do
+nothing, since that phase only answers what is already persisted. `replicate.py agg` and
+`replicate.py compare --arm refind` read the arms off the rows, so a
+five-arm run cannot aggregate into a three-arm table.
+
+```bash
+PYTHONPATH=. python evals/longmemeval_bench.py --dataset oracle \
+    --extractor qwen-27b --tag refind --refind --nomem --limit 5
+```
+
+The rag arm's ReFind counterpart searches the *identical* stored turn
+text — `archive_from_lme_question` and `ingest_and_dream` are pinned
+turn-for-turn against each other by
+`test_archive_mirrors_what_ingest_stores_turn_for_turn`, because both
+format and order the haystack independently.
+
+Run over the committed `ceiling-e2e` artifact (78 knowledge-update
+questions), the leak check finds **0 leaked rows**; its 27 untestable
+rows are **all `trivial_gold`** — LongMemEval always has a gold string,
+so unlike BEAM there is no `no_gold` class here, and what it cannot test
+is short numeric-or-yes/no answers (`25`, `Yes.`, `six`). The arm means
+it recomputes reproduce that run's published table exactly (rag 0.859,
+hybrid 0.8333, cortex 0.6667). Artifact:
+`longmemeval-ku-oracle-qwen-27b-ceiling-e2e.leakcheck.json`.
+
+### Token-matched rag arms — `--rag-lite-top-k` / `--rag-budget-tokens` (added and run 2026-09-04)
+
+Every comparison this harness has published so far scores a ~100-token fact
+context (`cortex`) against a ~1,200-token raw-turn context (`rag`), and
+reports the accuracy gap and the token gap as two separate findings — when
+they are one trade-off. Nobody had ever run a **token-matched
+non-consolidating comparator**, so "the fact spine costs 0.19 accuracy" has
+never been read against "…and what does plain RAG score if you give it the
+fact spine's tokens?". These arms answer exactly that: the rag control's
+*identical* retrieval, ranking, formatting, answer prompt and judge, served
+at a narrower budget and nothing else changed.
+
+| arm | flag | context |
+|-----|------|---------|
+| `rag1`, `rag2`, … | `--rag-lite-top-k 1,2` | the first K turns of the rag control's own ranking |
+| `ragb<N>` | `--rag-budget-tokens N` | the rag ranking truncated to the turns that fit N approximate tokens (`len//4`) — matches a fact-spine budget exactly instead of by turn count |
+
+Both knobs live in `build_contexts`, which BOTH harnesses call, so the
+LongMemEval bench and the BEAM adapter cannot drift into serving them
+differently — the same single-implementation contract `serve_comparator_arms`
+carries for the ReFind and no-memory arms. Each arm is a **strict prefix** of
+`contexts["rag"]` by construction (same list, same separator), pinned by
+`tests/test_rag_lite_arms.py`; a width at or above the control's is rejected
+rather than serving a copy of the control under a second name. The budget arm
+measures its budget on the **joined block** — the same string whose
+`approx_tokens` the row records — and always serves at least one turn, so on a
+question whose top-ranked turn alone exceeds the budget it overshoots rather
+than turning into a second no-memory control. The contexts are persisted like
+every other arm, `replicate.py agg`/`compare`/`strip_judged` read the arms off
+the rows, and a baseline that predates them does not fail the gate for their
+presence.
+
+Adding them to an **already-extracted** run needs `evals/rag_lite_rebuild.py`,
+not `--phase answer` (which only answers already-persisted keys) and not
+`rebuild_contexts.py` (which copies the rag context verbatim; the fact-bank
+dumps do not contain the ranked turn list, and splitting the persisted block
+back into turns recovers it for only 6 of the 78 `ceiling-v38` rows, because
+turn texts contain blank lines). The rebuild re-ingests the static haystack on
+the CPU, re-runs the control's pinned search, and refuses to write unless the
+re-derived rag context matches the judged one byte for byte. `--slug ku|all`
+picks the run family for both the source and the destination filename.
+
+#### What the runs found (2026-09-04)
+
+Three runs, all committed; procedure and full per-arm tables in
+`docs/runbooks/raglite-runs-20260904.md`.
+
+**The budget flag does not reach a fact-spine budget on LongMemEval, and
+cannot.** Truncation is turn-granular and the arm always serves at least one
+turn, while one raw LongMemEval turn is already ~200 approximate tokens. So
+`ragb100` — sized to match the cortex arm's 96.7 tokens — served a mean
+**219.2** tokens, overshot on 36 of the 78 `raglite-v38` rows, and produced a
+byte-identical context to `rag1` on 74 of them (accuracies 0.333 vs 0.321).
+Read the arm's measured `context_tokens` and its `budget_overshoot_rows`, never
+its name. `ragb400` does land (309.0 served on the 78-question run, 312.3 on
+the 500-question one), and on BEAM — whose turns are shorter relative to the
+budget — `ragb600` served 584.
+
+So the honest token-matched pair on LongMemEval is **cortex at ~97 tokens
+against one-turn RAG at ~206**, and over the 500-question six-type run
+(`longmemeval-all-oracle-qwen-27b-raglite-all-fresh`, fresh extraction) the two
+are indistinguishable: **cortex − rag1 = −0.006 ± 0.049, p 0.87**
+(77 W / 80 L / 343 ties). Paired against the `rag` control over the same 500
+rows, hybrid is **+0.040 ± 0.031 (p 0.015, 41 W / 21 L)** and cascade
++0.002 ± 0.022, while every truncated raw-turn arm is far below it
+(ragb400 −0.230 ± 0.041, rag2 −0.232 ± 0.042, rag1 −0.374 ± 0.045, cortex
+−0.380 ± 0.048). Arm means and costs on that run: hybrid 0.730 @ 1229.3
+tokens, cascade 0.692 @ 843.7, rag 0.690 @ 1124.2, ragb400 0.460 @ 312.3,
+rag2 0.458 @ 432.5, rag1 0.316 @ 206.3, cortex 0.310 @ 96.5.
+
+Those means — and the paired deltas above — span all 500 rows, the 25 the
+leak check flags as naming their own gold answer included, so every arm is
+paired over the same questions. The leak-free reads live in the summary's
+own `leak_check` block and are not the headline figures: over the 475
+unleaked rows, **rag 0.6947, hybrid 0.7326, cortex 0.3158**.
+
+The paired column is a committed artifact
+(`…raglite-all-fresh.arms-vs-rag.json`) written by
+`evals/beam_within_run_pairs.py` — harness-agnostic since 2026-09-04
+(`--score-key correct|score`, `--type-key`, `--prefix`, `--pairs left:right`,
+and a derived `cascade` arm) — and pinned by a byte-exact regeneration test.
 
 Model roles are split so extraction quality is the **only** variable:
 
@@ -668,6 +799,156 @@ test over the 78 questions:
   tables now show. The v2 figures remain the same-stack baseline for
   everything else measured on the TurboQuant fork.
 
+## Cue-gated contiguity (offline re-read of `aggp1-variants-0803`)
+
+**2026-09-04 — no new answer or judge calls.** The 2026-08-04 Phase-1
+gates applied four retrieval knobs to *every* query and all four lost on
+the weak types; contiguity lost hardest (−0.147). This asks the obvious
+follow-up: would contiguity have helped if it fired only where the
+engine's own aggregation/temporal **cue** detector says the query is
+asking about order or counts? The run persisted per-arm contexts,
+judged verdicts and token counts for all 500 questions, so a gated
+policy — vanilla `hybrid` where the cue is off, the variant where it is
+on — is a composite of verdicts that were *already judged*.
+`evals/contiguity_cue_split.py` builds it, importing
+`has_temporal_cue` / `has_aggregation_cue` / `has_date_cue` from
+`pseudolife_memory/memory/cms.py` rather than re-implementing them
+(artifact `contiguity-cue-split-20260904.json`; paired sign-flip
+permutation, 10k draws, seed 0, the same `_perm_p` `compare_arms.py`
+uses).
+
+**The cue is not selective enough to gate on.** `any` (temporal OR
+aggregation OR date — the engine's own chronicle-serving gate) fires on
+**0.702** of the 500 questions: recall **0.947** on the weak types, but
+precision only **0.718**, and it fires on **0.692** of knowledge-update
+questions — the type contiguity must not disturb. The date predicate
+fires **0.000** times: LongMemEval carries the date in a separate field,
+never in the question text.
+
+| type | n | temporal | aggregation | any |
+|---|---|---|---|---|
+| multi-session | 133 | 0.256 | 0.887 | 0.940 |
+| temporal-reasoning | 133 | 0.820 | 0.421 | 0.955 |
+| knowledge-update | 78 | 0.321 | 0.538 | 0.692 |
+| single-session-user | 70 | 0.243 | 0.200 | 0.429 |
+| single-session-assistant | 56 | 0.196 | 0.107 | 0.268 |
+| single-session-preference | 30 | 0.000 | 0.000 | 0.000 |
+
+**Contiguity loses hardest exactly where the cue fires**, which is the
+one shape gating cannot rescue. Paired against the same-run vanilla
+hybrid, split on the `any` cue:
+
+| arm | slice | n | delta vs hybrid | 95% CI | p |
+|---|---|---|---|---|---|
+| `hybrid_ctg` | all, cue fired | 351 | −0.114 | [−0.153, −0.075] | 0.00000 |
+| `hybrid_ctg` | all, cue quiet | 149 | −0.047 | [−0.107, +0.013] | 0.18170 |
+| `hybrid_ctg` | weak types, cue fired | 252 | −0.147 | [−0.199, −0.094] | 0.00000 |
+| `hybrid_ctg` | weak types, cue quiet | 14 | −0.143 | [−0.423, +0.137] | 0.61820 |
+
+The gated composites, against vanilla hybrid (0.664 overall / 0.459 weak)
+and the naive-RAG control (0.688 / 0.515):
+
+| gated arm | overall | weak types | ungated weak | overall tokens |
+|---|---|---|---|---|
+| `hybrid_ctg` gated | 0.584 | 0.320 | 0.312 | 1096.4 |
+| `hybrid_tl` gated | 0.640 | 0.447 | 0.447 | 803.4 |
+| `hybrid_enum` gated | 0.626 | 0.387 | 0.387 | 857.5 |
+| `hybrid_all` gated | 0.546 | 0.293 | 0.282 | 1089.0 |
+| vanilla `hybrid` | 0.664 | 0.459 | — | 842.1 |
+
+Gating buys contiguity **+0.008** on the weak types (0.312 → 0.320) out
+of a 0.147 hole, and still costs −0.139 against vanilla hybrid there
+(p 0.00000) and −0.080 overall (p 0.00000) — while adding **254 context
+tokens** overall and 378 on the weak types. `hybrid_tl` gated is
+*identical* to `hybrid_tl` ungated because the timeline channel is
+already cue-gated inside the engine (`timeline_fired` in `cms.py`,
+whose `has_temporal_cue` trigger is a strict subset of the `any`
+gate used here, so the two policies serve the same context on every
+row); that agreement is the check that the imported predicates
+behave here the way they do in production.
+
+A narrower gate does not save it either. Gating contiguity on the
+temporal predicate alone, or on the aggregation predicate alone,
+lands at **0.616** overall and **0.376** on the weak types — better
+than the `any` gate, still well under vanilla hybrid's 0.664 / 0.459
+(the artifact's `gated_by_cue` block carries all four gates per arm).
+
+**Why contiguity hurts is displacement, not dilution.** The served
+memory block is a fixed top-k (3 turns), so a neighbor turn does not
+extend the context — it *evicts* a ranked hit. On cue-fired rows
+`hybrid_ctg` adds a mean **1.46** turns and displaces the same **1.46**
+(333 of the 351 cue-fired rows lose at least one ranked
+hit), while the token count rises 362: neighbor turns are longer *and* worse.
+
+**Measurement floor.** Across the four variants, **522 arm-rows** served
+a context byte-identical to the vanilla hybrid one and were answered and
+judged independently anyway (the bench makes one answer call per arm, no
+caching). **Zero** disagreed — the reproducible q8_0 serving path, so the
+splits above carry no answerer/judge noise to net out.
+
+Caveats, in full: a single replicate from 2026-08-03 on the **retired
+Qwen3.6 judge**, so every number inherits that instrument; a composite of
+two already-judged arms is not a run; and a gated knob that had looked
+promising here would still need its own judged run before shipping. It
+did not look promising. **Verdict: gating does not rescue contiguity** —
+the cue fires on 70% of questions, and the losses are concentrated
+inside the fired set.
+
+---
+
+# Review-queue judge ladders (`judge_ladder.py`, `queue_judge_ladder.py`)
+
+Two harnesses answer "can a judge model reproduce the ratified human panel"
+for the daemon's autonomous review-queue judging (2026-09-02 — every queue
+the Console's Atlas Review view surfaces now gets a shadow/auto-gated
+verdict from the SHIPPED judge code path itself, not a separate scorer).
+
+`judge_ladder.py` runs `OpenAICompatExtractor.judge_merges` against the
+frozen `judge_eval_20260816.json` fixture and scores reject/accept
+precision — the Phase-1 gate that decided `judge_mode: shadow` is the only
+safe out-of-the-box default. `--caution` (added 2026-08-31) stamps the
+production low-differential caution line on flagged rows and reports
+paired flagged/clean-subset metrics; `--max-tokens` (default 400) raises
+the verdict budget for high-reasoning-effort arms — the 2026-08-31 xhigh
+run truncated all 30 true-accept rows at the default budget.
+
+`queue_judge_ladder.py` (2026-09-02) extends the same idea to every queue
+the sweep now judges: merges, links, junk, candidates, and store curation.
+It replays the shipped `judge_merges`/`judge_links`/`judge_junk`/
+`judge_candidates`/`judge_slot_pairs` prompts against a blind-panel pack
+and simulates each shipped auto-gate. The evidence pack itself is PRIVATE
+(freezes bank text, lives outside the tree under gitignored `evals/data/`);
+what's committed is the scrubbed derivative
+`evals/results/queue-judge-panel-20260902.json` (labels, gates, per-row
+votes, no bank text) and the harness's own output
+(`evals/results/queue-judge-ladder-20260902.json`). `--data`/
+`--snippet-chars` (added 2026-09-03) reran the merge judge at full-length
+(uncapped) evidence instead of the shipped 240-char cap — accept precision
+fell to 0.70 (from 0.85 clipped), so the default cap stays 240
+(`evals/results/queue-judge-ladder-20260903-fulllen.json`).
+
+First run (`opus-r2`, claude-opus-5, two replicates,
+`evals/results/queue-judge-ladder-20260902.json`): merge two-vote reject
+8/8, two-vote non-low-differential accept 4/4; link auto-accept 4/4,
+auto-reject 5/5; junk auto-delete-under-the-evidence-bar 6/6, auto-keep
+7/7; candidate auto-propose 7/8, auto-dismiss 15/16; curation
+auto-distinct 21/21 — while duplicate keep-side precision is only 0.5625,
+which is why curation's `auto` (as opposed to `auto-distinct`) forgetting
+mode ships off. `tests/test_eval_evidence.py` pins every number here to
+its artifact.
+
+**Companion: the v35 write-time label heuristic.**
+`evals/label_heuristic_audit.py` (schema v35,
+`pseudolife_memory/memory/labels.py`) measures the deterministic
+`authority`/`distortion_tolerance` form heuristic against hand verdicts.
+On the live bank (2026-09-03, 869 entries / 5,435 current facts) the
+shipped rule fires on 86 facts, of which 73 read as a genuine rule (0.85
+precision), on 1 of 869 entries; on the chip-5 BEAM chat-text bank (1,099
+current facts) it fires on 8 values, all 8 genuine. Artifacts:
+`evals/results/label-heuristic-audit-20260902.json` (pre-fix),
+`-20260903.json`, `-20260903-prefix-rule.json` (rejected variant), and
+`-20260903-beam-chip5.json`.
+
 ---
 
 # BEAM long-term-memory benchmark (`beam_adapter.py`)
@@ -712,11 +993,264 @@ paper-faithful float, `score_intfaithful` = code-faithful).
 judged locally or by an Opus-class CLI judge. Cognee's 0.79 is also a
 20-question single-conversation protocol. Compare within a row.
 
+## Comparator arms — ReFind and no-memory (added 2026-09-01)
+
+Two opt-in arms, both adopted from the 2026-09-01 briefing-backlog triage.
+Both were smoke-run first (below) and then measured at the full 100K tier
+on 2026-09-02 — the five-arm table further down is the first real
+comparison; on LongMemEval they remain smoke-only.
+
+| arm | flag | context | measures |
+|-----|------|---------|----------|
+| `refind` | `--refind` | an **agentic lexical loop** over the same formatted turns the bank holds: the answerer model plans BM25 queries for up to `--refind-rounds` rounds, narrowing by date range, never re-reading a turn it already inspected, with session-aware rank fusion; the surviving turns are budget-matched to the rag control | the honest lexical baseline ([ReFind, arXiv 2608.12888](https://arxiv.org/abs/2608.12888)) — single-shot BM25 badly understates it, and without it a claim about the structural stack (bands, cortex, graph) has no floor to beat |
+| `nomem` | `--nomem` | nothing — the question and this harness's own task framing, answer-length policy included | the memory-off floor ([MemTrapBench, arXiv 2608.20202](https://arxiv.org/abs/2608.20202), where all five frameworks tested scored *below* it). If memory-on does not beat memory-off, the win is imaginary |
+
+The ReFind loop only **retrieves**; its context is answered by the
+harness's own answerer and graded by the harness's own judge, so the arm
+is instrument-matched to `rag`/`cortex`/`hybrid` (the same rule the Cognee
+adapter follows — retrieval modes, never completion modes). It searches
+the *identical* formatted turns that were stored into the bank, so a
+`refind` − `rag` delta is about the retrieval loop and nothing else. Cost
+per question is `--refind-rounds` extra planner calls (default 3) on top
+of the arm's own answer + judge calls; `--nomem` costs one answer + its
+judge items.
+
+The loop's knobs — session fusion weight 0.3, 3 rounds, 3 queries per
+round, 8 turns inspected per query — are **declared defaults, not
+measured values**: ReFind publishes no fusion weight and no sweep has been
+run here. Every one of them is a flag (`--refind-session-weight`,
+`--refind-rounds`, `--refind-max-queries`, `--refind-per-round-k`, plus
+`--refind-top-k` to break the budget match deliberately) so they can be
+measured before anything is claimed from a number this arm produces. The
+one constant that is not a flag is the 400-character snippet the planner
+sees per turn, which is display width, not retrieval.
+
+Ranking runs the fusion twice, and the second pass is the one that
+decides what is served: once inside a query, to choose what that query
+inspects, and again over the **union of everything inspected** at serve
+time. Normalising per query would put every query's best hit at exactly
+1.0, so a lone weak hit from a late round would tie the strongest hit of
+the first and win on tie-break — caught in review before the arm ever
+ran, and pinned by
+`test_serve_ranking_fuses_across_rounds_not_per_query`.
+
+```bash
+# both comparator arms alongside the usual three, one chat first
+PYTHONPATH=. python evals/beam_adapter.py --beam-root <path-to-BEAM> \
+    --tier 100K --extractor qwen-27b --out-tag refind-smoke \
+    --refind --nomem --limit-chats 1
+# the comparison proper: full tier, all five arms
+PYTHONPATH=. python evals/beam_adapter.py --beam-root <path-to-BEAM> \
+    --tier 100K --extractor qwen-27b --out-tag refind-100k --refind --nomem
+```
+
+### First smoke, 2026-09-01 — plumbing only, not a measurement
+
+Both arms ran for the first time on the reproducible Qwen3.8 server
+(stock `llama-server`, `--cache-type-k/v q8_0`, verified by process
+inspection): BEAM 100K chat 1 (20 questions, all five arms) and
+LongMemEval oracle (5 knowledge-update questions, all five arms).
+Artifacts: `beam-100K-qwen-27b-refind-smoke.jsonl(.summary.json)` and
+`longmemeval-ku-oracle-qwen-27b-refind-smoke.jsonl(.summary.json)`.
+
+**No accuracy from these runs is quoted anywhere, here or in the
+CHANGELOG, and none should be.** One chat and five questions cannot
+separate arms — read the committed summaries if you want to see them, and
+treat them as plumbing receipts.
+
+What the smoke *does* establish, from the per-row `refind_trace`:
+
+- The loop behaves like a loop. On BEAM it used 2.9 of its 3 rounds on
+  average, issued 7.4 distinct queries per question (cap 9), and
+  accumulated 49 inspected turns per question (cap 72) — reformulating
+  between rounds rather than repeating itself, which is what
+  skip-already-inspected is for.
+- It served **exactly 6 turns on every question of both runs**, the rag
+  control's budget.
+- **0 plan failures and 0 fallbacks** across 25 questions: the local model
+  returned parseable JSON plans every time, and no window emptied the
+  search.
+- Temporal narrowing fires but is not the main channel: 7 of 49 BEAM
+  rounds proposed a date window, and one LongMemEval question narrowed to
+  a 3-day range and answered correctly.
+- The no-memory arm was served a genuinely empty context on every row and
+  abstained on the LongMemEval questions, as its prompt tells it to.
+
+One asymmetry worth carrying into any real run: the arms are matched by
+**turn count, not characters**. ReFind's 6 turns averaged ~17.4k chars
+against the rag control's ~14.2k (hybrid sits at ~16.1k), because the loop
+tends to select longer turns. A future run reading a refind-vs-rag delta
+should say so, or add a character-matched variant.
+
+### Full tier, 2026-09-02 — the first five-arm measurement
+
+`beam-100K-qwen-27b-chip12-b16.summary.json` (rows in the `.jsonl` beside
+it): 20 chats, 400 questions, every arm at a matched 16-turn budget,
+reproducible Qwen3.8 answerer and judge, **one replicate**. The `rag` and
+`hybrid` rows reproduce the committed `p1-b16` run at a paired delta of
+exactly 0.0000 over all 400 rows
+(`beam-100K-qwen-27b-p1-b16.vs-chip12-b16.paired.json`; the chip-5
+comparison beside it carries the same control at 0.0000), so the
+cross-arm deltas below sit on a zero instrument-noise floor. The paired
+column is written by `evals/beam_within_run_pairs.py` into
+`beam-100K-qwen-27b-chip12-b16.arms-vs-rag.json` (sign-flip permutation,
+10k draws, seed 0, so the smallest reportable p is 1/10001; the CI is
+1.96 × SE over the 400 per-row deltas).
+
+| arm | score | vs rag, paired | served chars/q |
+|---|---:|---|---:|
+| rag | 0.6425 | control | 22,158 |
+| refind | 0.6272 | −0.0152 ± 0.0362 (p 0.41) | 41,757 |
+| hybrid | 0.6226 | −0.0199 ± 0.0285 (p 0.18) | 24,398 |
+| cortex | 0.2829 | −0.3595 ± 0.0485 (p < 0.0001) | 2,207 |
+| nomem | 0.1812 | −0.4612 ± 0.0479 (p < 0.0001) | 0 |
+
+Two findings, both of which bound earlier readings on this page:
+
+- **The no-memory floor is not diffuse, and on abstention it wins.**
+  `nomem` is exactly zero on 7 of the 10 types and scores 1.000 on
+  abstention, 0.469 on preference_following and 0.344 on
+  instruction_following. On abstention that beats every memory arm
+  (cortex 0.950, rag 0.725, hybrid 0.650, refind 0.575): refusing is the
+  correct answer there, and an arm served nothing always refuses.
+  62 of 400 rows score full marks with an empty context. Any BEAM number,
+  ours or a vendor's, carries this floor — and the cortex arm's abstention
+  lead, the number this page and the README used to call the fact spine's
+  one decisive win, is a calibration property of a small context, not
+  evidence that memory recalled anything.
+- **The agentic lexical loop does not beat naive cosine RAG.** `refind`
+  served 1.9× the characters (41,757 vs 22,158 mean characters per
+  question) for a delta that is negative and not significant. It sits above
+  the control on three of the ten types, but only contradiction_resolution
+  (0.616 vs 0.500) clears the judge-transfer floor this page reports
+  (mean |item delta| 0.073); temporal_reasoning (0.669 vs 0.644) and
+  event_ordering (0.496 vs 0.472) sit inside it. The arms are matched by
+  turn count, not characters — the asymmetry the smoke flagged — so read
+  the refind row as "more text, same score".
+
+The LongMemEval side of these arms is still smoke-only.
+
+### Gold-answer leak check (`leak_check.py`)
+
+The [SR-TTT retraction](https://arxiv.org/abs/2603.06642) came down to the
+gold answer already sitting in the context the model was handed, so the
+reported win measured nothing. Every BEAM row now records
+`gold_in_question` at answer time, `--report` carries a `leak_check` block
+(how many rows named their own gold answer, and every arm's mean with
+those rows excluded), and the same check runs standalone over any judged
+artifact — BEAM `*_score` rows or LongMemEval `*_correct` rows:
+
+```bash
+python evals/leak_check.py --in evals/results/<artifact>.jsonl
+```
+
+It always writes its report (`<artifact>.leakcheck.json`) and exits 1 when
+any row leaked, so it can gate a promotion. Rows whose gold answer is too
+short or generic to test (`yes`, a bare number) are reported as
+**untestable** rather than counted clean. It also flags a context-free arm
+that was served a context — a `nomem` row with content in it would flatter
+memory-off in exactly the comparison the arm exists to make.
+
+Run over the committed 2026-08-21 BEAM run (400 rows), it finds
+**0 leaked rows**. Its untestable rows split
+**200 `no_gold`** and **10 `trivial_gold`**: five of BEAM's ten question
+types are rubric-judged and carry no gold string at all, so this check
+cannot speak to half of that benchmark — and says so rather than
+reporting those rows clean. The arm means it recomputes reproduce the
+run's committed summary exactly
+(rag 0.5005, cortex 0.2918, hybrid 0.4682), which is what makes the
+recomputation trustworthy as a leak-free comparator. Artifact:
+`beam-100K-qwen-27b-beam100k-qwen38.leakcheck.json`.
+
+Beside those, the report carries each arm's mean over only the 190 rows
+the check could examine: **rag 0.4789, cortex 0.1759, hybrid 0.4229**.
+That is a different slice of the same run, not a correction to it — and
+the gap is a fact about where each arm earns its score, not about
+leakage. The rubric-only types it drops include abstention, the cortex
+arm's best type (0.950 above — and see the no-memory floor in the
+five-arm table), so removing them costs that arm the most.
+
+### Memory-only answerability + pathway evidence (`answerability_probe.py`)
+
+[AWM](https://arxiv.org/abs/2608.25618) removed the source context and
+asked whether each question could still be answered from the agent's
+terminal memory alone — and found **42.5% of correct answers could not
+be reproduced from memory alone**: right answers whose notes were too
+thin to support them later. End-to-end QA cannot see that failure, and
+this stack is structurally exposed to it (dream claims and digests are
+written while the full session is still in context).
+[PAST-Bench](https://arxiv.org/abs/2608.04003) asks the per-row sibling:
+does a correct answer actually follow the save → retrieve → use pathway?
+
+```bash
+python evals/answerability_probe.py --in evals/results/<artifact>.jsonl
+```
+
+Per arm, over the persisted contexts (CPU-only re-parsing, no model):
+is the gold contained in the arm's served context — a two-step ladder
+(`span`: a gold variant as a contiguous normalized token sequence;
+`tokens`: every content token present — the reading a sentence-shaped
+BEAM gold needs), crossed with the arm's verdict into four cells. The
+interesting ones: `answerable_wrong` (an answering failure, the context
+sufficed) and `unanswerable_correct` — the **AWM red-flag candidates**,
+right answers without containment support. Containment is a floor, not
+a judge, and it errs in **both directions**: the strict `span` rung
+misses inference-phrased golds ("you *increased* the limit" is not
+containable in the cortex arm's served chain — `two cups`, earlier
+`one cup` — which plainly supports it), while the loose `tokens` rung
+can accept content tokens scattered across a large served context that
+no single passage states. So the red-flag cell is a **noisy candidate
+set, not a bound**; the per-arm `answerable_by` split says how much of
+the answerable side rests on the loose rung, and the judge-based level
+(`--judge`, "can this be answered from this context alone?") is wired
+to decide the cell: it probes the judge server up front and fails fast,
+annotates rows resumably (`{arm}_answerable_judge`, stripped by every
+rebuild/replicate path), and has deliberately not been run yet. The
+same parse emits per-row **pathway evidence** for every correct answer:
+which served entries carry the gold (`supported` / `unsupported` /
+`spanning` when the gold is only assembled across entries), with the
+supported share per arm. Two row classes classify out with their own
+reasons instead of polluting the cells: abstention rows (their gold
+names an absence — a right abstention with no memory support is the
+designed outcome) and context-free arms (`nomem` is served nothing by
+construction, so its correct answers are the arm's accuracy, not red
+flags). Both harnesses' `--report` carry the block on any artifact with
+persisted contexts.
+
+Over the committed ceiling-e2e run (**78 rows**, 45 testable per arm —
+**27 `trivial_gold`, 6 `abstention`**): answerable shares
+**rag 0.9556, hybrid 0.9111, cortex 0.6222**; red-flag candidates
+**rag 2, hybrid 1, cortex 3** of each arm's correct-testable answers;
+and the cortex arm's wrong answers are dominated by storage/retrieval
+(**14** `unanswerable_wrong` against 4 `answerable_wrong`) — when cortex
+is wrong, the fact context usually never contained the gold, matching
+the extractor-bottleneck reading of the e2e table above. Pathway
+supported shares among examined correct answers:
+**rag 0.9189, hybrid 0.9429, cortex 0.8889**. A committed audit of all
+**six red-flag arm-rows (three distinct questions)** records verdict
+`inference_gap` for each, with the served-evidence snippet quoted per
+arm-row: the served context supports the answer without containing its
+wording (the engineers-led 4→5 chain, the one-cup→two-cups chain, the
+listed road bike). So this run surfaces **no confirmed memory-support
+failure** — deciding the cell for real is the judge level's job.
+Artifacts:
+`longmemeval-ku-oracle-qwen-27b-ceiling-e2e.answerability.json`,
+`longmemeval-ku-oracle-qwen-27b-ceiling-e2e.redflag-audit.json`.
+
+The committed 2026-08-21 BEAM run predates context persistence, so the
+probe classifies all **400 rows** untestable — **200 `no_gold`,
+10 `trivial_gold`, 190 `no_context`** — and can say nothing about it
+retroactively; the artifact records exactly that
+(`beam-100K-qwen-27b-beam100k-qwen38.answerability.json`, `n_testable`
+**0** on every arm). The two refind-smoke artifacts (contexts persisted,
+all five arms) carry probe artifacts as plumbing receipts — n is far too
+small to read as measurement.
+
 ## Findings — 2026-08-03 to 2026-08-24
 
 | finding | evidence |
 |---|---|
-| **The fact spine's one decisive win is abstention.** On BEAM's abstention questions the cortex arm scores **0.950** against naive RAG's 0.775 — a small curated fact context refuses where a raw-turn context confabulates. The number is **identical under two independent judges** (local Qwen3.8 and an Opus-class CLI judge over the same recorded answers), which is what makes it the most transferable claim the memory has. | `beam-100K-qwen-27b-beam100k-qwen38.summary.json`, `beam-100K-qwen-27b-beam100k-qwen38.rejudge-opus5.summary.json` |
+| **Abstention is the fact spine's best type — and a no-memory arm beats it there.** On BEAM's abstention questions the cortex arm scores **0.950** against naive RAG's 0.775 — a small curated fact context refuses where a raw-turn context confabulates — and the number is **identical under two independent judges** (local Qwen3.8 and an Opus-class CLI judge over the same recorded answers). The 2026-09-02 five-arm run bounds it: on the same 40 questions an arm served no memory scores 1.000, so this is a calibration property of a small context, not evidence of recall. Retired as "the one decisive win" on 2026-09-04. | `beam-100K-qwen-27b-beam100k-qwen38.summary.json`, `beam-100K-qwen-27b-beam100k-qwen38.rejudge-opus5.summary.json`, `beam-100K-qwen-27b-chip12-b16.summary.json` |
 | **Budget-matched, the hybrid arm ties the raw-turn control — it does not lose.** The hybrid arm (facts + turns) historically served 3 raw turns against rag's 6; at a matched 16/16 budget with the Phase-1 fixes, rag 0.6425 vs hybrid 0.6226 (−0.020 ± 0.029, a wash). Earlier "hybrid loses" readings were the halved turn window. | `beam-100K-qwen-27b-p1-b16.summary.json`, `beam-reader-volume-grid-verdict.json` |
 | **Judge transfer on BEAM is small — measured, not assumed.** Re-judging 400 identical responses with an Opus-class judge moved rag −0.002, cortex +0.007, hybrid −0.016, against a same-judge stability floor of mean \|item delta\| 0.073. Deltas below that floor are not findings. | `beam-100K-qwen-27b-beam100k-qwen38.rejudge-opus5.summary.json` |
 | **Most of the gap to published leaderboard numbers is the reading stack, not the memory layer.** Context volume dominates: widening naive-RAG context from 6 to 48 turns (roughly the published systems' budget) is +0.186 ± 0.041 and takes a local 27B reader to 0.665 full-tier, while swapping in a frontier reader over byte-identical contexts adds only ~+0.04 (not significant at 48 turns). | `beam-readersweep-verdict.json`, `beam-reader-volume-grid-verdict.json` |
@@ -728,6 +1262,153 @@ Caveats that bound all of the above: single replicate per configuration
 reader sweep is 116 of 400 rows, chats 1–7, so per-type rows are n=10–12
 and directional only; a CLI answerer/judge is not bit-reproducible; and
 only the 100K tier has been run — 500K/1M/10M are unmeasured.
+
+## Retrieval-pool probe (`retrieval_pool_probe.py`, 2026-09-04)
+
+A **retrieval proxy, not a verdict.** It answers "does the gold-bearing
+turn reach the served window?" under each candidate-pool setting, and
+nothing about whether an answerer then gets the question right. Only a
+judged run decides these knobs — the standing regression gate does not
+reach them (scope warning below), so a dedicated one was run: **both
+settings lose**, and the verdict table is at the end of this section.
+
+Run (CPU only; no Postgres, no GPU, no judge, no network):
+
+```bash
+python evals/retrieval_pool_probe.py          # writes results/retrieval-pool-probe-<today>.json
+python evals/retrieval_pool_probe.py --haystack 0   # synthetic corpus alone
+```
+
+Corpus: the 10 knowledge-update pairs + 6 distractors from
+`ladder_sweep.py`, ingested initials → distractors → updates, buried in
+400 real conversational turns whose TEXT is read from the
+`band_ablation.py` band-state dumps (`results/banks/s-qwen-27b-ablbands-flat`)
+and re-encoded with the current backbone. That directory is gitignored, so
+a fresh worktree has to copy it from the main checkout; without it the
+probe runs synthetic-only and says so in the artifact.
+
+Why not LongMemEval gold: no dump under `results/banks/` can score recall
+over `cms.retrieve()`. `dump_bank` persists cortex facts only (turns
+absent, `source_entries` stripped), and the band-state dumps carry no
+gold-turn labels — the `has_answer` markers live in the dataset, not the
+dump — and their own vectors are 384-d from the retired MiniLM backbone.
+
+**Result — `results/retrieval-pool-probe-20260904.json` (null):**
+
+| multiplier | fusion | reranker | recall@6 | stale leak | churn vs shipped | latency |
+|---|---|---|---|---|---|---|
+| 1 | weighted_sum | off | 0.700 | 0.300 | — (baseline) | 52 ms |
+| 1 | weighted_sum | on  | 0.700 | 0.300 | 0.000 | 112 ms |
+| 1 | rrf | off | 0.700 | 0.300 | 0.183 | 55 ms |
+| 1 | rrf | on  | 0.700 | 0.300 | 0.183 | 214 ms |
+| 4 | weighted_sum | off | 0.700 | 0.300 | 0.283 | 48 ms |
+| 4 | weighted_sum | on  | 0.700 | 0.300 | 0.283 | 373 ms |
+| 4 | rrf | off | 0.700 | 0.300 | 0.317 | 75 ms |
+| 4 | rrf | on  | 0.700 | 0.300 | 0.333 | 560 ms |
+
+Every cell scores 0.700 with the *same three misses*, so on this proxy the
+knobs buy nothing: the misses are questions whose gold turn no pool width
+reaches. What they do change is *which* turns are served — 18–33% of the
+served set — which is exactly the difference a judged run scores. The
+null here is uninformative rather than negative *as a proxy*; the judged
+verdict below is what settled the knobs, and it is negative. The cost
+side is not null either: multiplier 4 with the reranker on is 7–11x the
+shipped latency, because rerank-then-cut hands the cross-encoder ~4x the
+pairs.
+
+Power caveat: 10 gold queries whose gold values are rare tokens the BM25
+channel already nails, over a 426-entry bank. Read the table as "no signal
+at this scale", not "no effect".
+
+**Scope warning — the regression gate does not cover these knobs.**
+`regression_gate.ps1` stage 1 runs `rebuild_contexts.py`, which rebuilds
+the CORTEX fact ranking offline and copies the associative (`rag`, hybrid
+raw-memory) context verbatim, because no band state was dumped. The
+candidate-pool knobs live on `cms.retrieve`. Measuring them judged means a
+full `--phase extract` re-run with the sanctioned env overrides, which
+`ladder_sweep.build_service` applies and `bench_env_knobs()` stamps into
+the summary:
+
+```powershell
+$env:PSEUDOLIFE_BENCH_POOL_MULT = "4"   # unset = shipped default 1
+$env:PSEUDOLIFE_BENCH_FUSION    = "rrf" # unset = shipped weighted_sum
+python evals/longmemeval_bench.py --dataset oracle --extractor e4b-ft `
+    --tag arm1-pool --phase extract
+python evals/longmemeval_bench.py --dataset oracle --extractor e4b-ft `
+    --tag arm1-pool --phase answer      # Start-Qwen first (qwen_server.ps1)
+```
+
+An invalid value aborts rather than silently serving the default
+(`tests/test_bench_pool_knobs.py`).
+
+### Judged verdict (2026-09-04): the knobs lose
+
+That `--phase extract` re-run was done. Three runs over the LongMemEval
+knowledge-update **oracle** slice (n=78, qwen-27b extraction, identical
+judge and answerer): the shipped control, multiplier 4 + rrf, and
+multiplier 4 + weighted_sum. Accuracy @ mean context tokens, with the
+paired delta against the control, its bootstrap p (10 000 draws, seed 0)
+and per-question wins/losses:
+
+| arm | shipped (`pool-ctl`) | mult 4 + rrf (`pool-m4rrf`) | mult 4 + weighted_sum (`pool-m4sum`) |
+|---|---|---|---|
+| naive RAG (top-6 turns) | 0.859 @ 1184.1 tok | 0.744 @ 1793.0 (-0.115, p 0.0506, 4W/13L) | 0.782 @ 1643.0 (-0.077, p 0.1071, 2W/8L) |
+| cortex facts only | 0.667 @ 96.7 tok | 0.667 @ 96.7 (0.000, p 1.0, 0W/0L) | 0.667 @ 96.7 (0.000, p 1.0, 0W/0L) |
+| hybrid (facts + top-3 turns) | 0.897 @ 1289.7 tok | 0.833 @ 1898.6 (-0.064, p 0.1265, 1W/6L) | 0.872 @ 1748.6 (-0.026, p 0.6194, 1W/3L) |
+| commit-gated cascade | 0.846 @ 389.4 tok | 0.846 @ 598.7 (0.000, p 1.0, 1W/1L) | 0.859 @ 544.5 (+0.013, p 1.0, 2W/1L) |
+
+**The cortex arm is the control with identical input.** It never touches
+`cms.retrieve`, so it scores 0.667 in all three runs with 0 wins and 0
+losses — a measured noise floor of exactly zero on this instrument. Every
+delta above is therefore a real difference in the served context, not
+judge jitter.
+
+**Reading it honestly.** Nothing is positive except the cascade's single
++0.013 under weighted_sum, which is one question (2W/1L, p 1.0) and is
+noise. Neither RAG delta clears p < 0.05 at n=78 — rrf's -0.115 lands at
+p 0.0506, a hair outside — so the individually-significant claim is not
+available. What *is* available is the pattern: every arm that moves at
+all moves down, under both knobs, while the turn-serving arms' context
+cost rises by 36-54% (the token columns above: +35.6% to +53.7% on
+rag/hybrid/cascade, cortex unchanged). A
+knob that costs that much more context to lose 0.115 on its primary arm
+does not need a tighter p-value to be declined.
+
+**The reranker-on cell is untested.** Both runs had the cross-encoder OFF
+and an empty reference bank. That is the only combination measured, and
+it is the only one the CAUTION on `SearchConfig.fusion` permits: under
+rrf the reranker's `fusion_weight` collapses to cross-encoder-only
+ordering and un-rescaled reference cosines outrank every memory. Whether
+a widened pool pays off *with* the cross-encoder — the configuration the
+whole retrieve-then-rerank shape was built for — remains unmeasured.
+
+Artifacts (all committed):
+`results/longmemeval-ku-oracle-qwen-27b-pool-{ctl,m4rrf,m4sum}.jsonl`
+and their `.summary.json`; paired comparisons
+`results/compare-pool-m4rrf-pairs.json` and
+`results/compare-pool-m4sum-pairs.json`.
+
+This is why both knobs ship at today's behaviour, stay off the Console
+(`tests/test_console_knob_gapfill.py`), and are documented as measured
+losers rather than as unmeasured options.
+
+**Regression gate for the v35 label carrier (2026-09-03).** Two paired
+checks confirmed the write-time `authority`/`distortion_tolerance` labels
+(and their `constraint`-carrier dream logic) don't move numbers where no
+label fires. `ladder_pair_compare.py` re-ran the extraction ladder's
+deterministic metrics (`gold_recoverable`/`stale_leak`/`tokens_per_query`)
+pre- and post-#245 on the unlabelled ladder corpus and found them
+verdict-identical on both rungs, as predicted
+(`evals/results/ladder-chip5-paired-verdict.json`).
+`beam_cross_run_paired.py` paired the full BEAM 100K run at the matched
+16/16 budget against the 2026-09-02 pre-#245 baseline on all 400
+questions: the identical-input `rag` control moved 0.0000, hybrid
++0.0004±0.0014, cortex +0.0036±0.0029 — every delta inside the control's
+own noise. The 30 rows whose served context differed all sit in the two
+chats where the write-time heuristic labelled a slot `constraint` (3 of
+1099 facts; `quoted` fired on 11), confirming the recall pin is the only
+thing the label change touched
+(`evals/results/beam-100K-qwen-27b-chip5-b16.vs-chip12-b16.paired.json`).
 
 Bank dumps and served contexts persist per run under
 `evals/results/banks/beam-<tier>-<extractor>-<tag>/` (gitignored), so a
@@ -1003,6 +1684,105 @@ loop+graph (A)        1.000        1.0     1.0     1.0     3.0    137.4    69.1
   1 iter / 59 tok / 6 ms — roughly 2× tokens and 11× latency for a 3× recall
   gain on multi-hop corpora.
 - **1-hop cost reflects the unenforced gate.** Arm A runs the full hop-cap on every question, so even 1-hop lookups cost ~3 iterations — recall is not regressed, but the wasted cost on easy questions is exactly what a real (currently unenforced) gate would suppress.
+
+---
+
+# Recall fan-out cap (`recall_fanout_bench.py`)
+
+Does bounding `memory_recall`'s search fan-out cost it any answers? The walk
+as shipped issued one seed search plus one re-query per newly discovered
+entity per hop, which on a star-shaped graph is the whole cost of the call.
+`memory.recall.max_searches_per_hop` / `max_total_searches` /
+`time_budget_seconds` bound it; this harness runs the same 20 relational
+questions with the caps off and on, against a **restored copy** of the live
+bank (never the live bank, never the shared bench DB — `guard_dsn` refuses
+both), and records per question: searches issued, wall time, served
+characters, whether the expected entity surfaced, and how the added entities
+arrived (hub / `part-of` / domain relation).
+
+```
+# one arm per invocation
+python evals/recall_fanout_bench.py --arm before --dsn postgresql://.../pseudolife_memory_replay_YYYYMMDD --out before.json
+python evals/recall_fanout_bench.py --arm after  --dsn postgresql://.../pseudolife_memory_replay_YYYYMMDD --out after.json
+# pair them into the committed artifact
+python evals/recall_fanout_bench.py --combine before.json after.json --out evals/results/recall-fanout-cap-20260904.json
+```
+
+Question set: the twelve relational questions the 2026-09-04 graph-ablation
+probe ran (`evals/graph_ablation.py`, landing separately) plus eight written
+for this bench, n=20. Every `expect` string also
+occurs in the tracked repo tree, so the artifact carries no bank-private
+names, and no query or entry text is emitted.
+
+## Findings — 2026-09-04 (`recall-fanout-cap-20260904.json`)
+
+Restored copy of the live bank (1,296 entries, 5,504 entities, flat preset),
+CPU only, `top_k=6`, `hops=3`. BEFORE is the pre-change package (the knobs do
+not exist in it at all); AFTER ran the caps at 6 / 20 / 20.0 s.
+
+The AFTER arm's `code_commit` is `7595ce6f+dirty` — the working tree of the
+branch before it was committed, so the arm is pinned by the artifact's `caps`
+block rather than by a commit hash. Two edits landed after the run and neither
+can move its numbers: the `skip_part_of_expansion` induced-subgraph fix is
+inert with that knob off (`False` in the recorded `caps`), and the
+negative-value normalisation of the three numeric knobs is a no-op for the
+positive values recorded. The shipped `max_total_searches` default was later
+raised from the 20 recorded here to 31 (a backstop above `1 + 6 x 5`, the most
+the per-hop cap can spend at the tool's maximum `hops=5`); at `hops=3` a full
+walk costs at most 19, the ceiling never fired in either arm, and the numbers
+below stand unchanged.
+
+Reruns meant to be reproducible should pin the AFTER arm's budget off with
+`--time-budget-seconds 0`. A wall-clock budget makes the walk
+machine-dependent — the same question can truncate on slow hardware and not on
+fast — so leaving the 20.0 s default in place means a rerun that disagrees
+cannot be told apart from a real regression. (The BEFORE arm is unaffected:
+`apply_arm` forces every cap off for it.) The run below kept the 20.0 s
+default and it never fired, which the artifact records as
+`truncated_calls: 0`.
+
+```
+metric (per call)        before      after     ratio
+searches issued  mean     89.15      12.40      7.2x fewer
+                 median   58         13
+                 max     205         19
+recall wall (s)  mean     25.25        4.166     6.1x faster
+                 median   16.38        4.49
+                 max      57.67        7.51
+served chars     mean  178,110     77,546      2.3x smaller
+expected targets found    20/20      20/20
+```
+
+- **Nothing was lost, and the check could have failed.** `targets_lost` is
+  empty: every expected target the uncapped walk surfaced, the capped walk
+  surfaced too. Read that with the mechanism in mind — the caps bound the
+  SEARCH budget and deliberately leave graph expansion alone, so the entity,
+  edge and iteration counts are identical on all 20 questions
+  (`structural_identity`) and the only channel that could lose a target is
+  `texts`. `hit_channels` says how much of the question set actually rode
+  that channel: 17 targets arrived on `entity` (where the check has no
+  power) and **3 on `texts`** (where it does). Those three survived the cut
+  — the finding is about three questions, not twenty.
+- **The whole saving is supporting text.** 2,116 texts before, 558 after. The
+  MCP layer caps `texts` at 6 anyway, so the character figure above is the
+  service-level payload, not what a model sees — the honest headline is the
+  wall time and the search count.
+- **The per-hop cap does the work; the ceiling is a backstop.** With
+  `max_searches_per_hop=6` and `hops=3` a full walk costs at most
+  1 + 6 + 6 + 6 = 19 searches, so the `max_total_searches=20` this run used
+  never fired on these questions (`truncated_calls: 0` in both arms) and
+  neither did the 20 s budget. The shipped default has since been raised to
+  **31** so the ceiling is a backstop at every `hops` the tool accepts
+  (clamped 1..5, where the per-hop cap can spend 1 + 6 x 5 = 31) rather than
+  binding at 4 and 5 hops; at `hops=3` that changes nothing here. The ceiling
+  and the budget are pinned by unit tests (`tests/test_recall.py`), not by
+  this run.
+- **Search is still 16x cheaper.** Plain `memory_search` on the same questions
+  is 0.26 s and 7,789 chars per call and found 18 of the 20 targets; recall
+  buys the last two, and now costs 4.2 s instead of 25.3 s to do it.
+- The eval-only `skip_part_of_expansion` knob is not exercised in this run;
+  `arrivals_total` records the shape it targets (1,046 of the 1,763 added
+  entities arrived via `part-of` alone, identically in both arms).
 
 ---
 
@@ -1389,3 +2169,658 @@ its control) makes all these paired comparisons exact on the reproducible
 q8_0 server. The shipped extraction prompt still carries **no** op block:
 v5 is the shipping candidate, pending a ladder rung run and an explicit
 reversal of the hold decision.
+
+---
+
+# Retrieval telemetry, offline replay, and the graph ablation (2026-09-04)
+
+Three read-only harnesses over a **restored copy** of a live bank. None of
+them touches `pseudolife_memory` or the shared `pseudolife_memory_bench`:
+each refuses those two database names outright, in either DSN spelling and
+regardless of case. `retrieval_telemetry_review.py` goes no further than
+that — it is plain SQL over the log tables, loads no model and never opens
+the search path. The two that do search (`retrieval_replay.py`,
+`graph_ablation.py`) build a `MemoryService` against the restored copy and
+then force `embedding.device = "cpu"` and
+`memory.retrieval_log.enabled = False`, so a replay cannot append to the
+log it is replaying.
+
+Restore recipe (the 2026-09-04 run used
+`pseudolife_memory_replay_20260904` on the bench Postgres):
+
+```powershell
+ops\backup.ps1 -OutDir <scratch>          # sanctioned dump path (pg_dump, read-only)
+docker cp <dump>.sql.gz pseudolife-mcp-postgres:/tmp/replay.sql.gz
+docker exec pseudolife-mcp-postgres psql -U pseudolife -d postgres `
+  -c "CREATE DATABASE pseudolife_memory_replay_20260904 OWNER pseudolife"
+docker exec pseudolife-mcp-postgres sh -c `
+  "gunzip -c /tmp/replay.sql.gz | psql -U pseudolife -d pseudolife_memory_replay_20260904 -q"
+```
+
+Pass the **deployed** `config.yaml` (`docker cp pseudolife-mcp-daemon:/data/config.yaml .`)
+with `--config` so the "shipped" arm is production and not the dataclass
+defaults.
+
+**Privacy.** Query text and entry text are private (this is a public repo),
+and the graph holds personal names and machine identifiers. The artifacts
+carry aggregates and ids only; `graph_ablation.py` emits an entity name
+only when `git grep` finds it in the tracked tree, and writes `<redacted>`
+otherwise.
+
+## `retrieval_telemetry_review.py` — does the learned reranker have labels yet?
+
+PR #168 logs the (query, served) half of the training tuple in
+`retrieval_events`, and `retrieval_uses` records the implicit relevance
+label: a `memory_get` / `memory_reinforce` on a served entry credits the
+most recent in-session serving event within `use_window_seconds` (3600).
+PR #200/#201 added `slot_reads`, `served_facts` and
+`entries.explicit_reinforcements`.
+
+The script separates the counters that mean **consumption** from the ones
+that only mean **served**, which is the distinction the raw numbers hide:
+
+| counter | what it actually means |
+| --- | --- |
+| `retrieval_uses` | consumption — a served entry was later dereferenced or reinforced |
+| `entries.explicit_reinforcements` | consumption — moves only on `memory_reinforce` |
+| `entries.access_count` | **serve count** — `cms.py` bumps it for every entry in a merged result set |
+| `slot_reads.read_count` | **serve count** — `_track_slot_reads`: "count each slot SERVED as an answer" |
+
+### Findings — 2026-09-04 bank (`retrieval-telemetry-review-20260904.json`)
+
+| quantity | value |
+| --- | --- |
+| logged events | 1349 |
+| distinct sessions / episodes | 60 / 101 |
+| **events with any downstream signal** | **1** (0.074%) |
+| `retrieval_uses` rows | 1 (`used_via=get`, served rank 0, 72 s after the serve) |
+| `entries.explicit_reinforcements`, bank-wide sum | **0** |
+| served-list length: mean / mode | 4.94 / 5 (146 events served exactly 1; 0 served nothing) |
+| `params` coverage (v32+) | 790 / 1349 (58.6%) |
+| `served_facts` coverage (v34+) | 160 / 1349 (11.9%), 798 facts |
+| served entry ids that still resolve in `entries` | 6666 of 6666 (no dangling ids) |
+| `slot_reads` | 605 slots, 807 serves — all serve-side |
+
+The event log is healthy: it writes on every search, the ids all still
+join, and 59% of rows carry the ranking-knob snapshot. The **label** side
+is empty. One labelled event is not a small sample, it is a plumbing
+check. Read against the plan's "a few hundred logged events", the correct
+reading is a few hundred **labelled** events — an event with no target
+trains nothing — so Phase 1 is 299 labelled events short of its own
+floor.
+
+Why: the label is only written by `memory_get` and `memory_reinforce`, and
+agents overwhelmingly consume `memory_search`'s inline result text and
+never dereference an id. Nothing about the current tool surface makes them.
+
+**Cheapest changes that would actually produce labels**, in ascending cost:
+
+1. **Credit `memory_fact_get` / `memory_fact_resolve` against `served_facts`.**
+   The fact half of the tuple has been recorded since v34 and has no
+   `uses` table at all; a fact-side read is a genuine consumption event
+   the daemon already sees.
+2. **An explicit `used_ids` parameter on `memory_outcome`.** The
+   convention already requires an outcome at task end, so the caller is
+   present and knows which memories mattered; today that knowledge is
+   discarded. This is the only option that produces *positive* labels for
+   the entries an agent actually reasoned from rather than clicked on.
+3. **Treat a `memory_store` whose text quotes a served entry as a use.**
+   Free (no tool-surface change) but noisy, and it labels writing, not
+   reading.
+
+Option 2 is the one worth shipping: it is a single optional list
+parameter, it is written by the agent that just used the memories, and it
+labels the whole served set rather than the one id someone happened to
+dereference.
+
+## `retrieval_replay.py` — the shipped knobs on the queries agents really asked
+
+Re-runs the logged queries through an offline `MemoryService` on the
+restored bank under several settings and scores each against a label set.
+
+Label sources: `uses` (the real implicit labels — n=1 on this bank, so it
+is a plumbing check), and `logged-top1` / `logged-top3`, which use the
+entry ids the daemon itself served at those ranks as pseudo-labels. The
+`logged-*` sources measure **agreement with the shipped ranker's own past
+head**, i.e. how far a setting moves the served head — never relevance.
+
+The `feat/retrieval-candidate-pool` arm probes the live config object for
+pool/fusion knobs rather than trusting a branch name; on 2026-09-04 the
+sibling worktree carried none, so the arm reports itself skipped.
+
+**The bank has grown since these events were logged**, so absolute MRR and
+hit@k are indicative only. Every arm sees the identical restored bank and
+the identical query list, so the paired comparison across arms is the
+valid read. The query-embedding LRU is cleared between arms — without
+that, the second arm reads its query vectors out of cache and posts a
+latency an order of magnitude below the first.
+
+### Findings — 2026-09-04 (`retrieval-replay-20260904.json`), 250 sampled events, top_k=6
+
+Latency is the **median** per-query wall time
+(`results.logged-top1.arms.<arm>.median_latency_s` in the artifact).
+
+| arm | MRR | hit@1 | hit@3 | hit@6 | median latency |
+| --- | --- | --- | --- | --- | --- |
+| `shipped` (deployed config) | 0.784 | 0.668 | 0.888 | 0.948 | 0.305 s |
+| `bm25_off` | 0.689 | 0.544 | 0.812 | 0.920 | 0.140 s |
+| `rerank_on` | 0.606 | 0.368 | 0.852 | 0.948 | 0.694 s |
+
+Read as drift, three things:
+
+- **BM25 is load-bearing for the head.** Turning it off moves 12.4 points
+  of hit@1 and 9.4 of MRR while leaving hit@6 nearly intact — the lexical
+  channel decides *which* of the right six goes first, which is what a
+  reranker would be trained to do.
+- **BM25 costs ~165 ms per query at this bank scale** (median 0.305 s
+  vs 0.140 s), well above the 20-50 ms the config docstring quotes. That
+  docstring number is due a re-measure; it is not pinned to an artifact.
+- **The cross-encoder reranker reshuffles the head hard and does not
+  obviously improve it.** hit@1 drops 30 points against `shipped` while
+  hit@6 is unchanged — it is re-ordering the same six. Whether that
+  re-order is better cannot be settled by this harness, because the label
+  IS the shipped ranker's own head; it needs a judged run or real
+  `uses` labels. It stays off by default, and that decision is untouched
+  here.
+
+## `graph_ablation.py` — lever 6, does `memory_recall`'s expansion earn its cost?
+
+Two halves. `shape` describes the graph itself; `ablate` pairs
+`memory_recall` against plain `memory_search` on the same queries and
+classifies how each extra entity **arrived**: through a `part-of` edge
+only (containment, the cheapest edge the extractor makes), through a
+domain relation (`depends-on`, `uses`, `runs-on`, …), through a hub node
+(degree >= p95), or unlinked (it came from the re-query's dense hits, not
+from an edge at all).
+
+Query sets: 30 hand-written relational questions in the bank's own domain
+(each names the entity that should surface) plus a sample of the logged
+retrieval events, scored on whether the entry the daemon served at rank 0
+comes back. `--rel-limit` / `--logged-limit` cap both sets — `recall` at
+the shipped defaults (3 hops, `max_entities=50`, `expand_budget=0`) issues
+one search per newly-discovered entity per hop, which measured a **mean
+of 32.4 s per call on the relational set and 44.3 s on the logged set,
+worst case 73.0 s** on CPU against this bank
+(`ablation.*.summary.recall.mean_wall_s` in
+`graph-ablation-20260904.json`), so a full 30-question sweep still runs
+to tens of minutes. The artifact records the `n` it actually asked.
+
+### Findings — graph shape, 2026-09-04 (`graph-ablation-20260904.json`)
+
+| quantity | value |
+| --- | --- |
+| entities | 5504 |
+| edges (live / all versions) | 4020 / 4247 |
+| degree p50 / p95 / max | 1 / 5 / 132 |
+| `part-of` share of live edges | 19.0% |
+| entities with no live edge at all | 1156 (21%) |
+| dead weight (only `part-of` edges, no current fact) | 421 |
+
+Live edges by relation: `prefers` 929, `part-of` 765, `uses` 736,
+`configures` 272, `depends-on` 272, `related-to` 181, `implements` 181,
+`avoids` 162, `tests` 148, `runs-on` 139, `stores-data-in` 116, `hosts`
+70, `superseded-by` 49.
+
+Two things the shape says on its own:
+
+- **The graph is a hub-and-spokes star, not a mesh.** Median degree is 1
+  and p95 is 5, while the top node (`pseudolife-mcp`) carries 132 — so
+  most nodes are leaves hanging off a handful of hubs, which is exactly
+  the topology the recall hub gate exists to refuse to expand through.
+  1156 entities carry no live edge at all.
+- **Comparator names the corpus argues about are missing from the
+  graph.** Of the terms checked, `naive rag` (16 entries) and `titans`
+  (21 entries) are mentioned in five or more entries and have **no
+  node**, while `rag`, `longmemeval`, `cognee`, `bm25`, `beam` and `lme`
+  all do. The extractor promotes subjects of claims, not the things
+  claims are compared against — so the one relation a reader most wants
+  ("what did we measure this against, and what happened") is the one the
+  graph cannot answer.
+
+### Findings — `recall` vs `search`, 2026-09-04 (same artifact)
+
+8 of the 30 relational questions and 4 logged queries — the run size the
+per-recall cost allowed (mean 32.4 s relational / 44.3 s logged, max
+73.0 s), and small enough that the hit-rate column is a ceiling, not a
+comparison.
+
+| | relational (n=8) | | logged (n=4) | |
+| --- | --- | --- | --- | --- |
+| | `search` | `recall` | `search` | `recall` |
+| mean served chars | 6932 | 184641 | 6649 | 74186 |
+| mean wall time | 0.44 s | 32.4 s | 0.39 s | 44.3 s |
+| expected entity/entry found | 8/8 | 8/8 | 4/4 | 4/4 |
+| recall-only hits | — | 0 | — | 0 |
+
+`recall` served **27× the characters at 74× the wall time** of plain
+`search` on the relational set (11× / 114× on the logged set) and found
+the expected target no more often, because plain `search` already found
+it every time. That last clause is the honest limit of this run: at n=8
+with both arms at 100%, the questions cannot separate the two arms on
+quality — they only price the difference. A question set that plain
+search *fails* is what a quality verdict needs, and writing one is the
+obvious next step.
+
+What the expansion is made of is measurable even at this n. Of the 524
+entities `recall` added beyond its seeds on the relational set:
+
+| arrival | count | share |
+| --- | --- | --- |
+| touches a hub (degree >= p95 = 5) | 520 | 99.2% |
+| only `part-of` edges | 225 | 42.9% |
+| at least one domain relation | 299 | 57.1% |
+| unlinked (came from the re-query, not an edge) | 0 | 0% |
+
+Essentially every entity the graph adds arrives through a hub, and over
+two fifths arrive through containment alone. On a star-shaped graph with
+median degree 1, "expand the neighbourhood" mostly means "enumerate a
+hub's spokes" — which is why the payload is 27× larger without being
+more likely to contain the answer. The hub gate stops recall expanding
+*through* a hub; it does not stop a hub's spokes being pulled in as
+results.
+# Offline routing analysis (`router_offline.py`)
+
+The engine concatenates channels for every query — the hybrid arm serves a
+cortex fact block plus the top-k raw entries, whatever the question. The
+only routing policy that has ever won a measurement is the commit-gated
+cascade (serve cortex when it commits, else rag). This script asks whether
+a router that reads the QUESTION SHAPE could beat that, and answers it
+without a GPU: it re-aggregates the per-question verdicts that three
+already-judged runs left behind.
+
+**What these numbers are.** Offline re-use of judged verdicts. No new
+answer calls, no new judge calls, a single replicate per source run, and a
+local judge in every case. The oracle rows are fit on the very questions
+they score, so they are BOUNDS on what a router could reach, never shipped
+results. The realizable rows are 5-fold cross-validated by question — a
+prediction always comes from a model that never saw that question — but
+they still inherit the source runs' judge and era. The "best" realizable
+router is a maximum over every cross-validated configuration the script
+tries, so it carries the usual select-the-best optimism. There is one
+feature representation throughout (`FEATURE_NAMES`); what varies is the
+candidate ARM set, crossed with two classifiers (`tree_d3`, `logreg`) and
+two label policies, plus the type-prediction and two-stage variants. That
+is **16** configurations on LongMemEval-500 and on the 78-question slice —
+two candidate sets each — and **22** on BEAM-400, which has three because
+BEAM also carries a no-memory arm. So the optimism is largest on the
+benchmark carrying the larger headline gain. The verdict does not depend
+on it: the maximum still fails the preregistered bar on both benchmarks.
+
+```bash
+python evals/router_offline.py --out evals/results/router-offline-20260904.json
+```
+
+Deterministic and seeded (`SEED = 0`): two runs produce byte-identical
+JSON, and `tests/test_router_offline.py` regenerates the committed
+artifact and compares it.
+
+## Sources and cost units
+
+| tag | rows | source artifact | cost column |
+| --- | --- | --- | --- |
+| LME-500 | 500 | `longmemeval-all-oracle-qwen-27b-alltypes-0803.jsonl` | real `*_context_tokens` |
+| LME-KU78 | 78 | `longmemeval-ku-oracle-qwen-27b-ceiling-v38.jsonl` | real `*_context_tokens` |
+| BEAM-400 | 400 | `beam-100K-qwen-27b-chip12-b16.jsonl` | context **characters** |
+
+BEAM rows carry no token column, so cost there is the length of
+`contexts[arm]` in characters; the ratio column divides by a flat 4
+chars/token and is labelled `est_tokens` in the artifact. The two units are
+never mixed. LongMemEval scores are binary judge verdicts; BEAM scores are
+the paper-faithful float rubric means.
+
+The cascade arm is not re-implemented here — `replicate.cortex_commits` and
+its cost rule are imported, and a test asserts the derived arm matches
+`replicate.cascade_correct` / `cascade_context_tokens` row by row. As a
+sanity gate the script also recomputes each run's published per-arm table
+from the rows: LME-500 reproduces its summary exactly (max score delta
+0.0000), LME-KU78 and BEAM-400 to within the summaries' own rounding
+(< 5e-4). If that gate ever drifts, nothing below it is trustworthy.
+
+## LongMemEval, 500 questions, six types
+
+Accuracy and mean served tokens side by side, plus accuracy per 1k tokens
+so the trade is one number rather than two.
+
+| policy | accuracy | mean tokens | acc / 1k tok |
+| --- | --- | --- | --- |
+| cortex only | 0.416 | 158 | 2.629 |
+| hybrid (facts + top-k) | 0.664 | 842 | 0.789 |
+| **rag — best single arm** | **0.688** | 1210 | 0.569 |
+| cascade (shipped policy) | 0.690 | 883 | 0.782 |
+| oracle by type (arms + cascade) | 0.712 | 893 | 0.797 |
+| oracle per question (ceiling) | 0.778 | 419 | 1.857 |
+| best cross-validated router | 0.690 | 883 | 0.782 |
+| router via predicted type | 0.686 | 1002 | 0.685 |
+| two-stage: cascade, then router | 0.690 | 883 | 0.782 |
+| two-stage, token-greedy labels | 0.656 | 667 | 0.983 |
+
+The oracle-by-type bound is **+0.024** over the best single arm, at 316
+fewer tokens. The best realizable router is **+0.002**, and it is the
+shipped policy in a different shape: the two-stage variant serves cortex on
+the 193 questions where cortex commits and rag on the other 307, landing on
+0.690 at 883 tokens — the cascade's own score and cost, to the digit. A
+router that reads only the question's shape does not get there. The best
+single-stage one ties the best single arm at 0.688 on 1205 tokens, and the
+two variants free to pick the cascade as well tie at 0.678, on 1005 and
+1009 tokens, agreeing with the oracle-by-type choice on 0.226 of questions.
+
+## BEAM 100K, 400 questions, ten types
+
+| policy | score | mean chars | score / 1k est-tok |
+| --- | --- | --- | --- |
+| no memory | 0.181 | 0 | n/a |
+| cortex only | 0.283 | 2 207 | 0.513 |
+| cascade | 0.552 | 14 294 | 0.154 |
+| hybrid | 0.623 | 24 398 | 0.102 |
+| refind | 0.627 | 41 757 | 0.060 |
+| **rag — best single arm** | **0.642** | 22 158 | 0.116 |
+| oracle by type (arms + cascade) | 0.683 | 22 861 | 0.120 |
+| oracle by type (+ the no-memory arm) | 0.688 | 22 635 | 0.122 |
+| oracle per question (ceiling) | 0.789 | 17 672 | 0.179 |
+| best cross-validated router | 0.651 | 22 829 | 0.114 |
+| router via predicted type | 0.620 | 27 780 | 0.089 |
+| two-stage: cascade, then router | 0.554 | 14 364 | 0.154 |
+
+Here the oracle-by-type bound is larger — **+0.046** — but it costs 477
+chars MORE than rag, not fewer, because the types it moves off rag it moves
+onto refind and hybrid, both of which serve more context. The best
+realizable router recovers **+0.008** of that, also at more cost. The
+cascade is not the strong policy on BEAM that it is on LongMemEval: cortex
+alone scores 0.283 there, so committing to it costs 0.09.
+
+## LongMemEval knowledge-update, 78 questions (ceiling-v38)
+
+| policy | accuracy | mean tokens | acc / 1k tok |
+| --- | --- | --- | --- |
+| cortex only | 0.667 | 97 | 6.894 |
+| hybrid | 0.846 | 731 | 1.157 |
+| cascade | 0.846 | 389 | 2.173 |
+| **rag — best single arm** | **0.859** | 1184 | 0.725 |
+| oracle by type | 0.859 | 1184 | 0.725 |
+| oracle per question (ceiling) | 0.962 | 318 | 3.021 |
+| two-stage: cascade, then router | 0.846 | 382 | 2.212 |
+
+This slice is one question type, so a type router is degenerate on it by
+construction — the oracle-by-type row is the best single arm, exactly. It
+is here for the per-question ceiling: **0.962** over the three channels,
+against 0.936 for the rag∪cortex union on the same rows. (The 0.949 union
+published in the guide is a different run — the e2e ceiling — and a
+two-channel union; the two are not interchangeable.)
+
+## Why the routers do not reach the bound
+
+The question type IS partly predictable from surface text — 0.654 on
+LME-500 and 0.652 on BEAM-400 by 5-fold CV, against majority baselines of
+0.266 and 0.100. The gap is not in the classifier. It is that
+
+- the per-type best-arm differences are small (LME-500: +0.024 for a
+  perfect type oracle), so a classifier at 0.65 gives most of that back on
+  its mistakes — `router_via_type` scores BELOW the best single arm on
+  every dataset; and
+- the per-question best-arm label is dominated by ties. Trained on it, both
+  models collapse: 493/500 rag under accuracy-first tie-breaking on
+  LME-500, or 475/500 cortex under cost-first, which trades 0.25 accuracy
+  for the tokens.
+
+The token-greedy variants are the one place a router earns something real,
+and it is a cost win, not an accuracy win: two-stage with cost-first labels
+serves LongMemEval at 0.656 on 667 tokens (0.983 acc/1k) against rag's
+0.688 on 1210 (0.569). That is the same trade the cascade already makes,
+made harder.
+
+## Robustness across benchmarks
+
+Of the four question types the two benchmarks share, the oracle's best-arm
+choice agrees on **two**:
+
+| LongMemEval type | BEAM type | LME best | BEAM best | agree |
+| --- | --- | --- | --- | --- |
+| knowledge-update | knowledge_update | cascade | cascade | yes |
+| single-session-preference | preference_following | rag | rag | yes |
+| temporal-reasoning | temporal_reasoning | hybrid | refind | no |
+| multi-session | multi_session_reasoning | rag | hybrid | no |
+
+A per-type choice that flips between benchmarks is a property of the
+benchmark, not of the question shape, and cannot be shipped.
+
+## Verdict
+
+The criterion, fixed before the numbers were read and recorded in the
+artifact: a cross-validated router must beat the best single arm by at
+least 3 points at no more served cost, on BOTH benchmarks.
+
+**It fails, and so does the oracle bound.** The realizable gains are +0.002
+(LongMemEval, at 327 fewer tokens) and +0.008 (BEAM, at 671 MORE chars).
+Even a router with perfect knowledge of the question type would fall short:
++0.024 on LongMemEval is under the bar, and BEAM's +0.046 comes at more
+cost. The per-question ceilings — 0.778 and 0.789, +0.090 and +0.147 over
+the best single arm — say the channels genuinely disagree and a *perfect*
+selector would be worth a great deal; they also say the signal that picks
+correctly is not in the question's surface form.
+
+Read against the cascade: on LongMemEval the shipped cascade already sits
+at 0.690/883 tokens, which the best router matches exactly and no router
+beats. The gain is in the cascade already. A query-shape router is not
+worth building; if the per-question ceiling is to be approached, the
+selector needs a signal from the retrieved evidence (the cascade's
+abstention gate is one such signal, and it is the one that works), not from
+the question text.
+
+---
+
+# Smaller probes
+
+Five tracked scripts, each answering one narrow question, without their
+own section above:
+
+- `beam_attrib_ablation.py` (2026-08-24) — re-answers a BEAM run's
+  persisted contexts with the pre-Phase-1 answer prompt, holding the turn
+  budget and ordinals fixed, to isolate the prompt term from the budget
+  term in the Phase-1 delta.
+- `digest_sidecar_probe.py` (2026-08-24/27) — generates session digests
+  against a configured extractor endpoint for human review, gating
+  `memory.dream.digest_enabled` on whether a small CPU sidecar's narrative
+  prose is actually usable.
+- `recall_cap_probe.py` (2026-08-25) — a synthetic-graph, DB-free
+  measurement backing the `memory_recall` output-cap size claim (issue
+  #186), reproducing the shape of the live audit without a daemon or bank
+  (`evals/results/recall-cap-186-payload-probe.json`).
+- `snippet_differential_replay.py` (2026-08-30) — replays a bank's pending
+  merge proposals through the real snippet-attachment path, before/after,
+  to measure low-differential evidence share
+  (`evals/results/snippet-differential-live-20260830.json`).
+- `queue_judge_fulllen_pack.py` (2026-09-03) — rebuilds a queue-judge
+  evidence pack with full-length merge snippets, recovering the
+  2026-09-02 panel's 240-char-clipped rows by prefix match against the
+  bank they were built from, feeding the fulllen ladder rerun above.
+
+---
+
+# Agent-side token ledger (`agent_token_ledger.py`)
+
+Every "fewer tokens" number this repo publishes measures **served benchmark
+context** — the passage an answerer model reads to answer a LongMemEval or
+BEAM question. Nothing measured the other side of the wire: what a real MCP
+client reads *back* from a tool call, and pays for on every call, forever.
+This ledger measures that side, and the payload cuts below were chosen from
+it rather than from taste.
+
+```bash
+python evals/agent_token_ledger.py --daemon http://127.0.0.1:8765 \
+    --out evals/results/agent-token-ledger-20260904-r3.json
+```
+
+The cited artifact is
+`evals/results/agent-token-ledger-20260904-r3.json`. Two earlier runs stay
+committed as **pre-review records** and are cited by no number below:
+
+* `agent-token-ledger-20260904.json` (r1) measured the lean
+  `memory_fact_get` projection while it was still dropping `source_entries`,
+  and picked its five widest slots from a 2,000-row prefix of the fact dump
+  rather than from the whole cortex. Both were fixed; the `fact_get` row
+  moved as a result and says so in place.
+* `agent-token-ledger-20260904-r2.json` measured `superseded_by_text`
+  truncated to the same 600 chars as the entry's own text. That behaviour
+  was **corrected before merge** — the field has no recovery path, since a
+  compact entry carries no id for the superseding entry — so its headline
+  (−41%) priced a payload this repo does not ship. The r3 run below prices
+  the shipped one. (One slot label in r2 was redacted in place after the
+  fact: it was a bare machine name, which `safe_label` did not catch until
+  the same review taught it hostnames.)
+
+The script refuses to overwrite an existing `--out`, which is why each
+rerun is a new tag rather than a rewrite.
+
+**Method.** Raw payloads are fetched once from the daemon's GET-only REST
+(`/api/search`, `/api/recall`, `/api/facts`), then projected offline through
+the MCP layer's own pure helpers (`mcp_server._project_search`,
+`_lean_fact_record`, the `_cap_recall_*` family), so before/after is exactly
+paired — same bytes in, two projections out. GET-only is not side-effect
+free: `/api/search` runs the real retrieval path, so it appends
+`retrieval_events` rows and touches per-entry access counters. It changes no
+bank *content* — nothing is written, moved or reinforced. Sizes are
+characters of the compact JSON an MCP client receives; approximate tokens
+are `chars // 4`, the `ladder_sweep.approx_tokens` convention. Queries are a
+fixed, committed list of 15 dev-session questions, deliberately **not** a
+sample of the `retrieval_events` table: this is a public repo and real
+queries carry paths and names. Numbers are bank-specific (measured on the
+maintainer's live bank, 1,316 entries, `preset: flat`) and the artifact
+records the entry count so a rerun elsewhere is not read as a regression.
+The two cuts' parameters are read from `utils.config.McpConfig` rather than
+restated in the harness — the values used are written to the artifact's
+`config` block — so a future change to `entry_text_chars` re-prices the run
+instead of quietly leaving the published numbers describing the old default.
+
+## What a session costs before it asks anything
+
+| Surface | chars | ~tokens |
+| --- | --- | --- |
+| tool manifest, `minimal` tier (9 tools) | 7,015 | 1,753 |
+| tool manifest, `core` tier (22 tools) | 14,076 | 3,519 |
+| tool manifest, `full` tier (35 tools) | 22,719 | 5,679 |
+| served session-start block (`MEMORY_LOOP_BLOCK`) | 7,492 | 1,873 |
+
+The manifest split is roughly two-thirds tool descriptions, one-third
+inputSchema parameter descriptions (full tier: 14,523 + 8,196). Both halves
+are already metered per tier by
+`tests/test_tool_consolidation.py::test_descriptions_fit_tier_budgets`; this
+ledger reads them through the same path so the two cannot disagree.
+
+The session-start row is **raw** characters, not the JSON encoding the rest
+of this page counts: the hook writes that block into the session as plain
+text, so the escaping is not paid. (Its JSON size, 7,644, is in the artifact
+under `chars` for comparability and is not the cost.) The block is capped at
+`HOOK_CONTEXT_MAX_CHARS - 2,000` = 7,500 raw chars by
+`tests/test_plugin_packaging.py`, which is why it is the one surface here
+with almost no headroom.
+
+## What a call costs — before and after the cuts
+
+Mean over the 15 queries, `memory_search` at the tool's default `top_k=8`:
+
+| Payload part | before | after | change |
+| --- | --- | --- | --- |
+| **total** | **14,745** | **9,951** | **−33%** |
+| entries block | 12,637 | 7,842 | −38% |
+| — entry `text` | 9,464 | 4,550 | −52% |
+| — `superseded_by_text` | 2,406 | 2,406 | — |
+| — entry metadata | 767 | 887 | +16% |
+| cortex block | 1,853 | 1,853 | — |
+| approx tokens | 3,686 | 2,487 | −33% |
+
+Median total 15,325 → 9,613; p90 18,886 → 12,583. Entry `text` alone was
+**64% of the whole payload**. The metadata line goes *up*, on purpose: the
+`truncated: true` marker is what tells the reader that `memory_get` has more.
+
+The `superseded_by_text` line is **exempt from the cap** and is why the
+headline is 33% rather than the 41% the r2 run reported. It is a sixth of
+the "before" payload and a quarter of what ships, so capping it looked like
+free money — but it has no recovery path. A compact entry carries no id for
+the superseding entry and nothing stores a pointer to one, so
+`memory_get(entry.id)` returns the *superseded* text, not the replacement:
+a clipped correction is unrecoverable by any tool call in any tier. Three
+surfaces tell agents to prefer that field over the entry's own text (the
+served session-start block, `examples/CLAUDE.memory.md`, and
+`memory_search`'s own description), and 13 of these 15 queries had at least
+one clipped under r2 (2,406 → 1,199 chars mean). It was published as a row
+here rather than left inside "entries block" because the r2 breakdown left
+those ~2,400 chars unlabelled between the block total and text + metadata
+(2026-09-04 review finding).
+
+One approximation, named: the narrow arm slices the width-5 cortex list
+`/api/search` returns rather than re-running `cortex_search` at width 3, so
+it would diverge from a real call on a bank where constraint pinning
+re-budgets. The measured bank carries **0 of 5,509** labelled current facts,
+so `_pin_constraint_facts` is a no-op and the two are the same set in the
+same order. That validity condition is now counted by the run itself and
+recorded in the artifact (`bank.facts_labelled` / `bank.facts_current`, with
+`bank.facts_dump_truncated` false so the census saw the whole cortex) rather
+than hand-checked; read this arm only while `facts_labelled` is 0.
+
+At `top_k=3` — where the cortex-block narrowing actually bites, since
+`min(5, top_k)` is inert at the default:
+
+| Payload part | before | after | change |
+| --- | --- | --- | --- |
+| **total** | **6,870** | **4,290** | **−38%** |
+| entry `text` | 3,537 | 1,712 | −52% |
+| `superseded_by_text` | 931 | 931 | — |
+| cortex block (5 facts → 3) | 1,853 | 1,107 | −40% |
+
+`memory_fact_get`, over the five widest current slots in the bank: **2,175 →
+1,296 chars** mean (median 2,281 → 1,128), a 40% cut from moving provenance,
+support, writer/session id, tx/valid time and the supersession chain behind
+`verbose=True` — 25 keys down to 12 or 13.
+
+That cut is smaller than the r1 run reported (1,424 → 764, 46%), for
+two reasons, both corrections rather than regressions. The projection now
+keeps `source_entries`, the engram links: it is the only handle from a fact
+back to the episodes that formed it, and the poisoned-memory procedure in
+`docs/guide/security-posture.md` ("follow the engram links"), `memory_get`'s
+core-tier justification, and
+`tests/test_release_ux.py::test_core_tier_can_close_its_own_loops` all
+depend on it being served by default. And the five widest slots are now
+chosen from the whole cortex rather than from the first 2,000 rows the fact
+dump returned, so both arms are measured on genuinely wider records.
+
+Both arms price the RECORD, not the whole call, and in the same direction:
+the "before" is the `/api/facts` dump row (`service.cortex_dump`), which
+carries an `entity_id` the served `memory_fact_get` record never has, and
+neither arm includes the tool envelope — `{record, contenders}` plus
+`correct_with` and the correction note on an aged fact. Read the percentage
+as the claim and the absolute chars as a floor. Closing either gap needs a
+live service bound to the bank, which this script deliberately does not
+have.
+
+## The cap, and why 600
+
+Served entry `text` runs mean **1,180** chars, median 1,149, p90 1,794 over
+the 120 entries the 15 queries returned. A 600-char cap therefore clips 88%
+of hits on this bank — deliberately: these are consolidated notes, not
+one-liners, and 600 chars (~150 tokens) is enough to judge a hit and usually
+to act on it, with `memory_get` for the rest. `memory_recall` has capped its
+supporting texts at 200 since 2026-07-10 for the same reason; search entries
+are the primary answer rather than walk evidence, so they get the wider cap.
+
+## `memory_recall` is the expensive one
+
+A 3-hop `memory_recall` issues **35 `service.search` calls on average** and
+up to **66** on a single question — one seed search plus one per entity
+newly discovered on each hop (`run_recall` + `MechanicalController.next_queries`;
+derived from the response's `entity_hop`, not instrumented). Two of the five
+relational questions resolved no seed entity and cost 1 search each; the
+other three cost 50, 58 and 66. The *response* is already lean by comparison
+— 4,243 chars mean against 10,349 for the same walk with `verbose=True` —
+because the recall caps landed on 2026-07-10 and in #186. The call
+amplification is untouched here and is the obvious next lever.
+
+## What this does **not** measure
+
+- Ranking, `min_score`, or anything an accuracy number depends on. Every cut
+  is a projection above `service.*`; the eval harness calls the service
+  directly, pinned by
+  `tests/test_agent_payload_budget.py::test_eval_harness_does_not_read_the_mcp_projection`.
+- Real client tokenisation. `chars // 4` is the house approximation, not a
+  tokeniser.
+- Whether a clipped hit ever costs an answer. That needs an end-to-end run
+  with an agent in the loop, and is not attempted here.

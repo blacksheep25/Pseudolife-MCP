@@ -259,8 +259,8 @@ if (-not $Extractor) {
     Write-Host "  1) sonnet-only      - lightest: Claude shim only; sidecar never built (~11.8 GB lighter; needs logged-in Max-plan CLI; dreams pause when the shim is down)"
     Write-Host "  2) sonnet-fallback  - Claude shim primary, sidecar auto-fallback (Max-plan CLI plus the ~11.8 GB image)"
     Write-Host "  3) sidecar          - bundled local CPU model (no Claude plan needed, works for everyone; ~11.8 GB image)"
-    Write-Host "  4) codex-fallback   - Codex (ChatGPT-plan) shim primary, sidecar auto-fallback (extraction quality unmeasured - see docs/guide/dreaming.md)"
-    Write-Host "  5) codex-only       - Codex shim only; sidecar never built (quality unmeasured; dreams pause when the shim is down)"
+    Write-Host "  4) codex-fallback   - Codex (ChatGPT-plan) shim primary, sidecar auto-fallback (ladder-measured at parity with the Claude ceiling - see docs/guide/dreaming.md)"
+    Write-Host "  5) codex-only       - Codex shim only; sidecar never built (ladder-measured; dreams pause when the shim is down)"
     while (-not $Extractor) {
         switch (Read-Host "Choose 1/2/3/4/5") {
             "1" { $Extractor = "sonnet-only" }
@@ -457,7 +457,7 @@ function Remove-ShimTask($name) {
     if (-not (Get-ScheduledTask -TaskName $name -ErrorAction SilentlyContinue)) { return }
     Unregister-ScheduledTask -TaskName $name -Confirm:$false -ErrorAction SilentlyContinue
     if (Get-ScheduledTask -TaskName $name -ErrorAction SilentlyContinue) {
-        Write-Warning "could not remove autostart task '$name' (needs an ELEVATED pwsh) - its shim keeps starting at logon until you remove it"
+        Write-Warning "could not remove autostart task '$name' (needs an ELEVATED pwsh opened from the Start menu, not from inside Claude Desktop) - its shim keeps starting at logon until you remove it"
     } else {
         Step "Removed autostart task '$name' (a running shim process, if any, persists until logoff)"
     }
@@ -468,21 +468,23 @@ if (-not $claudeShimMode) {
     Remove-ShimTask "Pseudolife Sonnet Shim"   # pre-rename installs
 }
 if ($claudeShimMode) {
-    Step "Registering the Claude shim autostart (Task Scheduler; needs an ELEVATED pwsh)..."
+    Step "Registering the Claude shim autostart (Task Scheduler; needs an ELEVATED pwsh opened from the Start menu - not from a shell inside Claude Desktop)..."
     try {
         & (Join-Path $PSScriptRoot "install-shim-autostart.ps1") -Port $ShimPort -Model $Model
     } catch {
         Write-Warning "Shim autostart registration failed (usually elevation): $_"
-        Write-Host "  Re-run later from an admin pwsh: ops\install-shim-autostart.ps1 -Port $ShimPort -Model $Model"
+        Write-Host "  Re-run later from an admin pwsh opened fresh from the Start menu (never from a shell inside Claude Desktop - see the note in ops\install-shim-autostart.ps1):"
+        Write-Host "    ops\install-shim-autostart.ps1 -Port $ShimPort -Model $Model"
         Write-Host "  Or start it manually: python evals\claude_shim.py --port $ShimPort --model $Model --system-prompt-file evals\prompts\sonnet_extractor_v2.md"
     }
 } elseif ($codexShimMode) {
-    Step "Registering the Codex shim autostart (Task Scheduler; needs an ELEVATED pwsh)..."
+    Step "Registering the Codex shim autostart (Task Scheduler; needs an ELEVATED pwsh opened from the Start menu - not from a shell inside Claude Desktop)..."
     try {
         & (Join-Path $PSScriptRoot "install-codex-shim-autostart.ps1") -Port $ShimPort -Model $Model
     } catch {
         Write-Warning "Shim autostart registration failed (usually elevation): $_"
-        Write-Host "  Re-run later from an admin pwsh: ops\install-codex-shim-autostart.ps1 -Port $ShimPort -Model $Model"
+        Write-Host "  Re-run later from an admin pwsh opened fresh from the Start menu (never from a shell inside Claude Desktop - see the note in ops\install-codex-shim-autostart.ps1):"
+        Write-Host "    ops\install-codex-shim-autostart.ps1 -Port $ShimPort -Model $Model"
         Write-Host "  Or start it manually: python evals\codex_shim.py --port $ShimPort --model $Model"
     }
 }

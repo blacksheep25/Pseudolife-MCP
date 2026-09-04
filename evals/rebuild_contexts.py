@@ -8,7 +8,9 @@ chains), and cortex search is plain cosine over
 ``encode_single(f"{entity} {attribute} {value}")`` — so the cortex arm's
 context can be rebuilt EXACTLY offline. The rag context is copied verbatim;
 the hybrid arm reuses its original raw-memories block verbatim and splices in
-the rebuilt fact lines. Judge fields are stripped so the answer phase re-runs.
+the rebuilt fact lines. EVERY arm's judge fields are stripped (comparator arms
+included) so the answer phase re-runs the whole row, never a mix of fresh and
+carried-over verdicts.
 
     python evals/rebuild_contexts.py                  # s/qwen-27b diag -> diag-knobs
     python evals/rebuild_contexts.py --top-k 24 --min-score 0.1
@@ -16,6 +18,16 @@ the rebuilt fact lines. Judge fields are stripped so the answer phase re-runs.
 Then:
     python evals/longmemeval_bench.py --dataset s --extractor qwen-27b \
         --tag diag-knobs --phase answer
+
+SCOPE — ASSOCIATIVE knobs are NOT covered here. This rebuilds the CORTEX
+fact ranking only. Anything under ``memory.search`` (the candidate-pool
+multiplier, the fusion mode) changes ``cms.retrieve``, whose output reaches
+the ``rag`` context and the hybrid arm's raw-memory block — both of which
+this script copies verbatim from the source run, because no band state was
+dumped. ``evals/regression_gate.ps1`` runs this as its stage 1, so a GREEN
+GATE SAYS NOTHING about those knobs: measuring them needs a full
+``--phase extract`` with ``PSEUDOLIFE_BENCH_POOL_MULT`` /
+``PSEUDOLIFE_BENCH_FUSION`` set (``ladder_sweep.apply_pool_env``).
 """
 from __future__ import annotations
 
@@ -32,11 +44,25 @@ os.environ.setdefault("HF_HUB_OFFLINE", "1")
 os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
 
 from longmemeval_bench import (  # noqa: E402
-    ARMS, CORTEX_MIN_SCORE, CORTEX_TOP_K, bank_dir, load_rows, out_file,
+    CORTEX_MIN_SCORE, CORTEX_TOP_K, bank_dir, load_rows, out_file,
     rewrite_rows,
 )
+from context_format import FACTS_HEADER, MEMS_HEADER  # noqa: E402
+from replicate import is_judge_field  # noqa: E402
 
-_HYBRID_SPLIT = "\n\nRelevant memories:\n"
+
+def strip_verdicts(row: dict) -> dict:
+    """Clear EVERY arm's verdict in place so the answer phase re-runs.
+
+    Not just the canonical three: a rebuilt row that kept a comparator
+    arm's verdict would carry a stale judgement beside freshly rebuilt
+    contexts, and an interrupted answer phase would then leave a file
+    whose arms are judged over different row sets — which leak_check.py,
+    unlike report(), does not filter out (2026-09-01 review).
+    """
+    for key in [k for k in row if is_judge_field(k)]:
+        row.pop(key)
+    return row
 
 
 def rebuild_fact_lines(bank: dict, emb, top_k: int, min_score: float,
@@ -50,6 +76,15 @@ def rebuild_fact_lines(bank: dict, emb, top_k: int, min_score: float,
     ``bm25=False`` mirrors the shipped ``BM25Config.cortex_enabled``
     default (the 2026-07-30 A/B measured no end-to-end benefit); lexical
     hits gate on the normalised ``bm25.min_score``, not the dense floor.
+
+    Schema v35: the live ``cortex_search`` also pins in-scope
+    CONSTRAINT-labelled facts ahead of this ranking. That step is NOT
+    mirrored here, so the lockstep holds only for banks that carry no
+    ``distortion_tolerance`` labels — which every committed bench bank
+    is (the dumps predate v35, and the bench turn prefix defeats the
+    auto heuristic). A labelled bank needs either
+    ``memory.cortex.pin_constraints = false`` for the run or a measured
+    fire rate beside the result.
 
     Task 6: a fact dict may carry an optional ``"kind"`` — ``"member"``
     marks one row of a set-valued slot; absent (every bank dumped before
@@ -179,13 +214,11 @@ def main() -> int:
         fact_lines = rebuild_fact_lines(bank, emb, args.top_k,
                                         args.min_score,
                                         bm25=args.bm25)
-        raw_block = row["contexts"]["hybrid"].split(_HYBRID_SPLIT, 1)[-1]
+        raw_block = row["contexts"]["hybrid"].split(MEMS_HEADER, 1)[-1]
         row["contexts"]["cortex"] = "\n".join(fact_lines)
-        row["contexts"]["hybrid"] = ("Known facts:\n" + "\n".join(fact_lines)
-                                     + _HYBRID_SPLIT + raw_block)
-        for arm in ARMS:                 # strip verdicts -> answer phase re-runs
-            for field in ("response", "correct", "context_tokens"):
-                row.pop(f"{arm}_{field}", None)
+        row["contexts"]["hybrid"] = (FACTS_HEADER + "\n".join(fact_lines)
+                                     + MEMS_HEADER + raw_block)
+        strip_verdicts(row)              # every arm -> answer phase re-runs
         out_rows.append(row)
 
     rewrite_rows(dst, out_rows)

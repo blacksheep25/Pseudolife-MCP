@@ -15,7 +15,7 @@ import json
 import logging
 import time
 from contextlib import contextmanager
-from typing import Any
+from typing import Any, Sequence
 
 import numpy as np
 import psycopg
@@ -30,6 +30,8 @@ _ENTRY_COLS = (
     "band", "text", "embedding", "surprise", "ts", "access_count", "source",
     "superseded_at", "superseded_by_text", "last_logical_turn",
     "episode_id", "episode_title", "tags", "slots",
+    # v35: the write-time label pair — nullable, NULL = unlabelled.
+    "authority", "distortion_tolerance",
 )
 _ENTRY_JSONB = {"tags", "slots"}
 
@@ -53,6 +55,8 @@ _FACT_COLS = (
     "kind", "value_norm",
     # v29: epistemic stance — nullable, NULL = asserted plainly.
     "stance",
+    # v35: the write-time label pair — nullable, NULL = unlabelled.
+    "authority", "distortion_tolerance",
 ) + _STAMP_COLS
 _FACT_JSONB = {"support", "provenance"}
 
@@ -465,14 +469,21 @@ class PostgresStorage:
 
     def update_access_counts(self, pairs: list[tuple[int, int]]) -> None:
         """Bulk-sync (entry_id, access_count) — called on the save cadence,
-        not per retrieval, to keep reads cheap."""
+        not per retrieval, to keep reads cheap. One unnest'd UPDATE rather
+        than per-row executemany: the autosave holds the service lock while
+        this runs, and a single round trip keeps that hold O(1) in bank
+        size (2026-09-01, live-sized 1,135 rows: 30.5ms as per-row
+        statements vs 9.8ms unnest'd; the gap scales with row count). The
+        ``<>`` guard keeps a no-op save from rewriting every row."""
         if not pairs:
             return
-        with self._txn(), self.conn.cursor() as cur:
-            cur.executemany(
-                "UPDATE entries SET access_count = %s "
-                "WHERE id = %s AND access_count <> %s",
-                [(c, i, c) for (i, c) in pairs],
+        with self._txn():
+            self.conn.execute(
+                "UPDATE entries e SET access_count = v.ac "
+                "FROM (SELECT unnest(%s::bigint[]) AS id, "
+                "             unnest(%s::int[]) AS ac) v "
+                "WHERE e.id = v.id AND e.access_count <> v.ac",
+                ([i for i, _ in pairs], [c for _, c in pairs]),
             )
 
     def delete_fact_ids(self, ids: list[int]) -> int:
@@ -1412,6 +1423,22 @@ class PostgresStorage:
         ]
         return d
 
+    def canonical_names_among(self, names: Sequence[str]) -> set[str]:
+        """The subset of ``names`` that are some entity's canonical. One
+        indexed probe (``entities.canonical`` is UNIQUE); no query for an
+        empty list. Lets a caller holding a node's alias list drop the
+        aliases ``find_entity`` would never resolve to that node — it
+        resolves canonical-first, so an alias row that coincides with any
+        canonical is dead for resolution (``graph.alias_canonical_map``
+        applies the same drop from a loaded graph)."""
+        names = [n for n in names if n]
+        if not names:
+            return set()
+        rows = self.conn.execute(
+            "SELECT canonical FROM entities WHERE canonical = ANY(%s)",
+            (names,)).fetchall()
+        return {r[0] for r in rows}
+
     def find_fact_slot_entity(self, key_norm: str) -> str | None:
         """Display entity of a CURRENT fact whose slot key — entity_norm and
         attribute_norm hyphen-joined, matching graph.norm_name's separator
@@ -1444,6 +1471,27 @@ class PostgresStorage:
             row = self.conn.execute(
                 "DELETE FROM entities WHERE id = %s RETURNING id", (entity_id,)).fetchone()
         return row is not None
+
+    def delete_entity_audited(self, entity_id: int, display: str, status: str,
+                              reason: str, decided_by: str, now: float) -> bool:
+        """``delete_entity`` plus its ``merge_decisions`` audit row in ONE
+        transaction — an unattended deletion whose audit row a crash could
+        separate from the delete would be an invisible deletion."""
+        with self._txn():
+            for tbl in ("facts", "lessons"):
+                self.conn.execute(f"UPDATE {tbl} SET entity_id = NULL WHERE entity_id = %s", (entity_id,))
+                self.conn.execute(f"UPDATE {tbl} SET object_entity_id = NULL WHERE object_entity_id = %s", (entity_id,))
+            row = self.conn.execute(
+                "DELETE FROM entities WHERE id = %s RETURNING id", (entity_id,)).fetchone()
+            if row is None:
+                return False
+            self.conn.execute(
+                "INSERT INTO merge_decisions "
+                "(proposal_id, entity_display, into_display, status, score, "
+                " reason, decided_by, decided_at) "
+                "VALUES (NULL, %s, NULL, %s, NULL, %s, %s, %s)",
+                (display, status, reason, decided_by, now))
+        return True
 
     def merge_entity(self, from_id: int, into_id: int) -> bool:
         """Fold `from` into `into`: drop edges that would duplicate or self-loop,
@@ -1896,33 +1944,155 @@ class PostgresStorage:
 
     def pending_proposals(self) -> list[dict]:
         cols = ("id", "src_id", "relation", "dst_id", "confidence", "similarity",
-                "rationale", "source", "created_at", "status")
+                "rationale", "source", "created_at", "status",
+                "judge_verdict", "judge_confidence", "judge_note",
+                "judge_model", "judged_at", "judge_relation")
         rows = self.conn.execute(
             "SELECT p.id, p.src_id, p.relation, p.dst_id, p.confidence, p.similarity, "
-            "       p.rationale, p.source, p.created_at, p.status, s.display, d.display "
+            "       p.rationale, p.source, p.created_at, p.status, "
+            "       p.judge_verdict, p.judge_confidence, p.judge_note, "
+            "       p.judge_model, p.judged_at, p.judge_relation, "
+            "       s.display, d.display "
             "FROM edge_proposals p "
             "JOIN entities s ON s.id = p.src_id JOIN entities d ON d.id = p.dst_id "
             "WHERE p.status = 'pending' ORDER BY p.confidence DESC, p.id"
         ).fetchall()
         out = []
         for r in rows:
-            d = dict(zip(cols, r[:10]))
-            d["src"], d["dst"] = r[10], r[11]
+            d = dict(zip(cols, r[:16]))
+            d["src"], d["dst"] = r[16], r[17]
             out.append(d)
         return out
 
+    def set_proposal_judgment(self, proposal_id: int, *, verdict: str,
+                              confidence: float | None, note: str | None,
+                              model: str | None, relation: str | None,
+                              at: float) -> bool:
+        """Record the link judge's verdict on a PENDING edge proposal (an
+        opinion, not a decision — schema v35 mirrors the v30 merge
+        contract). ``relation`` is the corrected relation of a retype."""
+        with self._txn():
+            cur = self.conn.execute(
+                "UPDATE edge_proposals SET judge_verdict=%s, "
+                "judge_confidence=%s, judge_note=%s, judge_model=%s, "
+                "judged_at=%s, judge_relation=%s "
+                "WHERE id=%s AND status='pending'",
+                (verdict, confidence, note, model, at, relation, proposal_id))
+        return cur.rowcount > 0
+
+    def record_curation_judgment(self, store: str, a_key: str, b_key: str, *,
+                                 verdict: str, keep: str | None,
+                                 fold: str | None, confidence: float | None,
+                                 note: str | None, model: str | None,
+                                 at: float) -> bool:
+        """Memo the store-curation judge's verdict on a lesson/world slot
+        pair (keys stored sorted, like dismissed_pairs); a re-judge
+        overwrites in place. Returns True once written."""
+        a, b = sorted((a_key, b_key))
+        with self._txn():
+            self.conn.execute(
+                "INSERT INTO curation_judgments (store, a_key, b_key, verdict, "
+                " keep, fold, confidence, note, model, judged_at) "
+                "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s) "
+                "ON CONFLICT (store, a_key, b_key) DO UPDATE SET "
+                " verdict = EXCLUDED.verdict, keep = EXCLUDED.keep, "
+                " fold = EXCLUDED.fold, confidence = EXCLUDED.confidence, "
+                " note = EXCLUDED.note, model = EXCLUDED.model, "
+                " judged_at = EXCLUDED.judged_at",
+                (store, a, b, verdict, keep, fold, confidence, note, model, at))
+        return True
+
+    # ── store decisions: retire/restore audit for lessons + world (v37) ───
+
+    _STORE_DECISION_COLS = ("id", "store", "entity_norm", "attribute_norm",
+                            "action", "decided_by", "reason", "record",
+                            "decided_at")
+
+    def record_store_decision(self, store: str, entity_norm: str,
+                              attribute_norm: str, action: str, *,
+                              decided_by: str | None, reason: str | None,
+                              record: dict | None, now: float) -> int:
+        """Durable, FK-free audit row for a lesson/world retire or restore.
+        ``record`` is the verbatim slot record (embedding excluded) — the
+        restore fallback once compaction has purged the retired row."""
+        with self._txn():
+            row = self.conn.execute(
+                "INSERT INTO store_decisions (store, entity_norm, "
+                " attribute_norm, action, decided_by, reason, record, "
+                " decided_at) VALUES (%s, %s, %s, %s, %s, %s, %s, %s) "
+                "RETURNING id",
+                (store, entity_norm, attribute_norm, action, decided_by,
+                 reason, Jsonb(record) if record is not None else None,
+                 now)).fetchone()
+        return int(row[0])
+
+    def store_decisions(self, store: str, *, entity_norm: str | None = None,
+                        attribute_norm: str | None = None,
+                        limit: int = 500) -> list[dict]:
+        """Retire/restore audit rows for ``store``, newest first."""
+        cols = self._STORE_DECISION_COLS
+        sql = f"SELECT {', '.join(cols)} FROM store_decisions WHERE store = %s"
+        params: list = [store]
+        if entity_norm is not None:
+            sql += " AND entity_norm = %s"
+            params.append(entity_norm)
+        if attribute_norm is not None:
+            sql += " AND attribute_norm = %s"
+            params.append(attribute_norm)
+        sql += " ORDER BY decided_at DESC, id DESC LIMIT %s"
+        params.append(int(limit))
+        return [dict(zip(cols, r))
+                for r in self.conn.execute(sql, params).fetchall()]
+
+    def retired_slots(self, store: str, *, entity_norm: str | None = None,
+                      limit: int = 100) -> list[dict]:
+        """Slots whose LATEST decision is a retire — still retired, whether
+        or not compaction has since purged the row. Newest first."""
+        cols = self._STORE_DECISION_COLS
+        sql = (f"SELECT DISTINCT ON (entity_norm, attribute_norm) "
+               f"{', '.join(cols)} FROM store_decisions WHERE store = %s")
+        params: list = [store]
+        if entity_norm is not None:
+            sql += " AND entity_norm = %s"
+            params.append(entity_norm)
+        sql += " ORDER BY entity_norm, attribute_norm, decided_at DESC, id DESC"
+        rows = [dict(zip(cols, r))
+                for r in self.conn.execute(sql, params).fetchall()]
+        out = [d for d in rows if d["action"] == "retire"]
+        out.sort(key=lambda d: (-float(d["decided_at"]), -int(d["id"])))
+        return out[: max(0, int(limit))]
+
+    def curation_judgments(self, store: str) -> dict[tuple[str, str], dict]:
+        """``{(a_key, b_key): {verdict, keep, fold, confidence, note, model,
+        judged_at}}`` for one store, keys sorted."""
+        rows = self.conn.execute(
+            "SELECT a_key, b_key, verdict, keep, fold, confidence, note, "
+            "model, judged_at FROM curation_judgments WHERE store = %s",
+            (store,)).fetchall()
+        return {(r[0], r[1]): {"verdict": r[2], "keep": r[3], "fold": r[4],
+                               "confidence": r[5], "note": r[6],
+                               "model": r[7], "judged_at": r[8]}
+                for r in rows}
+
     def get_proposal(self, proposal_id: int) -> dict | None:
         cols = ("id", "src_id", "relation", "dst_id", "confidence", "similarity",
-                "rationale", "source", "created_at", "status")
+                "rationale", "source", "created_at", "status", "decided_by",
+                "decided_at", "judge_verdict", "judge_confidence",
+                "judge_relation")
         r = self.conn.execute(
             f"SELECT {', '.join(cols)} FROM edge_proposals WHERE id = %s", (proposal_id,)
         ).fetchone()
         return dict(zip(cols, r)) if r else None
 
-    def set_proposal_status(self, proposal_id: int, status: str) -> bool:
+    def set_proposal_status(self, proposal_id: int, status: str, *,
+                            decided_by: str | None = None,
+                            decided_at: float | None = None) -> bool:
         with self._txn():
             cur = self.conn.execute(
-                "UPDATE edge_proposals SET status = %s WHERE id = %s", (status, proposal_id))
+                "UPDATE edge_proposals SET status = %s, "
+                "decided_by = COALESCE(%s, decided_by), "
+                "decided_at = COALESCE(%s, decided_at) WHERE id = %s",
+                (status, decided_by, decided_at, proposal_id))
         return cur.rowcount > 0
 
     def insert_entity_proposal(self, kind: str, entity_id: int, into_id: int | None,
@@ -1969,11 +2139,15 @@ class PostgresStorage:
     def pending_entity_proposals(self) -> list[dict]:
         cols = ("id", "kind", "entity_id", "into_id", "score", "reason",
                 "status", "created_at", "judge_verdict", "judge_confidence",
-                "judge_note", "judge_model", "judged_at")
+                "judge_note", "judge_model", "judged_at",
+                "judge2_verdict", "judge2_confidence", "judge2_model",
+                "judged2_at")
         rows = self.conn.execute(
             "SELECT p.id, p.kind, p.entity_id, p.into_id, p.score, p.reason, p.status, "
             "       p.created_at, p.judge_verdict, p.judge_confidence, "
             "       p.judge_note, p.judge_model, p.judged_at, "
+            "       p.judge2_verdict, p.judge2_confidence, p.judge2_model, "
+            "       p.judged2_at, "
             "       e.display, i.display "
             "FROM entity_proposals p "
             "JOIN entities e ON e.id = p.entity_id "
@@ -1982,10 +2156,70 @@ class PostgresStorage:
         ).fetchall()
         out = []
         for r in rows:
-            d = dict(zip(cols, r[:13]))
-            d["entity"], d["into"] = r[13], r[14]
+            d = dict(zip(cols, r[:17]))
+            d["entity"], d["into"] = r[17], r[18]
             out.append(d)
         return out
+
+    def set_entity_proposal_second_judgment(self, proposal_id: int, *,
+                                            verdict: str,
+                                            confidence: float | None,
+                                            model: str | None, at: float,
+                                            note: str | None = None) -> bool:
+        """Record the merge judge's SECOND opinion on a still-pending row
+        (schema v35); ``note`` replaces the combined judge_note when given."""
+        with self._txn():
+            cur = self.conn.execute(
+                "UPDATE entity_proposals SET judge2_verdict=%s, "
+                "judge2_confidence=%s, judge2_model=%s, judged2_at=%s, "
+                "judge_note = COALESCE(%s, judge_note) "
+                "WHERE id=%s AND status='pending'",
+                (verdict, confidence, model, at, note, proposal_id))
+        return cur.rowcount > 0
+
+    def entity_fact_rows(self, entity_id: int, canonical: str,
+                         limit: int = 3) -> list[tuple[str, str]]:
+        """``(attribute, value)`` of the current facts an entity carries,
+        by id or by name — evidence for the junk judge."""
+        rows = self.conn.execute(
+            "SELECT attribute, value FROM facts "
+            "WHERE (entity_id = %s OR entity_norm = %s) "
+            "  AND superseded_at IS NULL ORDER BY id LIMIT %s",
+            (entity_id, canonical, int(limit))).fetchall()
+        return [(r[0], r[1]) for r in rows]
+
+    def zero_evidence_entities(self, min_age_seconds: float) -> list[dict]:
+        """Entities carrying NO structural evidence — no edge (superseded
+        rows count: edge history is evidence), no current fact by id or by
+        cortex norm, no lesson reference, no alias, no scope, no proposal
+        on either side — created before ``now - min_age_seconds``. The
+        orphan sweep's candidate list; the service still checks the
+        entries for a mention before deleting."""
+        cutoff = time.time() - float(min_age_seconds)
+        rows = self.conn.execute(
+            "SELECT e.id, e.display, e.canonical, e.created_at FROM entities e "
+            "WHERE e.created_at < %s "
+            "  AND NOT EXISTS (SELECT 1 FROM edges x "
+            "                  WHERE x.src_id = e.id OR x.dst_id = e.id) "
+            "  AND NOT EXISTS (SELECT 1 FROM facts f "
+            "                  WHERE (f.entity_id = e.id OR f.object_entity_id = e.id "
+            "                         OR f.entity_norm = e.canonical) "
+            "                    AND f.superseded_at IS NULL) "
+            "  AND NOT EXISTS (SELECT 1 FROM lessons l "
+            "                  WHERE l.entity_id = e.id OR l.object_entity_id = e.id "
+            "                     OR l.entity_norm = e.canonical) "
+            "  AND NOT EXISTS (SELECT 1 FROM world_facts w "
+            "                  WHERE w.entity_norm = e.canonical "
+            "                    AND w.status = 'current') "
+            "  AND NOT EXISTS (SELECT 1 FROM entity_aliases a WHERE a.entity_id = e.id) "
+            "  AND NOT EXISTS (SELECT 1 FROM entity_sources s WHERE s.entity_id = e.id) "
+            "  AND NOT EXISTS (SELECT 1 FROM edge_proposals p "
+            "                  WHERE p.src_id = e.id OR p.dst_id = e.id) "
+            "  AND NOT EXISTS (SELECT 1 FROM entity_proposals q "
+            "                  WHERE q.entity_id = e.id OR q.into_id = e.id) "
+            "ORDER BY e.id", (cutoff,)).fetchall()
+        return [{"id": r[0], "display": r[1], "canonical": r[2],
+                 "created_at": r[3]} for r in rows]
 
     def set_entity_proposal_judgment(self, proposal_id: int, *,
                                      verdict: str, confidence: float | None,
@@ -2002,7 +2236,9 @@ class PostgresStorage:
         return cur.rowcount > 0
 
     def get_entity_proposal(self, proposal_id: int) -> dict | None:
-        cols = ("id", "kind", "entity_id", "into_id", "score", "reason", "status", "created_at")
+        cols = ("id", "kind", "entity_id", "into_id", "score", "reason", "status",
+                "created_at", "decided_by", "decided_at", "judge_verdict",
+                "judge_confidence", "judge2_verdict", "judge2_confidence")
         r = self.conn.execute(
             f"SELECT {', '.join(cols)} FROM entity_proposals WHERE id = %s", (proposal_id,)
         ).fetchone()
@@ -2100,6 +2336,80 @@ class PostgresStorage:
             "SELECT entry_id FROM memory_traces "
             "WHERE entity_norm = %s AND attribute_norm = %s ORDER BY entry_id",
             (entity_norm, attribute_norm)).fetchall()]
+
+    def traces_for_slots(self, slot_keys) -> dict[tuple[str, str], list[int]]:
+        """:meth:`traces_for_slot` for MANY slots in one round trip.
+
+        The per-slot form is right where the caller is already doing per-row
+        work (a cortex lookup, or one row of a top_k search page). ``recall``
+        is not that shape: it serves the facts of up to ``max_entities``
+        nodes at once, so the per-slot form would put an unbounded query
+        count on a single call. Keys are the normalized ``(entity,
+        attribute)`` pairs, unnested into a join rather than an ``IN`` list
+        of tuples so one plan serves any batch size.
+
+        Input keys are de-duplicated first: a repeated pair would join N×M
+        and hand the caller the same ``entry_id`` several times, which for
+        a caller that COUNTS the hits (the ``re_verify`` reason names how
+        many source memories moved) is a wrong answer rather than a slow
+        one."""
+        keys = list(dict.fromkeys((str(e), str(a)) for e, a in (slot_keys or [])))
+        if not keys:
+            return {}
+        out: dict[tuple[str, str], list[int]] = {}
+        for e, a, eid in self.conn.execute(
+                "SELECT t.entity_norm, t.attribute_norm, t.entry_id "
+                "FROM memory_traces t "
+                "JOIN unnest(%s::text[], %s::text[]) AS k(e, a) "
+                "  ON t.entity_norm = k.e AND t.attribute_norm = k.a "
+                "ORDER BY t.entity_norm, t.attribute_norm, t.entry_id",
+                ([k[0] for k in keys], [k[1] for k in keys])).fetchall():
+            out.setdefault((e, a), []).append(int(eid))
+        return out
+
+    def superseded_evidence(self, entry_ids) -> dict[int, float]:
+        """``{entry_id: superseded_at}`` for those of these entries that
+        carry a supersession mark.
+
+        The TIMESTAMP, not just the fact of it: the cross-index is keyed on
+        the SLOT, so it returns every entry that ever formed that slot
+        across its whole supersession history. A caller asking "is my
+        evidence still good?" has to compare WHEN the evidence was
+        retracted against when the standing value was last confirmed, or it
+        flags every slot that ever had a corrected contributor and never
+        stops.
+
+        Scoped to the ids asked about and served by the primary key, never a
+        full-table scan — the caller is a read surface annotating exactly
+        the source entries the facts it is serving cite (a handful on a
+        lookup, the whole cited set on a dump)."""
+        ids = [int(i) for i in (entry_ids or []) if i is not None]
+        if not ids:
+            return {}
+        return {int(r[0]): float(r[1]) for r in self.conn.execute(
+            "SELECT id, superseded_at FROM entries "
+            "WHERE id = ANY(%s) AND superseded_at IS NOT NULL",
+            (ids,)).fetchall()}
+
+    def slots_for_entries(self, entry_ids) -> list[dict]:
+        """The engram cross-index read in the RETRACT direction: given source
+        entries, every cortex slot they helped form.
+
+        :meth:`traces_for_slot` walks the same edge forwards. Correcting a
+        source memory needs it backwards — that is what scopes a repair to
+        the derivations that actually stood on the retracted evidence,
+        instead of leaving them current (arXiv 2608.10502) or resetting the
+        store. Served by ``memory_traces_entry_idx``.
+        """
+        ids = [int(i) for i in (entry_ids or []) if i is not None]
+        if not ids:
+            return []
+        cols = ("entity_norm", "attribute_norm", "entry_id")
+        return [dict(zip(cols, r)) for r in self.conn.execute(
+            "SELECT entity_norm, attribute_norm, entry_id FROM memory_traces "
+            "WHERE entry_id = ANY(%s) "
+            "ORDER BY entity_norm, attribute_norm, entry_id",
+            (ids,)).fetchall()]
 
     def upsert_entity_source(self, entity_id: int, source: str,
                              origin: str, now: float) -> None:

@@ -24,10 +24,15 @@ enforce it:
   verifies each listed helper is only ever reached with the lock held
   (directly, or via callers that are themselves always lock-held).
 
-Known, accepted blind spots (each latent — no such code in service.py
-today; noted so nobody mistakes a green run for proof against them):
-lambdas inherit the lock state of their definition site even if invoked
-later; a nested ``def`` resets to unlocked and flags under the inner
+Known, accepted blind spots (noted so nobody mistakes a green run for
+proof against them): lambdas inherit the lock state of their definition
+site even if invoked later — as of 2026-09-01 this shape EXISTS in
+``_persist_all`` (timing lambdas closing over ``self._storage``); it is
+safe there because ``_timed`` invokes them inline and ``_persist_all``
+is in ``CALLER_HOLDS_LOCK``, but a lambda whose invocation is DEFERRED
+past the lock would pass this guard unseen — treat any lambda that
+escapes its defining scope as unverified;
+a nested ``def`` resets to unlocked and flags under the inner
 name; allowlist matching is by bare function name; manual
 ``self._lock.acquire()``/``release()`` is not recognized as locking; the
 scan covers ``service.py`` plus the ``DreamOps`` mixin in
@@ -68,10 +73,23 @@ CALLER_HOLDS_LOCK = {
     "_link_lesson_graph",
     "_link_dream_relations",
     "_annotate_lesson_staleness",
+    # Retract traversal — read-time helpers over the engram cross-index,
+    # each reached only from an already-locked read surface (the fixpoint
+    # below is what actually verifies that).
+    "_superseded_evidence",
+    "_annotate_set_slot_evidence",
+    "_derived_from_entries_locked",
+    # Constraint pinning (schema v35) — cortex_search's per-fact dict builder
+    # and the TypeRetrieve pin step, both reached only from inside
+    # cortex_search's lock (the fixpoint verifies the callers).
+    "_scalar_fact_entry",
+    "_pin_constraint_facts",
     "_log_retrieval_event",
     "_record_retrieval_use",
     "_track_slot_reads",
     "_persist_episodes",
+    "_persist_tombstones",
+    "_persist_deferred_empty",
     "_load_infer_cursor",
     "_save_infer_cursor",
     "_pending_inference_candidates",
@@ -86,6 +104,16 @@ CALLER_HOLDS_LOCK = {
     "_auto_title_locked",
     "_resolve_or_create_entity",
     "_propose_write_dedup",
+    # 2026-09-02 deep-dream apply helpers: called inside deep_dream's
+    # locked apply block (analyzer duplicate filing, unreachable-orphan
+    # sweep).
+    "_file_analyzer_duplicates",
+    "_sweep_unreachable_orphans",
+    "_record_store_decision",
+    "_unreachable_orphans",
+    # Alias retry list for a slot miss (one storage probe for shadowed
+    # aliases) — reached only from cortex_lookup and chain(), both locked.
+    "_alias_retry_names",
     # These three pass self._storage as an argument to the sync helpers
     # rather than calling methods on it — invisible to the first walker,
     # surfaced by the argument-passing check.

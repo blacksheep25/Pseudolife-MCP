@@ -4,9 +4,15 @@ description: Run a judgment session over the Pseudolife memory bank — triage t
 Run a judgment session over the Pseudolife-MCP bank. The pipeline halves
 run themselves — the auto-sweep extracts facts through the configured
 extractor, and a need-based tick applies the deep dream's mechanical half
-(rescore, guarded junk deletes, scope stamping, proposal filing,
-snapshot-first). What cannot be automated is judgment: this command works
-the review queues that automation fills.
+(rescore, guarded junk deletes, scope stamping, proposal filing, analyzer
+duplicate filing, the unreachable-orphan sweep, snapshot-first). Since
+2026-09-02 the sweep also judges every queue itself (merge second opinion,
+link, junk, store-curation and candidate judges — each mode-gated, see
+`docs/runbooks/deep-dream.md` §0), so what this command meets is the
+residue: rows whose verdict sat below a gate, a `split` second opinion, a
+`low_differential` accept, a junk delete above the evidence bar. Every
+such row carries the judge's `judge` / `judge2` blocks — treat them as
+leads, read the evidence, and disagree freely.
 
 1. Call `memory_dream(action="status")` and read three things:
    - `deep_dream` — `{recommended, reason, new_entities, days_since}`:
@@ -90,14 +96,20 @@ the review queues that automation fills.
    - **A real thing that merely looks thin** — short, weakly-connected names
      are often legitimate ("Go", "uv"):
      `memory_graph_review(action="reject_entity", proposal_id=...)`.
-   - **Unsure**: leave it pending for the Atlas queue. Deletion is the one
-     irreversible verdict in this flow.
+   - **Unsure**: leave it pending for the Atlas queue. Junk deletion is the
+     one irreversible verdict in this flow — the step-1 snapshot is the
+     only undo (lesson/world forgets below are reversible; see step 6).
 6. Triage the returned `lesson_duplicates` / `world_duplicates` (cross-key
    near-duplicate slots in the lesson / world stores; listing-only — the
    dream never deletes them). Judge from the per-side values:
    - **Duplicate**: keep the better-keyed slot and drop the other via
      `memory_forget(scope="lesson"|"world", ...)`, folding anything the
-     dropped slot added into the survivor first.
+     dropped slot added into the survivor first. This now RETIRES the
+     slot rather than deleting it (row kept, `store_decisions` audit
+     row) — a wrong call is undoable with
+     `memory_graph_review(action="restore_slot", store="lesson"|"world",
+     src="<entity>|<attribute>")`, so lean toward acting rather than
+     leaving a genuine duplicate pending.
    - **Distinct**: `memory_graph_review(action="dismiss_slot_pair",
      store="lesson"|"world", src=<a_key>, dst=<b_key>)` so the pair
      never re-lists.

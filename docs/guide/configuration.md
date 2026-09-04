@@ -8,7 +8,7 @@ backups. Part of the [user guide](../../README.md#documentation).
 
 | Variable | Default | Effect |
 |----------|---------|--------|
-| `PSEUDOLIFE_MCP_DATABASE_URL` | _(unset → lite/file mode)_ | Postgres DSN; when set, PG is the source of truth (schema v34). Unset: with the `[lite]` extra installed the daemon auto-starts an embedded PostgreSQL and fills this in itself; otherwise v0.1 file-only mode (announced loudly at startup). |
+| `PSEUDOLIFE_MCP_DATABASE_URL` | _(unset → lite/file mode)_ | Postgres DSN; when set, PG is the source of truth (schema v37). Unset: with the `[lite]` extra installed the daemon auto-starts an embedded PostgreSQL and fills this in itself; otherwise v0.1 file-only mode (announced loudly at startup). |
 | `PSEUDOLIFE_MCP_STORAGE` | `auto` | `files` opts the daemon out of the `[lite]` embedded Postgres (file mode even when pg0-embedded is installed). Only consulted when no DSN is set. |
 | `PSEUDOLIFE_MCP_DAEMON_URL` | `http://127.0.0.1:8765` | Daemon the shim connects to (and auto-starts). |
 | `PSEUDOLIFE_MCP_NO_SPAWN` | _(unset)_ | Set `1` on the **shim** to disable its spawn-a-daemon fallback: when nothing answers at `PSEUDOLIFE_MCP_DAEMON_URL` it waits (up to ~3 min) for an external daemon instead. The Docker-tier installers set this on every shim registration — after a reboot the shim can probe before Docker Desktop has bound the port, and a spawned host fallback then wins the bind race and shadows the real bank with whatever stale local state it finds. Leave unset on pip/lite installs, where the spawn fallback is the intended zero-config path. |
@@ -138,6 +138,16 @@ dream-extractor variables (`PSEUDOLIFE_DREAM_*`) are covered in
   false-merge risk in mind. See
   [the single-writer cortex design](../specs/2026-06-19-single-writer-cortex-design.md)
   for the structural fix.
+- **Constraint pinning on** (`memory.cortex.pin_constraints = true`, schema
+  v35) — a fact whose `distortion_tolerance` is `constraint` is served
+  AHEAD of the cosine ranking, marked `pinned: true`, when it is in
+  scope: in `memory_search`'s cortex block when the query names the
+  fact's entity (separator-insensitive, word-bounded), in
+  `memory_recall` when the entity is a seed of the walk. A pin must still
+  clear the caller's `min_score` floor, pins take at most half of `top_k`
+  (best cosine first) so the ranked answer keeps the rest, and the
+  payload never grows. An unlabelled bank is served byte-identically
+  either way; set `false` for plain ranking.
 - **Slot read telemetry on** (`memory.cortex.read_tracking = true`, schema
   v33) — every cortex slot served as an answer (`memory_fact_get` and the
   cortex-first block of `memory_search`) bumps its `slot_reads` counter,
@@ -152,6 +162,17 @@ dream-extractor variables (`PSEUDOLIFE_DREAM_*`) are covered in
   distinct sessions (once ≥8 sessions are on record) — static-context
   ("promote to CLAUDE.md") candidates; vet against the cortex before
   promoting, since the log counts serves before the handler's fact-dedup.
+- **Engram cross-index on** (`memory.traces.enabled = true`, schema v13) —
+  the dream links each consolidated fact-slot to the dense episodes it came
+  from. Forwards, that link is where a fact came from: `memory_get`'s
+  `consolidated_into` / `source_entries`. Backwards, it powers two
+  read-time cautions: `re_verify` on served facts and `derived_flagged` on
+  `memory_supersede` (see [Memory model](memory-model.md#how-current-is-this-fact)).
+  Set `false` to silence both — the read surfaces stop paying for the
+  cross-index query but otherwise serve exactly as before.
+  `memory.traces.retention_boost` (default `0.0`) is the separate Phase-2
+  MTT-retention weight this same cross-index feeds; `0.0` is today's
+  eviction behavior unchanged.
 - **No HyDE / no reflection** — both rely on an LLM callback. Claude *is*
   the LLM, so the natural way to reflect is for Claude to call
   `memory_store` with a self-composed summary.
@@ -261,6 +282,25 @@ dream-extractor variables (`PSEUDOLIFE_DREAM_*`) are covered in
   experiments (neighbor expansion, a timeline channel) that measurably
   failed their gates and ship dormant; they remain settable for
   replication but there is no measured reason to enable them.
+- **Candidate pool at the served width**
+  (`memory.search.candidate_pool_multiplier = 1`,
+  `memory.search.fusion = "weighted_sum"`) — the
+  retrieve-then-rerank shape (a dense pool `top_k x multiplier` wide,
+  optionally merged by reciprocal rank fusion instead of raw-sorting
+  incommensurate channel scores) exists and is settable, and it **lost**
+  its judged run: on the LongMemEval knowledge-update oracle slice
+  (2026-09-04, n=78) multiplier 4 cost naive RAG 0.115 accuracy under
+  `rrf` and 0.077 under `weighted_sum`, while serving 36-54% more
+  context tokens on every arm that serves turns. Table, caveats and artifacts in
+  `evals/README.md` ("Judged verdict (2026-09-04)"). CAUTION if you
+  enable `rrf` anyway: it changes the SCALE of every served score to
+  ~0.016-0.05, so `memory.search_confidence_floor` must stay 0, and
+  `rrf` must not be combined with the cross-encoder reranker
+  (`memory.reranker.fusion_weight` collapses to cross-encoder-only
+  ordering, `memory.reranker.skip_margin` can never be reached) or with
+  a populated reference bank (its raw cosines are not rescaled and
+  outrank every memory once the reranker fires). Neither combination has
+  been measured.
 - **Staleness served as annotation** (`memory.search.stale_policy =
   "annotate"`) — stale records (past 2×TTL for their freshness class)
   carry `effective_confidence`/`stale` flags and nothing more, today's
@@ -280,6 +320,28 @@ dream-extractor variables (`PSEUDOLIFE_DREAM_*`) are covered in
   renders the record `value` field, so under `quarantine` a stale fact
   shows the wrapper there — a known P2 cost to weigh before ever
   flipping the default.
+
+- **Compact MCP payloads on** (`memory.mcp.compact_payloads = true`,
+  `memory.mcp.entry_text_chars = 600`) — the payload an MCP client reads
+  *back* from a tool call, shaped for its context window: a
+  `memory_search` hit's `text` is truncated to `entry_text_chars` and
+  marked `truncated: true` (`memory_get` returns the full text;
+  `superseded_by_text` is exempt from the cap — a compact entry carries no
+  id for the superseding entry, so a clipped correction could not be
+  recovered by any call); the cortex block serves `min(5, top_k)` facts,
+  so a narrow search stops paying for five;
+  and `memory_fact_get` serves the acting subset — value, kind/members,
+  confidence, origin, `asserted_at`/`age`, freshness, the currency and
+  label flags, `correct_with`, `source_entries`, `entity_ref`,
+  `contenders` — moving provenance, support, writer/session id, tx/valid
+  time and the supersession chain behind `verbose=True`. Measured on the
+  2026-09-04 agent token ledger (`evals/agent_token_ledger.py`, r3): a
+  default `top_k=8` search fell from 14,745 to 9,951 chars mean,
+  `memory_fact_get` from 2,175 to 1,296. These are PROJECTIONS above the
+  service layer — ranking, `min_score` and every benchmark number are
+  unaffected. Set `compact_payloads: false` to restore the pre-2026-09-04
+  payloads verbatim; raise `entry_text_chars` for long-form corpora where
+  the tail of a note carries the answer.
 
 ## Toolset tiers
 
@@ -597,7 +659,7 @@ one is the daemon's job.
 
 ## Schema version history
 
-The current Postgres meta version is **v34**; migrations are additive
+The current Postgres meta version is **v37**; migrations are additive
 `ADD COLUMN IF NOT EXISTS` on daemon start, and legacy file-mode `.pt`
 banks auto-migrate into Postgres. The one exception is v25 itself: a
 vector *dimension* change on an existing column is not additive, so
@@ -637,6 +699,9 @@ The milestones:
 | v32 | `retrieval_events.params` — the ranking knobs in force for the query (effective `top_k` / keep-threshold, the recency ramp, BM25 weight and scorer params, the reranker's fusion weight + margin gate and whether it actually fired, timeline/contiguity settings, and the call's filters), logged beside a widened `served` list whose per-entry `components` blob carries the fusion INPUTS: bi-encoder score, cross-encoder score (`null` when the margin gate skipped the pass — a distinction a learned head needs), BM25 boost, surprise, recency and the source/supersession multipliers. Phase 0 logged only the fused score, which is the output a Phase-1 learned head is supposed to predict; the inputs are not recoverable afterwards, because config is mutable at runtime and band recency, supersession flags and access counts all mutate on every serve. Nothing new is computed at serve time — these values were already in hand and were being discarded. `NULL` params = a v31-era row. Additive/idempotent |
 | v33 | `slot_reads` + `entries.explicit_reinforcements` — read telemetry. `slot_reads` counts how many times each cortex slot was *served as an answer* (`memory_fact_get` and `memory_search`'s cortex-first block), keyed on the stable `(entity_norm, attribute_norm)` slot like `memory_traces` so counters survive cortex snapshot saves; deliberately uncounted are internal verification lookups (e.g. the dream rollback's post-revert check) and the facts attached to `memory_recall`/`memory_graph` neighborhoods (context, not a direct answer), so never-read is a lower bound. `explicit_reinforcements` moves only on `memory_reinforce`, splitting the deliberate "this was useful" signal out of the shared `reinforcements` counter, which also counts dream-trace links (and still feeds the retention formula unchanged). Both feed the new `read_audit` section of `memory_stats` (never-read fractions by age and source, read/write balance, slot coverage) — motivated by the 2026-08-26 bank audit, where entry reads were measurable but the 4.6k fact slots had no read signal at all. Kill-switch: `memory.cortex.read_tracking`. Additive/idempotent |
 | v34 | `retrieval_events.served_facts` — the fact half of the reranker training tuple. The v31 event log recorded only served *entries*; the cortex-first block's facts, served above those entries in every `memory_search` response, were invisible to a future learned reranker. The search handler now attaches them (`[{entity_norm, attribute_norm, rank, score, kind, contested}]`) to the exact event row that search wrote, keyed by the event id `search(return_event_id=True)` hands back — no session-window guessing. `NULL` = a pre-v34 row or a search that served no facts. Also (no DDL): `memory_stats` `read_audit` gains `graduation_candidates` — entries served in ≥60% of the last 30 days' distinct sessions (once ≥8 sessions are on record), i.e. static-context ("promote to CLAUDE.md") candidates that retrieval keeps re-paying for per query. Additive/idempotent |
+| v35 | `entries.authority` / `entries.distortion_tolerance` and `facts.authority` / `facts.distortion_tolerance` — the write-time label pair (authority collapse, arXiv 2608.01679; the compaction cliff, arXiv 2608.22752). `authority` is the SPEECH ACT of the text (`directive` \| `observation` \| `quoted`), deliberately a separate axis from the `origin` tier (who wrote — which drives supersession arithmetic and which entries never persisted anyway); `distortion_tolerance` is the fidelity class (`constraint` \| `procedural` \| `belief` \| `preference` \| `episodic`). Set at write time — explicit `memory_store` / `memory_fact_set` parameters, or a deterministic heuristic under the `auto` default that asserts only `constraint` (rule-sized deontic/imperative text) and `quoted`/`directive` — and inherited through `memory_supersede` / `memory_consolidate` / fact supersession unless the new write restates one. Consumers: the dream carries a `constraint` source's text verbatim onto a derived fact and a post-dream guard reports any constraint entry left without a verbatim carrier (`constraint_verbatim` / `constraint_misses`); a `quoted` source is low-trust for the two-man rule; `constraint` facts are pinned ahead of cosine in `memory_search`'s cortex block and `memory_recall` (`memory.cortex.pin_constraints`). `NULL` = observation / unlabelled, exactly the pre-v35 reading, so the migration is a no-op on an existing bank — no backfill, by design. Additive/idempotent |
+| v36 | Review-queue autonomy (2026-09-02). `edge_proposals.judge_verdict` / `judge_confidence` / `judge_note` / `judge_model` / `judged_at` / `judge_relation` / `decided_by` / `decided_at` — the link judge's opinion on a pending link proposal (the retype verdict's corrected relation in `judge_relation`) and who settled the row; `entity_proposals.judge2_verdict` / `judge2_confidence` / `judge2_model` / `judged2_at` — the merge judge's SECOND opinion beside the v30 first one (two-vote agreement is the apply gate for rows the single-vote 0.8 reject gate leaves pending); and `curation_judgments` (`store`, sorted slot keys, verdict, keep, fold, confidence, note, model, judged_at) — the store-curation judge's memo, because the lesson/world duplicate listings are recomputed per pass and would otherwise be re-sent every sweep. `NULL` judge columns = not yet judged, exactly the pre-v36 behaviour, so the migration is a no-op on existing banks. Gates measured by `evals/queue_judge_ladder.py` against `evals/results/queue-judge-panel-20260902.json`. Additive/idempotent |
+| v37 | Retire-not-delete (2026-09-03). `store_decisions` (`id`, `store`, `entity_norm`, `attribute_norm`, `action`, `decided_by`, `reason`, `record` JSONB, `decided_at`) — the FK-free audit of lesson/world forgets and restores. A `memory_forget(scope="lesson"\|"world")` now retires the slot's rows (`status='retired'`, rows kept; `memory.compaction` treats them like any non-live record) instead of deleting them, and the audit row carries the verbatim record so `lesson_restore` / `world_restore` (`memory_graph_review(action="restore_slot")`, `POST /api/lessons/restore`, `POST /api/world/restore`) still work after compaction has purged the retired row. Also (no DDL): merge and junk rejects write text-keyed tombstones to `dismissed_pairs` (canonical pair / `junk:<canonical>` self-pair) so a verdict outlives the CASCADE-deleted proposal row. No column changes; the table starts empty on an existing bank, so the migration is a no-op there. Additive/idempotent |
 
 The customized RE Hub build adds a separate **`v34-rehub` extension schema**:
 `re_evidence_artifacts`, `re_claims`, and `re_claim_evidence`. Its version is

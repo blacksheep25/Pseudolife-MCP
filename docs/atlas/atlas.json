@@ -1,9 +1,9 @@
 {
  "meta": {
   "title": "PseudoLife-MCP System Atlas",
-  "version": "0.14.0",
-  "schema": 34,
-  "verified": "2026-08-25"
+  "version": "0.15.0",
+  "schema": 37,
+  "verified": "2026-09-03"
  },
  "groups": {
   "clients": {
@@ -243,6 +243,19 @@
    "d": [
     "Superseded by daemon-owned session episodes (2026-06-30)",
     "install-hook strips it from old installs; still shipped for compat"
+   ]
+  },
+  {
+   "id": "transfer",
+   "g": "transport",
+   "x": 330,
+   "y": 560,
+   "t": "transfer_cli.py",
+   "s": "pseudolife-mcp export / import · logical bank transfer",
+   "p": "pseudolife_memory/transfer_cli.py",
+   "d": [
+    "ZIP of JSONL (one per table) + manifest — decoupled from Postgres major version and deployment tier, unlike pg_dump's physical backup",
+    "Export is a live-safe REPEATABLE READ snapshot; import fills a fresh bank only, inside one transaction, ids/HLC/embeddings verbatim"
    ]
   },
   {
@@ -552,7 +565,7 @@
    "p": "pseudolife_memory/memory/episodes.py",
    "d": [
     "open_leaf_for(session_key): concurrent sessions never clobber each other",
-    "Daemon-owned lazy open; the idle reaper closes / prunes-if-empty",
+    "Daemon-owned lazy open; the idle reaper closes; empty roots are kept for the resume window, then swept to a tombstone (handle recreates)",
     "stamp() fills episode_id / title on every stored entry"
    ]
   },
@@ -580,7 +593,9 @@
    "d": [
     "Seed entities → depth-1 graph expansion per hop, re-query each hop",
     "Hub-gating avoids degree blowup; Mechanical or LLM controllers",
-    "Promoted from an evals harness into the memory_recall tool"
+    "Promoted from an evals harness into the memory_recall tool",
+    "v35: a seed entity's constraint facts are pinned first (survive the per-entity fact cap); hop-discovered entities are context, not scope",
+    "2026-09-04: search fan-out capped (max_searches_per_hop / max_total_searches / time_budget_seconds); the hub gate bounds EXPANSION, these bound SEARCH"
    ]
   },
   {
@@ -596,6 +611,7 @@
     "Provenance tiers user > action > agent, + contender parking on conflict",
     "dedup_siblings: paraphrase-cluster merge via union-find",
     "Per-fact freshness_class (v23) · set-valued slots (v26) · epistemic stance (v29, latest-asserting-write, never a ranking input) · asserted_at/age on recall",
+    "v35 label pair: authority (speech act — directive/observation/quoted, a separate axis from the origin TIER) + distortion_tolerance (constraint…episodic); inherit-unless-restated via _pick (INHERIT sentinel, None clears); constraint is the ONE label ranking reads (cortex_search._pin_constraint_facts, recall seeds)",
     "Aggregate-total guard on member adds; cortex_search groups sets, opt-in BM25 fusion ships off (0.12)"
    ]
   },
@@ -654,6 +670,19 @@
    ]
   },
   {
+   "id": "labels",
+   "g": "engine",
+   "x": 1420,
+   "y": 1170,
+   "t": "labels.py",
+   "s": "write-time authority + distortion_tolerance (v35)",
+   "p": "pseudolife_memory/memory/labels.py",
+   "d": [
+    "Deterministic form heuristic, never a model call: authority (directive/observation/quoted) is orthogonal to the origin TIER; distortion_tolerance (constraint…episodic) says how exactly a claim must survive consolidation",
+    "Measured on the live bank (2026-09-03): fires on 86 of 5,435 current facts, 73 judged genuine (0.85 precision) — evals/label_heuristic_audit.py"
+   ]
+  },
+  {
    "id": "configN",
    "g": "engine",
    "x": 1160,
@@ -682,7 +711,10 @@
     "run_sweep_once: compaction every tick; dream on backlog + quiescence",
     "Claim op:add/remove routes to set members; op prompt block shipped 2026-08-01 (v5, count-exclusion repaired the KU-negative v0)",
     "Write gates: literal_violations (digit fidelity, enforce) · span_unbacked (quote-vs-cited-note containment, ships off) — fidelity checks, never trust checks",
-    "run_sweep_once also rides: need-based deep tick + autonomous Step-C judge (judge_merges, shadow/auto-reject, v30)"
+    "run_sweep_once also rides: need-based deep tick + autonomous Step-C judge (judge_merges, shadow/auto-reject, v30)",
+    "v35 TypeCompact: a constraint-labelled source's text is carried verbatim onto a derived scalar claim (_apply_constraint_carrier); post-dream guard reports constraint entries with no verbatim carrier (constraint_misses — flag, cursor advances); derived facts take the SOURCE entry's labels, never extractor output; quoted sources are low-trust for the two-man rule",
+    "Review-queue judges (2026-09-02): judge_links · judge_junk · judge_candidates · judge_slot_pairs share the merge judge's transport; run_sweep_once runs each as a bounded, mode-gated batch",
+    "Retire-not-delete (2026-09-03): the curation judge's auto forget retires the losing slot through lesson_forget/world_forget (store_decisions audit, lesson_restore/world_restore undo); merge and junk rejects write text-keyed tombstones to dismissed_pairs; the merge judge builds evidence at judge_snippet_max_chars (default 240 — the 2026-09-03 full-length ladder measured 3000 as no better) and stamps it on each proposal"
    ]
   },
   {
@@ -696,7 +728,8 @@
    "d": [
     "Step A self-clean: rescore edges, hard violations, exact duplicates",
     "Step B semantic candidates from mention-centroid vectors",
-    "junk_name_reason write-gate blocks garbage entity names"
+    "junk_name_reason write-gate blocks garbage entity names",
+    "Detector precision fixes (2026-09-02): slot-key spares code symbols / version dots; slash compounds must be spaced"
    ]
   },
   {
@@ -827,12 +860,12 @@
    "x": 1760,
    "y": 730,
    "t": "storage/schema.py",
-   "s": "DDL · SCHEMA_META_VERSION 32",
+   "s": "DDL · SCHEMA_META_VERSION 37",
    "p": "pseudolife_memory/storage/schema.py",
    "d": [
     "pgvector required; Apache AGE fully removed",
-    "entries(vector 1024) · facts · world_facts · lessons · entities/edges · episodes · memory_traces · communities · outcome_signals · entity_kinds · dream_runs/dream_run_slots · chronicle_events · retrieval_events/retrieval_uses · slot_reads · optional RE evidence/claims",
-    "Additive migrations: v23 fact freshness_class · v24 entity_kinds · v25 1024-d re-embed · v26 set-valued slots · v27 dream-run pre-image journal · v28 chronicle events (dated occurrences, additive-only) · v29 fact stance (labelled hedge field, NULL = plain) · v30 merge-proposal judge verdict (five nullable entity_proposals.judge_* columns, an opinion until a decision path ratifies it) · v31 retrieval event log (retrieval_events/retrieval_uses append-only query/served/used tuples for a future learned reranker; observational only) · v32 retrieval-log ranking params + per-entry fusion components (nullable retrieval_events.params JSONB; NULL = a v31-era row) · v33 read telemetry (slot_reads per-slot serve counters, slot-keyed so cortex snapshots don't reset them; entries.explicit_reinforcements splits deliberate reinforces from dream-trace links; feeds memory_stats read_audit) · v34 served facts on the retrieval log (nullable retrieval_events.served_facts JSONB — the cortex-first block's slots attached to the exact event row by returned id, completing the reranker training tuple; read_audit gains graduation_candidates, no DDL)",
+    "entries(vector 1024) · facts · world_facts · lessons · entities/edges · episodes · memory_traces · communities · outcome_signals · entity_kinds · dream_runs/dream_run_slots · chronicle_events · retrieval_events/retrieval_uses · slot_reads · curation_judgments · store_decisions · optional RE evidence/claims",
+    "Additive migrations: v23 fact freshness_class · v24 entity_kinds · v25 1024-d re-embed · v26 set-valued slots · v27 dream-run pre-image journal · v28 chronicle events (dated occurrences, additive-only) · v29 fact stance (labelled hedge field, NULL = plain) · v30 merge-proposal judge verdict (five nullable entity_proposals.judge_* columns, an opinion until a decision path ratifies it) · v31 retrieval event log (retrieval_events/retrieval_uses append-only query/served/used tuples for a future learned reranker; observational only) · v32 retrieval-log ranking params + per-entry fusion components (nullable retrieval_events.params JSONB; NULL = a v31-era row) · v33 read telemetry (slot_reads per-slot serve counters, slot-keyed so cortex snapshots don't reset them; entries.explicit_reinforcements splits deliberate reinforces from dream-trace links; feeds memory_stats read_audit) · v34 served facts on the retrieval log (nullable retrieval_events.served_facts JSONB — the cortex-first block's slots attached to the exact event row by returned id, completing the reranker training tuple; read_audit gains graduation_candidates, no DDL) · v35 write-time label pair (nullable entries/facts.authority + distortion_tolerance — the source's speech act and fidelity class, inherit-unless-restated through supersession; constraint facts pinned ahead of cosine in recall and carried verbatim through the dream; NULL = pre-v35 reading, no backfill) · v36 review-queue judges (link-judge verdict + decided_by on edge_proposals, merge second opinion judge2_* on entity_proposals, curation_judgments memo) · v37 store_decisions (FK-free retire/restore audit for lessons + world: forgets retire rows with the verbatim record instead of deleting them; restore falls back to the snapshot after compaction)",
     "Independent extension: v34-rehub adds immutable build/address evidence plus evidence-gated claims without consuming an upstream integer schema version",
     "One-current-row-per-slot partial unique indexes"
    ]

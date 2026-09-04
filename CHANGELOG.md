@@ -57,6 +57,1587 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   search and status filters, immutable hashes, structured addresses, source
   paths, and evidence links without copying proof records into ordinary
   memory, cortex, the graph, or dream consolidation.
+### Added (2026-09-04 — accuracy and context cost as one trade-off, not two findings)
+- **Every memory-vs-RAG comparison this project has published scored a
+  ~100-token fact context against a ~1,200-token raw-turn context and reported
+  the two gaps separately**, so nobody could say what plain RAG scores at the
+  fact spine's token budget. Two new bench knobs serve exactly that
+  comparator: `--rag-lite-top-k 1,2` adds arms `rag1`/`rag2` (the rag control's
+  own ranking truncated to the first K turns) and `--rag-budget-tokens N` adds
+  `ragb<N>` (truncated to the turns that fit N approximate tokens, so a run can
+  match a fact-spine budget exactly rather than by turn count). Both live in
+  `build_contexts`, which the LongMemEval bench and the BEAM adapter both call,
+  so the harnesses cannot serve them differently; each arm is a strict prefix
+  of the rag context by construction and a width at or above the control's is
+  rejected. Off by default: no new context keys, not one extra model call,
+  every prior artifact byte-identical.
+- **The BEAM adapter now records `{arm}_context_tokens` on every row** and
+  reports a `context_tokens` mean per arm and per question type. Until now BEAM
+  recorded characters only, which left every accuracy-vs-cost read on that
+  benchmark to be eyeballed across two artifacts.
+  `evals/beam_within_run_pairs.py` carries `context_tokens_mean` beside
+  `context_chars_mean` (the committed `chip12-b16` pairing artifact was
+  regenerated to add the column — every pre-existing value is unchanged; its
+  rag control served 5,539 tokens/question against the cortex arm's 551).
+  `report()` also discovers knob-minted arms from the rows, so a run no longer
+  reports fewer arms than it answered.
+- **`evals/rag_lite_rebuild.py`** adds these arms to an already-extracted
+  LongMemEval run without re-paying extraction. Neither existing path can:
+  `--phase answer` only answers already-persisted context keys, and
+  `rebuild_contexts.py` copies the rag context verbatim while the fact-bank
+  dumps hold no turn list. The rebuild re-ingests the static haystack on the
+  CPU, re-runs the control's pinned search, and refuses to write unless the
+  re-derived rag context matches the judged one byte for byte. `--slug ku|all`
+  points both the source and the destination at the 78-question
+  knowledge-update family or the 500-question six-type one (this replaced an
+  untested wrapper module that monkeypatched the bench's `out_file` globally);
+  `--limit N` stamps `partial: true` on every row it writes and counts against
+  the limited slice, and the bench's `--report` carries that stamp into the
+  summary as `partial: true`, so neither the short file nor the summary a
+  reader quotes from it can be mistaken for a complete run. Each question's
+  scratch bank is now removed after its re-derivation instead of being left
+  behind (a 500-row rebuild leaked 500 temp directories).
+  Used once under `--slug all`, it **refused on row 1** of `alltypes-0803` —
+  the retrieval stack has moved since that run, so arms rebuilt onto it would
+  have measured drift rather than budget, which is why the 500-question run
+  below is a fresh extraction.
+- **Three runs executed, and the token-matched answer is not the one the
+  budget flag promised.** Procedure, per-arm tables and caveats:
+  `docs/runbooks/raglite-runs-20260904.md`.
+  - `longmemeval-ku-oracle-qwen-27b-raglite-v38` (78 knowledge-update
+    questions, rebuilt onto `ceiling-v38`, all arms re-judged in one pass):
+    rag 0.859 @ 1184.1 tokens, hybrid 0.846 @ 731.3, cascade 0.846 @ 389.4,
+    cortex 0.667 @ 96.7, rag2 0.551 @ 429.7, ragb400 0.500 @ 309.0,
+    ragb100 0.333 @ 219.2, rag1 0.321 @ 217.1. The carried-over rag/cortex/
+    hybrid arms re-scored their `ceiling-v38` values exactly, which is the
+    reproducible-server check passing.
+  - `beam-100K-qwen-27b-raglite-smoke` (BEAM 100K, 2 chats, 40 rows — the
+    first BEAM run carrying token costs at all): hybrid 0.5629 @ 3635 tokens,
+    rag 0.4462 @ 3158, rag2 0.3396 @ 1188, cortex 0.2956 @ 468, rag1 0.2750 @
+    496, ragb600 0.2600 @ 584. A smoke, not a verdict.
+  - `longmemeval-all-oracle-qwen-27b-raglite-all-fresh` (**the whole
+    benchmark**: fresh extraction, all six question types, 500 questions,
+    arms rag/rag1/rag2/ragb400/cortex/hybrid + derived cascade; 07:33–11:42 on
+    2026-09-04, ~30 s/question): hybrid 0.730 @ 1229.3 tokens, cascade 0.692 @
+    843.7, rag 0.690 @ 1124.2, ragb400 0.460 @ 312.3, rag2 0.458 @ 432.5,
+    rag1 0.316 @ 206.3, cortex 0.310 @ 96.5. Paired against the rag control
+    over all 500 rows (10k sign-flip permutations, seed 0): hybrid **+0.040**
+    ± 0.031 (p 0.015, 41W/21L), cascade +0.002 ± 0.022, ragb400 −0.230 ±
+    0.041, rag2 −0.232 ± 0.042, rag1 −0.374 ± 0.045, cortex −0.380 ± 0.048.
+    `ragb100` was **dropped from this run**: Run A showed it serving a mean
+    219.2 tokens against its 100-token name and producing a byte-identical
+    context to `rag1` on 74 of 78 rows, so judging it over 500 questions would
+    have bought a duplicate of the `rag1` column for a full extra arm-pass.
+- **The budget arm cannot reach a ~97-token budget on LongMemEval, and now
+  says so.** Truncation is turn-granular and the arm always serves at least
+  one turn (an arm that can serve empty is a second no-memory control), while
+  one raw LongMemEval turn is already ~200 approximate tokens. So `ragb100`
+  overshot on 36 of 78 rows and `ragb400` on 98 of 500, and the honest
+  token-matched pair on this dataset is **cortex @ ~97 tokens vs one-turn RAG
+  @ ~210–220** — where the two are indistinguishable: cortex − rag1 =
+  **−0.006 ± 0.049, p 0.87** over the 500 questions. `rag_lite_contexts` now
+  warns the first time a served block exceeds its budget in a run, both
+  harnesses' summaries carry `budget_overshoot_rows` per `ragb<N>` arm, and
+  `validate_rag_lite`'s docstring records why the budget path has no
+  near-duplicate guard (what a token budget resolves to is a property of the
+  data, not of the flag).
+- **`evals/beam_within_run_pairs.py` is harness-agnostic**, so a LongMemEval
+  within-run pairing no longer needs an inline script: `--score-key
+  correct|score` (booleans read as 1.0/0.0), `--type-key
+  type|question_type`, `--prefix`, `--pairs left:right` for arm-vs-arm
+  comparisons, and a derived `cascade` arm computed through
+  `replicate.cascade_correct` / `cascade_context_tokens`. The BEAM CLI,
+  defaults and committed artifacts are unchanged and still pinned byte-exact.
+  The 500-question pairing artifact
+  (`…raglite-all-fresh.arms-vs-rag.json`) had been written by an inline
+  script with no committed producer — the one case where regenerating a
+  canonical result file is the fix rather than the failure — and was
+  regenerated by the tool under the same filename: every delta, CI,
+  permutation p and W/L reproduced exactly, with a token column and the
+  BEAM schema added. It is now pinned by a byte-exact regeneration test.
+- **The three judged runs were answered before `budget_overshoot_rows`
+  existed, so the docs pointed at a field no committed summary carried.**
+  All three summaries were regenerated through the harnesses' own `--report`
+  path — pure re-parsing of the committed rows, no model calls — and the
+  field is now present where the docs say it is (36/78 and 17/78 on
+  `raglite-v38`, 98/500 on `raglite-all-fresh`, 12/40 on `raglite-smoke`).
+  Every other value in all three files is byte-identical. The 500-question
+  pairing artifact's `note` also claimed the summary excluded the 25
+  gold-leak rows; it does not — the leak-free means are the summary's
+  separate `leak_check` block, and `evals/README.md` now states them
+  (rag 0.6947, hybrid 0.7326, cortex 0.3158 over the 475 unleaked rows)
+  beside the all-500 headline they are not.
+
+
+### Changed (2026-09-04 — the abstention headline is bounded by the no-memory floor)
+- **README and `evals/README.md` presented BEAM-100K abstention (fact
+  spine 0.950 vs naive RAG 0.775) as "the one decisive win".** The
+  budget-matched five-arm run of 2026-09-02
+  (`evals/results/beam-100K-qwen-27b-chip12-b16.summary.json`, committed
+  with PR #249 but never read into the docs) scores the no-memory arm at 1.000
+  on the same 40 questions: refusing is the correct answer there and an
+  empty context always refuses. Both sites now state the number as a
+  calibration property with the floor beside it, and the comparator-arms
+  section of `evals/README.md` — which still said the ReFind and no-memory
+  arms were "smoke-run only" — carries the full-tier five-arm table. The
+  paired column of that table is a new committed artifact
+  (`…chip12-b16.arms-vs-rag.json`) written by `evals/beam_within_run_pairs.py`
+  and pinned by a regeneration test. Docs, one eval script and evidence
+  pins only; no engine change.
+### Changed (2026-09-04 — measure what the AGENT pays, then cut it)
+- **Every "fewer tokens" number this project has published measures served
+  *benchmark* context — the passage an answerer model reads — and nothing
+  had ever measured what an MCP client reads back from a tool call and pays
+  for on every call.** New `evals/agent_token_ledger.py` measures it:
+  the per-tier tool manifest, the served session-start block, and the
+  `memory_search` / `memory_fact_get` / `memory_recall` response payloads
+  for 15 fixed dev-session queries against a live bank. Raw payloads are
+  read once from the daemon's GET-only REST and projected offline through
+  the MCP layer's own helpers, so before/after is exactly paired. (GET-only
+  is not side-effect free — `/api/search` appends `retrieval_events` rows
+  and touches access counters — but no bank content is written.) Artifact:
+  `evals/results/agent-token-ledger-20260904-r3.json` (1,316-entry bank,
+  `preset: flat`, 0 of 5,509 current facts label-bearing, which is the
+  validity condition for the `top_k=3` arm and is now counted per run);
+  the two pre-review runs (`agent-token-ledger-20260904.json` and
+  `...-r2.json`) stay committed as records and are cited by nothing. Every published cell is pinned in
+  `tests/test_eval_evidence.py`; the section is
+  `evals/README.md` → "Agent-side token ledger".
+  - What a session pays before asking anything: manifest **7,015 chars
+    (~1,753 tok) minimal / 14,076 core / 22,719 full**, plus **7,492 chars
+    (~1,873 tok)** of served session-start block (raw text, as the hook
+    writes it — not the JSON encoding the payload cells count).
+  - What one `memory_search` cost at the default `top_k=8`: **14,745 chars
+    mean** (median 15,325, p90 18,886), of which entry `text` alone was
+    **64%**.
+  - `memory_fact_get` on the five widest slots: **2,175 chars mean**.
+  - Not fixed, and the largest finding: a 3-hop `memory_recall` issues
+    **35 `service.search` calls on average, up to 66** on one question.
+    The response is already capped; the call amplification is untouched.
+- **Three payload cuts, behind one knob (`memory.mcp.compact_payloads`,
+  default on; `False` restores the previous payloads verbatim).** Console
+  knobs registered under a new "MCP payloads" group.
+  - `memory_search` entry `text` is truncated to
+    `memory.mcp.entry_text_chars` (default 600) with a `truncated: true`
+    marker, and the tool description points at `memory_get` for the whole
+    text — the shape `memory_recall` has used for its supporting texts
+    since 2026-07-10. `superseded_by_text` is **exempt** — see the
+    correction below. Mean payload **14,745 → 9,951 chars (−33%)**; entry
+    text 9,464 → 4,550.
+  - The cortex block follows the caller: `min(5, top_k)` facts instead of
+    a hardcoded 5. Inert at the default `top_k=8`; at `top_k=3` the block
+    goes 1,853 → 1,107 chars and the whole call 6,870 → 4,290 (−38%).
+    The narrowing is passed *into* `cortex_search` rather than sliced off
+    its output, so constraint pinning re-budgets with it and pinned facts
+    stay at the head.
+  - `memory_fact_get` serves the acting subset by default — entity,
+    attribute, value, kind/members, confidence, origin, asserted_at/age,
+    freshness_class, stale, the currency and label flags, `correct_with`,
+    `source_entries`, `entity_ref`, `contenders` — and moves provenance,
+    support, writer/session id, tx/valid time, polarity, status and the
+    supersession chain behind a new `verbose=True`. **2,175 → 1,296 chars
+    mean (−40%)**, 25 keys down to 12-13. The served-absent-when-default
+    rule (PR #245) holds: the keys that remain are byte-identical.
+    `source_entries` is kept on purpose — it is the only handle from a
+    fact back to the episodes that formed it, and the poisoned-memory
+    procedure in `docs/guide/security-posture.md`, `memory_get`'s
+    core-tier justification and
+    `test_release_ux.py::test_core_tier_can_close_its_own_loops` all read
+    it from the DEFAULT record.
+- **No ranking, `min_score` or service behaviour changed.** All three cuts
+  are projections in `mcp_server.py`, above `service.*`; the eval harness
+  calls the service directly and cannot see them — pinned by
+  `tests/test_agent_payload_budget.py::test_eval_harness_does_not_read_the_mcp_projection`,
+  which allows exactly two exceptions (this ledger and the existing
+  `recall_cap_probe.py`, both payload probes). No eval number moves, so
+  `regression_gate.ps1` was not run.
+- `memory_search`'s cortex-first block moved out of the tool body into the
+  pure `mcp_server._project_search`, so the ledger can reproduce the served
+  shape from raw service output without a live service and without a second
+  copy to drift. Behaviour-preserving, pinned byte-identical against a
+  pre-refactor snapshot by
+  `tests/test_agent_payload_budget.py::test_legacy_payloads_survive_the_projection_refactor`.
+- **The served session-start block was describing the old search shape.** It
+  told every session that results come back as `{id, text, source, tags,
+  score}` — an enumeration that went stale the moment entry `text` started
+  arriving clipped — so it now names the thing an agent has to act on
+  instead: "Long hits are clipped (`truncated: true` → `memory_get`)". Both
+  copies (`pseudolife_memory/web/session_hook.py` and the byte-identical
+  twin `examples/CLAUDE.memory.md`) move together; the block is 7,492 raw
+  chars against the 7,500 cap, so the replacement is length-neutral by
+  construction.
+- **`superseded_by_text` is served whole, never clipped** — and the
+  headline above is 33%, not the 41% the r2 run measured, because of it.
+  The first cut capped that field on the same terms as the entry's own
+  text, on the reasoning that it is read as an answer and so costs like
+  one. It is not recoverable like one: a compact entry carries no id for
+  the superseding entry and nothing stores a pointer to one, so
+  `memory_get(entry.id)` returns the *superseded* text rather than the
+  replacement, and a clipped correction cannot be retrieved by any tool
+  call in any tier. Three surfaces instruct agents to prefer that field
+  over the entry's own text (the served session-start block,
+  `examples/CLAUDE.memory.md`, `memory_search`'s description), and the r2
+  artifact measured 13 of 15 `top_k=8` queries clipping at least one
+  (2,406 → 1,199 chars mean). **The −41% and the entries-block figures the
+  PR first published priced that truncated payload and were retired before
+  merge**; every number in this entry is re-measured from r3 against the
+  shipped behaviour. `truncated: true` now means exactly one thing: this
+  entry's own `text` was clipped and `memory_get` returns it whole.
+- The ledger's `safe_label` redactor now covers **machine names** as well
+  as home paths, emails, IPs and credentials. A bank holds facts *about*
+  the machine it runs on, so a slot label can be a bare hostname with
+  nothing else in it to catch — and one reached a committed artifact,
+  which a public tree must never carry (CLAUDE.md). The redactor matches
+  every name this machine answers to (`socket.gethostname` plus
+  `COMPUTERNAME` / `HOSTNAME`), separator-insensitively, and the leaked
+  label in the r2 artifact was redacted in place. Guarded by
+  `tests/test_agent_payload_budget.py`, which checks every committed
+  ledger artifact against the running machine's own names.
+- The published payload breakdown names `superseded_by_text` as its own
+  row. It is a sixth of the "before" payload, and the r2 breakdown left
+  those ~2,400 chars unlabelled between the entries-block total and text +
+  metadata.
+- `agent_token_ledger.py` reads `entry_text_chars` and the cortex width
+  from `utils.config.McpConfig` instead of restating `600` and
+  `min(5, top_k)`, and writes what it used into the artifact's `config`
+  block, so changing a default re-prices the run rather than silently
+  desynchronising the published numbers from the shipped behaviour. Its
+  `fact_get` caveats now disclose that the arm prices the record and not
+  the call: the "before" is the `/api/facts` dump row (which carries an
+  `entity_id` the served record never has) and neither arm includes the
+  tool envelope, `contenders` or `correct_with`.
+- `agent_token_ledger.py` refuses to overwrite an existing `--out` unless
+  `--force` is passed. Its default path is dated, not run-tagged, so a
+  same-day rerun used to silently rewrite the canonical artifact — the exact
+  failure CLAUDE.md records from 2026-07-21. It also counts the label census
+  the `top_k=3` arm's validity rests on (`bank.facts_labelled` /
+  `facts_current` / `facts_dump_truncated`) instead of leaving it a
+  hand-checked sentence, and picks its five widest slots from the whole
+  cortex rather than the first 2,000 rows of the fact dump.
+### Fixed (2026-09-04 — pre-merge review of the retrieval-replay branch)
+- **A machine hostname reached a public artifact.** `graph-ablation-20260904.json`
+  published a homelab hostname carrying the maintainer name as a top-degree
+  entity name: the redactor emits a name only when it also occurs in the
+  tracked tree, and the tree already carried that hostname inside
+  `evals/data/judge_eval_20260816.json`, a judge-eval fixture built from real
+  bank memories — so the check vouched for it. The entity is redacted to `<redacted>` in the artifact (recorded there as
+  `redaction_note`; no measured field changed), the fixture that vouched for it
+  is scrubbed of that hostname and of the workstation name beside it, and both
+  shapes are now needles in `test_tracked_tree_carries_no_maintainer_identifiers`. The redactor's `git
+  grep` seam gets its first test that actually runs it, against a throwaway
+  repo, so "did the check pass it, or was it never run?" is answerable.
+- **The replay latency table misquoted its own artifact** — it published
+  medians of 0.234 / 0.101 / 0.394 s where `retrieval-replay-20260904.json`
+  records 0.305 / 0.140 / 0.694 s, and the BM25 cost derived from them
+  (~130 ms) becomes ~165 ms. MRR and hit@1 were pinned to the artifact; the
+  latency column was not, so nothing contradicted it. All three medians now
+  carry Claim rows.
+- **`memory_recall`'s per-call cost was published as "~2.5 minutes"** in
+  `evals/README.md` and in `graph_ablation.py`'s comment; the artifact's
+  per-question wall times are a mean of 32.4 s (relational) / 44.3 s (logged)
+  with a 73.0 s worst case. Both means and the max are now pinned.
+- **`guard_dsn` matched only lower-case URI DSNs** in all three harnesses, so
+  `dbname=pseudolife_memory`, a trailing slash, and an upper-cased name each
+  walked through onto the live bank. It now compares case-insensitively and
+  parses the keyword form too.
+
+
+### Added (2026-09-04 — offline retrieval replay and graph ablation harnesses; eval-only)
+- **`evals/retrieval_telemetry_review.py`, `evals/retrieval_replay.py` and
+  `evals/graph_ablation.py`** — three read-only harnesses over a restored
+  copy of a bank, answering "does the learned reranker have training signal
+  yet?", "what do the shipped ranking knobs do on the queries agents really
+  asked?", and "does `memory_recall`'s graph expansion earn its cost?".
+  All three refuse to run against `pseudolife_memory` or
+  `pseudolife_memory_bench` and emit aggregates only (entity names pass a
+  tracked-tree check first; no query or entry text). The two that search
+  (`retrieval_replay.py`, `graph_ablation.py`) additionally force CPU and
+  disable the retrieval log, so a replay cannot append to the log it is
+  replaying; `retrieval_telemetry_review.py` is plain SQL over the log
+  tables and never loads a model or touches the search path.
+  No shipped code path changes. Artifacts:
+  `evals/results/retrieval-telemetry-review-20260904.json`,
+  `retrieval-replay-20260904.json`, `graph-ablation-20260904.json`.
+### Changed (2026-09-04 — `memory_recall` costs a bounded number of searches)
+- **A 3-hop `memory_recall` could issue hundreds of searches and take over a
+  minute**, because the walk re-queried every newly discovered entity on every
+  hop and this graph is a star (5,504 entities, degree p50 1 / p95 5 / max
+  132) — so one hub's ring set the price of the whole call. Two live recall
+  calls timed out at the MCP layer on the morning of 2026-09-04. The walk now
+  spends a bounded search budget:
+  - `memory.recall.max_searches_per_hop` (default 6, above the graph's degree
+    p95 of 5): per hop, re-query only the top N newly discovered entities —
+    ranked by mentions in the seed search hits, then by lowest degree, then by
+    name. The rest are still returned as entities with their facts; only the
+    extra search is dropped.
+  - `memory.recall.max_total_searches` (default 31) and
+    `memory.recall.time_budget_seconds` (default 20.0): hard ceilings over the
+    whole call, seed search included. Reaching either stops the walk and the
+    response carries `truncated: true` and `searches_issued: N` — it never
+    raises, so a slow neighborhood degrades instead of timing out. Both fields
+    are served only when a ceiling actually bound, so an untruncated response
+    is byte-identical to the pre-cap one (pinned in `tests/test_recall.py`
+    against the response captured verbatim at 7595ce6f). 31 is a genuine
+    backstop rather than a working limit: `hops` is clamped to 1..5 and the
+    per-hop cap can spend at most 1 + 6 x 5 = 31, so no request the tool
+    accepts is cut by the ceiling — only a raised `max_searches_per_hop`
+    reaches it. (The measured run below used the first-cut default of 20 at
+    `hops=3`, where a full walk costs at most 19 and the ceiling never fired,
+    so raising it to 31 leaves every number in
+    `evals/results/recall-fanout-cap-20260904.json` unchanged and the artifact
+    is not re-run or edited. Pinned by
+    `tests/test_recall.py::test_default_ceiling_is_a_backstop_at_the_max_advertised_hops`.)
+    `truncated` asserts only what it knows: some re-queries, and possibly
+    deeper hops, were skipped, so supporting texts and deeper entities may be
+    missing — it does not claim the entity/edge set is partial, because a
+    ceiling that trips inside the last permitted hop's re-queries leaves that
+    hop's expansion already complete.
+  - `memory.recall.skip_part_of_expansion` (default False, eval-only): an
+    entity reached only through `part-of` edges is returned with its facts but
+    never spends a search. Default-off — the knob exists to measure what
+    dropping those re-queries costs before any default changes.
+
+  All four are in the Console's Recall group. Graph expansion is deliberately
+  untouched (it is already bounded by the hub gate and `max_entities`), so the
+  caps cost supporting `texts` and nothing structural.
+  - Measured with `evals/recall_fanout_bench.py` on a restored copy of the
+    live bank (1,296 entries; 20 relational questions — the twelve the
+    2026-09-04 graph-ablation probe ran plus eight new; CPU only; the BEFORE
+    arm on a `git archive` export of the pre-change tree, so the artifact
+    records a commit per arm;
+    `evals/results/recall-fanout-cap-20260904.json`): searches per call mean
+    89.15 → 12.40 and max 205 → 19; recall wall mean 25.25 s → 4.166 s and
+    max 57.67 s → 7.51 s; served characters mean 178,110 → 77,546. Expected
+    targets found 20/20 in both arms with **no target lost**, and entity, edge
+    and iteration counts identical on all 20 questions — the entire saving is
+    supporting text (2,116 texts → 558), which the MCP layer already caps at 6.
+    Because the entity sets are identical by construction, only a target
+    carried by `texts` could have been lost, and the artifact records how many
+    were: **3 of the 20** arrived on `texts` (17 on `entity`), so the check had
+    power on three questions and all three survived.
+    Honest limit: the per-hop cap alone bounds a 3-hop walk at 19 searches, so
+    the total ceiling and the time budget never fired in this run and are
+    pinned by unit tests rather than by it.
+### Added (2026-09-04 — a real retrieve-then-rerank shape, shipped OFF)
+
+- **The engine had no candidate pool.** Under the shipped `preset: flat`
+  there is one band, so `cms.retrieve`'s dense pool for the whole bank was
+  exactly the served width (`top_k`, default 8) — BM25 fusion, the slot
+  pool and the cross-encoder all re-ranked a set that dense retrieval had
+  already cut to size, and the reranker's `top_n = 20` budget never saw
+  more than ~11 candidates. Three knobs give it the retrieve-then-rerank
+  shape properly. **All three ship at their current behaviour** — not for
+  want of measurement: the judged run (2026-09-04, LongMemEval
+  knowledge-update oracle, n=78) says both settings LOSE. Multiplier 4 +
+  rrf takes naive RAG from 0.859 to 0.744 (-0.115, p 0.0506) and hybrid
+  from 0.897 to 0.833 (-0.064, p 0.1265); multiplier 4 + weighted_sum
+  takes RAG to 0.782 (-0.077, p 0.1071) and hybrid to 0.872
+  (-0.026, p 0.6194), both while serving a third to a half more context
+  tokens.
+  The cortex arm — the control whose input never touches `cms.retrieve` —
+  is 0.667 in all three runs, 0W/0L, so those deltas are not judge noise.
+  Artifacts:
+  `evals/results/longmemeval-ku-oracle-qwen-27b-pool-{ctl,m4rrf,m4sum}.*`
+  plus `evals/results/compare-pool-m4{rrf,sum}-pairs.json`; the table and
+  the caveats (nothing is significant at n=78; the reranker-on cell is
+  untested) are in `evals/README.md`.
+  - `memory.search.candidate_pool_multiplier` (default `1`) — each band's
+    dense pool becomes `top_k * multiplier`, band-size capped. The final
+    truncation to `top_k` does not move. At `1` the path is byte-identical
+    to the pre-change code, pinned against two goldens captured on
+    7595ce6f in `tests/test_retrieval_pool.py` — one over plain
+    un-boosted cosines, one over a fixture where a served entry carries a
+    nonzero BM25 boost (the single default-path line this change touched)
+    and another arrives only through the slot channel. The reranker and
+    the reference pool at multiplier `1` are pinned behaviourally in the
+    same module, not by a captured golden.
+  - `memory.search.fusion` (default `"weighted_sum"`) — `"rrf"` merges the
+    dense / slot / BM25 / timeline channels by reciprocal rank fusion
+    (`k = 60`, the constant from Cormack et al., SIGIR 2009) instead of
+    raw-sorting four incommensurate score scales together. Source and
+    supersession stay ranking-only modifiers, applied multiplicatively to
+    the fused score; recency rides inside the dense channel's own rank
+    order. `min_score` keeps its per-channel meaning — the dense floor
+    gates cosines before fusion, so a lexical-only hit is never dropped by
+    a cosine gate, and the ~0.03-scale fused score is never compared to it.
+    A typo'd value now fails at config LOAD (`SearchConfig.__post_init__`)
+    instead of raising inside every `retrieve()` call; the per-query check
+    stays as the belt for config objects built by other paths. The CAUTION
+    beside the knob names all four thresholds the rrf scale silently
+    redefines — `search_confidence_floor`, the reranker's `fusion_weight`
+    and `skip_margin`, and the reference pool's un-rescaled cosines — and
+    says plainly that rrf must not be combined with the reranker or a
+    populated reference bank until that combination is measured. Each
+    hazard is pinned in `tests/test_retrieval_pool.py` against the real
+    `CrossEncoderReranker.fuse` arithmetic.
+  - **Rerank-then-cut** — with a widened pool AND the reranker enabled, the
+    cross-encoder now sees the fused pool *before* the truncation to
+    `top_k`. Under multiplier `1` the old truncate-then-rerank order is
+    kept exactly. The deferred cut reserves the reference pool's slots
+    rather than slicing positionally: `combined` is `neural + ref_pool`
+    concatenated, so a plain slice of a widened pool would have dropped
+    reference documents outright and inverted Pool 2's standing guarantee
+    that memories can never displace them. Caught by the pre-commit review
+    pass, pinned by `test_deferred_cut_still_reserves_the_reference_pool_slots`.
+  - `explain=True` traces and the retrieval log's `params` both carry a
+    `candidate_pool` block (multiplier, effective pool size after the band
+    cap, fusion mode, rerank position).
+- **Offline retrieval-proxy probe** — `evals/retrieval_pool_probe.py`
+  (CPU-only, no Postgres/GPU/judge) scores recall@6 of the gold-bearing
+  turn over the `ladder_sweep` knowledge-update corpus buried in 400 real
+  conversational turns, across the full multiplier x fusion x reranker
+  grid. Artifact: `evals/results/retrieval-pool-probe-20260904.json`.
+  **Null result**: recall@6 is 0.700 and stale leak 0.300 in all eight
+  cells, with the same three misses; the knobs move 18–33% of the served
+  set and cost 48ms → 560ms per query at multiplier 4 with the reranker on.
+  A proxy, not a verdict — the judged run above is the verdict, and it is
+  negative; this null only says the proxy could not see the difference.
+- **Sanctioned bench override** — `PSEUDOLIFE_BENCH_POOL_MULT` /
+  `PSEUDOLIFE_BENCH_FUSION`, applied by `ladder_sweep.build_service` and
+  stamped into every summary's `bench_env` (the PR #165 contract). Note the
+  scope: `evals/regression_gate.ps1` rebuilds contexts with
+  `rebuild_contexts.py`, which rebuilds the *cortex* ranking and copies the
+  associative context verbatim — **a green gate says nothing about these
+  knobs**. Measuring them needs a full `--phase extract` re-run.
+### Measured (2026-09-04 — a query-shape router does not beat the commit-gated cascade)
+- **The engine concatenates channels for every query, and the question was
+  whether routing by question shape would serve better answers on fewer
+  tokens. It would not.** `evals/router_offline.py` re-aggregates three
+  already-judged runs offline — no new answer or judge calls, no GPU — into
+  arm/type tables, an oracle-by-type bound, a per-question ceiling, and
+  cross-validated cheap routers over surface features of the question text
+  (`evals/results/router-offline-20260904.json`, seeded and byte-reproducible;
+  the section is `evals/README.md` → "Offline routing analysis").
+  - The preregistered bar — a cross-validated router beating the best single
+    arm by >= 3 points at no more served cost, on BOTH benchmarks — fails,
+    and so does the oracle bound. Realizable gains: **+0.002** on LongMemEval
+    (500 q, at 327 fewer tokens) and **+0.008** on BEAM 100K (400 q, at 671
+    MORE context chars). A router with perfect knowledge of the question type
+    reaches +0.024 (LongMemEval, under the bar) and +0.046 (BEAM, at more
+    cost).
+  - The best router found is the cascade restated: on LongMemEval the winning
+    configuration is the two-stage one, which serves cortex on the 193
+    questions where cortex commits and rag on the other 307, landing exactly
+    on the shipped 0.690 / 883 tokens. Question type IS predictable from
+    surface text (0.654 and 0.652 by 5-fold CV against 0.266 / 0.100
+    majority), but the per-type arm differences are smaller than the
+    classifier's error cost — routing through a predicted type scores BELOW
+    the best single arm on all three slices.
+  - Per-question ceilings say the channels do genuinely disagree: 0.778
+    (LongMemEval-500), 0.789 (BEAM-400), 0.962 (the 78-question
+    knowledge-update slice, three channels; 0.936 for rag∪cortex on the same
+    rows). Any approach to that ceiling needs a signal from the retrieved
+    evidence — the cascade's abstention gate is one, and it is the one that
+    works — not from the question's wording.
+  - Only 2 of the 4 question types the two benchmarks share agree on a best
+    arm (knowledge-update and preference: yes; temporal-reasoning and
+    multi-session: no), which is a second reason not to ship a type table.
+  - Written after review: the `acc` label policy ranked the arms over the
+    WHOLE dataset before cross-validation split it, so a tied row's training
+    label depended on a statistic that included its own held-out fold. The
+    ranking is now recomputed inside each training fold, as
+    `router_via_type`'s per-fold mapping always was. No headline moves — the
+    realizable gains, the oracle bounds, the ceilings, the type-prediction
+    accuracies and the verdict are identical before and after — but WHICH
+    configuration attains the LongMemEval maximum does. The single-stage
+    `router[with_cascade|logreg|acc]` fell from 0.690 / 883 tokens, where it
+    had predicted "cascade" on 500 of 500 rows, to 0.678 / 1009; that
+    collapse was itself the leak, since rag and the cascade sit 0.002 apart
+    and the ranking separating them was borrowed from the test rows. The
+    maximum passed to the two-stage variant at the same 0.690 / 883. On the
+    78-question slice the best realizable row moved from 0.859 (gain 0.000)
+    to 0.846 (gain -0.013); no published figure quotes it. BEAM's published
+    numbers are untouched.
+  - Framing: offline re-use of judged verdicts, a single replicate per source
+    run, a local judge; the oracle rows are fit on the questions they score
+    and are bounds, not results. Pinned by `tests/test_eval_evidence.py`;
+    `tests/test_router_offline.py` covers the script on a fixture and
+    regenerates the artifact.
+### Measured (2026-09-04 — cue-gating does not rescue contiguity; eval-only)
+
+- **The 2026-08-04 Phase-1 knobs lose hardest exactly where the engine's
+  own cue detector fires, so gating them on it cannot help.** The
+  Phase-1 gates applied contiguity/timeline/enum to every query;
+  `evals/contiguity_cue_split.py` re-reads the same
+  `aggp1-variants-0803` rows offline (no new answer or judge calls) and
+  builds the gated policy explicitly — vanilla `hybrid` where the cue is
+  quiet, the variant where it fires — from verdicts that were already
+  judged. Detectors are imported from
+  `pseudolife_memory/memory/cms.py` (`has_temporal_cue`,
+  `has_aggregation_cue`, `has_date_cue`), never re-implemented. The
+  engine's own `any` gate fires on 0.702 of the 500 questions (recall
+  0.947 on the weak types, precision 0.718, and 0.692 on
+  knowledge-update — the type contiguity must not disturb; the date
+  predicate fires 0.000 times, LongMemEval keeps the date out of the
+  question text). Contiguity's paired delta against the same-run vanilla
+  hybrid is -0.114 on cue-fired rows (n=351, p 0.00000) against -0.047
+  where the cue is quiet (n=149, p 0.18170), and on the weak types the
+  two splits are indistinguishable (-0.147 fired vs -0.143 quiet). The
+  gated composite therefore scores 0.584 overall and 0.320 on the weak
+  types against vanilla hybrid's 0.664 / 0.459 (-0.080 and -0.139, both
+  p 0.00000), buying +0.008 of the 0.147 weak-type hole while adding 254
+  context tokens. Mechanism: the served memory block is a fixed top-k,
+  so on cue-fired rows contiguity adds a mean 1.46 turns and *displaces*
+  the same 1.46 ranked hits. The Phase-1 verdict that contiguity stays off
+  stands (`evals/results/agg-recall-phase1-verdict.json`); no defaults change.
+  Validity: `hybrid_tl` gated equals `hybrid_tl` ungated to the digit
+  (0.640 / 0.447) because the timeline channel is already cue-gated in
+  the engine, and 522 arm-rows whose served context was byte-identical
+  to vanilla hybrid's — answered and judged independently, one call per
+  arm — produced zero verdict disagreements, so the splits carry no
+  measurement noise to net out. Caveat, stated at the claim: a single
+  replicate from 2026-08-03 on the retired Qwen3.6 judge, and a
+  composite of already-judged arms is not a run — a gated knob would
+  still need its own judged run before shipping.
+  Artifact `evals/results/contiguity-cue-split-20260904.json`; section
+  "Cue-gated contiguity" in `evals/README.md`.
+
+## [0.15.0] - 2026-09-04 — labelled claims, judged review queues, and reversible forgets
+
+### Fixed (2026-09-04 — the Console's digest length default matches the daemon's)
+- **The Console offered `800` as the reset value for `memory.dream.digest_target_chars`
+  while the daemon has shipped `1200` since 2026-08-27**, so a "reset to default"
+  click silently lowered the target and the knob's help text argued for a
+  number the code no longer used. The registry default is `1200` and its help
+  names the measurement (the 2026-08-27 sidecar probe: 9 digests, 3 runs,
+  1019–1908 chars written against an 800 target). Found by the release
+  docs-currency pass: the registry test checked that every knob path resolves,
+  not that its default agrees with the dataclass. The same pass re-synced the
+  five translated front doors (i18n source v10): their Quickstart still said
+  the project requires Docker, six weeks after the pip-lite path became the
+  English README's first install.
+
+### Fixed (2026-09-03 — the label heuristic no longer reads "a must-read" as a rule)
+- **Two of the three `constraint` labels the chip-5 BEAM gate produced
+  were chat text with `must` as a noun or an adjective** — "a must-read
+  series", "quick-dry materials are a must" — and the recall pin then
+  served those turns ahead of the ranking (the mechanism behind every
+  context diff in the chip-5 paired run; see the gate note in the
+  2026-09-02 entry below). The strong-deontic rule in
+  `pseudolife_memory/memory/labels.py` now takes `must` only as the verb:
+  not after an article (`a must`, `the must`) and not hyphenated
+  (`must-read`, `must-have`). The imperative-opener rule also stops at an
+  unambiguous irregular past form (`never paid off …`, `always ran …`);
+  forms that double as imperatives (`put`, `read`, `run`, `set`) stay
+  bare. Re-measured with `evals/label_heuristic_audit.py`, which gained a
+  facts-only mode (`--facts` without `--entries`) for bank dumps that have
+  no entries table:
+  - live bank, 2026-09-03 (869 entries / 5,435 facts, scored against the
+    2026-09-02 hand verdicts, so a hit added since counts as not genuine
+    and the precision is a floor): 86 fact hits, 73 genuine, 0.85;
+    the pre-fix rule on the same dump: 88 hits, 73 genuine, 0.83 — the
+    two hits removed ("agent-must-invoke", "always ran") had both been
+    judged not a rule. Strong-deontic part 62 of 75, opener increment
+    11 of 11, still 1 of 869 entries.
+    `evals/results/label-heuristic-audit-20260903.json` (pre-fix:
+    `label-heuristic-audit-20260903-prefix-rule.json`).
+  - chip-5 BEAM bank (1,099 facts of chat text, every superset hit
+    hand-judged): 8 hits, 8 genuine — all standing instructions to the
+    assistant ("always include time zones when asked about meeting
+    times"); the two `must`-noun fires and "never paid off any personal
+    loans" are gone. Of the 16 superset hits the 8 non-genuine are
+    attribute-name matches (`event-planning-rule`, `work-rest-rule`)
+    and the three above — the attribute-name variant rejected on
+    2026-09-02 stays rejected. `evals/results/label-heuristic-audit-20260903-beam-chip5.json`
+    (+ `.verdicts.json`, keys only).
+  No backfill and nothing to unlabel: the live bank carries no
+  `constraint`-labelled row at all yet (checked 2026-09-03; auto labels
+  only began with the v35 deploy), and the chip-5 bench bank was
+  throwaway.
+
+### Added (2026-09-03 — the merge judge's second model is a Console knob)
+- **Making the merge judge's second opinion a genuinely independent vote
+  needed a container edit and a daemon restart.** `judge_mode` `"auto"`
+  refuses to fold on two same-model accepts by design, so the only flip
+  that arms the two-vote accept gate is `memory.deep_dream.judge_second_model`
+  — and it was a config-file field only (`POST /api/config` rejected it as
+  an unknown knob). It is now a live string knob in the Console's Deep
+  dream group ("Merge judge second model", suggestions `claude-fable-5`,
+  `claude-opus-5`, `claude-sonnet-5`, `gpt-5.6-terra`, `gpt-5.6-luna`),
+  read on every sweep batch like the other judge knobs; empty keeps the
+  same-model second opinion. Served by the same endpoint as the first
+  opinion (`judge_url`, else the dream extractor), whose CLI shims honour
+  `claude-*` / `gpt-*` names per request. No behaviour change until set.
+
+### Changed (2026-09-03 — forgets retire instead of delete; verdicts outlive their rows; schema v37)
+- **A forgotten lesson or world fact was gone for good — the 2026-09-02
+  review-queue triage hard-deleted eleven lessons, three of which carried
+  guidance no survivor had, and nothing in the bank could bring them
+  back.** `memory_forget(scope="lesson"|"world")` — and the store-curation
+  judge's `auto` forget — now RETIRES the slot: the row stays with
+  `status='retired'`, an FK-free `store_decisions` audit row (v37) records
+  who decided, why, and the verbatim record, and `lesson_restore` /
+  `world_restore` undo it — from the retired record while it exists
+  (provenance, stamps and embedding intact, so a lesson whose subject
+  changed while retired still comes back flagged `re_verify`), from the
+  audit snapshot once compaction has purged it (`memory.compaction`
+  treats a retired row like any other non-live record); a whole-entity
+  restore covers both populations in one call (`source: mixed`).
+  Surfaces: `memory_graph_review(action="restore_slot", store=,
+  src="entity|attribute")`, `POST /api/lessons/restore`,
+  `POST /api/world/restore`, and `GET /api/curation/retired` for what is
+  currently retired (each entry carries the `key` restore takes).
+  `memory_forget(scope="fact")` and `scope="memory"` are unchanged (hard
+  delete). The three lost lessons themselves were re-minted by the
+  2026-09-02 09:58 dream from the re-seeded outcome signals (804-806 →
+  lessons 2450-2452 at their original slots); no restore was needed.
+- **A rejected merge proposal ("distinct") or a rejected junk proposal
+  ("keep") vanished with its `entity_proposals` row the moment either
+  entity was deleted — a re-mint of the same name was re-filed and
+  re-judged as if no verdict existed.** Both rejects now write a
+  text-keyed tombstone that every filing gate already consults: a merge
+  reject writes the pair's STORED canonicals to `dismissed_pairs` (whoever
+  decided it — human, agent or dream-judge; the judge path no longer adds
+  its own display-keyed dismissal afterwards), a junk reject writes the
+  namespaced `junk:<canonical>` self-pair plus a `merge_decisions` audit
+  row, and the junk detector never files or auto-deletes a kept name
+  again. Consequence, stated plainly: a human or agent `reject_entity` on
+  a merge now means what the judge's auto-reject has meant since v30 —
+  the pair is dismissed everywhere `dismissed_pairs` is consulted,
+  including link-candidate generation — and `dismissed_pairs` still has
+  no un-dismiss route beyond a SQL delete. The Step-B alias scan also
+  re-checks the pair on the resolved entities' stored canonicals (its
+  name-keyed check missed display-enriched entities).
+- **The merge judge read evidence clipped to 240 characters at build time
+  — 305 of the 309 snippets the 2026-09-02 panel judged were exactly 240
+  chars, cut mid-word — and the assumption was that longer evidence would
+  judge better. It measured worse.** The judge's evidence cap is now its
+  own knob, `memory.deep_dream.judge_snippet_max_chars`, built on the
+  judge path and stamped on each proposal (`format_judge_proposal` keeps
+  the frozen 240-char serialization when the key is absent, so every
+  published judge number keeps its exact prompt; the review surfaces keep
+  `snippet_max_chars`). `evals/queue_judge_fulllen_pack.py` recovered the
+  2026-09-02 pack at full length by prefix match against the bank (305/305
+  clipped merge snippets, uniquely; source entries p50 1299 / p95 2765 /
+  max 4282 chars) and `evals/queue_judge_ladder.py` (new `--data` /
+  `--snippet-chars`) re-judged the same 63 rows with Opus at 3000 chars
+  (`evals/results/queue-judge-ladder-20260903-fulllen.json`): accept
+  precision fell to 0.70 (from 0.85 on clipped evidence), the two-vote
+  auto-fold gate passed 6/7 (4/4 clipped, so one bad fold), rejects stayed
+  clean (7/7 two-vote), and replicate disagreement rose to 6/63 rows (from
+  2/63) — the delta is within a noisier control, so this is "not better",
+  not "worse". The default therefore stays **240**; raise it only behind a
+  new ladder run. Note the `low_differential` stamp is computed from the
+  truncated texts, so the cap also moves the auto-accept precondition.
+- Schema **v37**: `store_decisions` (`store`, `entity_norm`,
+  `attribute_norm`, `action`, `decided_by`, `reason`, `record` JSONB,
+  `decided_at`). Additive/idempotent; the table starts empty on an existing
+  bank. The lesson and world stores' own `stats()` gain a `retired` count
+  (`memory_stats` does not surface those store sections — corrected
+  2026-09-04 at the release docs pass; the original note said it did).
+
+### Added (2026-09-02 — every review queue gets a judge; schema v36)
+- **The graph review queue kept refilling between human visits — merge
+  proposals below the auto-reject gate, junk proposals the zero-structure
+  guard skipped, link proposals nobody judged, lesson/world duplicate
+  listings, and ~90 analyzer duplicate findings the Console re-listed on
+  every load because they were never filed anywhere. The sweep now judges
+  every one of those queues itself and applies exactly the verdicts that
+  are cheap or reversible to get wrong; everything expensive stays pending
+  with the model's opinion attached.** Design:
+  `docs/superpowers/specs/2026-09-02-review-queue-autonomy-design.md`.
+  - **Merge judge: second opinion + guarded auto-accept.** A pending merge
+    whose first verdict sat below the single-vote gate is re-judged once in
+    a fresh batch (`judge_second_opinion`, optional `judge_second_model`);
+    two rejects at mean >= `judge_reject_min_confidence_2` (0.7) apply, a
+    disagreement stamps `split` on the note. New `judge_mode: auto` folds
+    a pair only when two independent accepts agree on a row that is NOT
+    `low_differential`, at mean >= `judge_accept_min_confidence` (0.6) —
+    the first path that ever auto-applies an accept — and only when the two
+    opinions come from different models (compared on the model each
+    endpoint reports SERVING, so a name-agnostic endpoint cannot satisfy
+    it with one model; a second opinion from the same extractor object or
+    the same configured name is never distinct, so rows stamped with a
+    configured name before this build cannot pass on a dated served id):
+    a same-model second vote at temperature 0 is independent only through
+    batch composition. An accept is also refused
+    when the pair sits in `dismissed_pairs` (an earlier `relate` /
+    `dismiss_pair` verdict settled it as distinct — the pending row is
+    closed instead), when the row was filed by the analyzer (an unmeasured
+    class), and when the pre-apply graph snapshot cannot be written.
+    Measured on the 63
+    residual (sub-gate) merge rows of the 2026-09-02 live queue against a
+    blind seven-agent Opus panel: two-vote rejects 8/8, two-vote
+    non-low-differential accepts 6/6, single-vote accept precision on the
+    same rows 0.74, and 9 of 10 two-vote accepts on LOW-differential rows
+    right with the tenth folding the wrong way — which is why the flag
+    gates (`evals/results/queue-judge-panel-20260902.json`, `merge_gate_table`).
+    Evidence honesty: the 6/6 is one distinct-model pairing (shadow Opus +
+    Fable); the other realizable pairing on the same rows (second Opus +
+    Fable) scores 5/6, so the fair figure is 11/12 on n=6 each, and the
+    reject-side labels are Opus panel vs Opus judge with no independent
+    check. n=6 does not authorize unattended folds — `auto` is a
+    measured-so-far option, not a recommendation.
+  - **Link judge** (`link_judge_mode`, schema v36 judge columns on
+    `edge_proposals`): judges pending link proposals from both sides' live
+    edges, scopes and the notes naming both; `auto` promotes accept
+    verdicts at/above `link_accept_min_confidence` to live edges (origin
+    `action`) and rejects at/above `link_reject_min_confidence`; a retype
+    is recorded with its corrected relation (`judge_relation`) but never
+    auto-written — the first ladder scored the judge's relation choice at
+    0/1 on retypes — so a reviewer applies it (`graph_accept_proposal(...,
+    relation=)`, gated exactly like `graph_propose_links`; row status
+    `retyped`). Edges are reversible, which is why this is the one queue
+    whose accepts may ship auto. `graph_accept_proposal` /
+    `graph_reject_proposal` now stamp `decided_by` / `decided_at`.
+  - **Junk judge** (`junk_judge_mode`): judges the evidence-bearing junk
+    proposals with a provenance pack (detector class, live edges with
+    origin, fact count and text, whether the node is a lesson-minted
+    object, scopes, mentions); `auto` keeps at/above
+    `junk_keep_min_confidence` and deletes at/above
+    `junk_delete_min_confidence` ONLY under the evidence bar (degree <=
+    `junk_max_auto_degree`, at most one fact slot).
+  - **Store-curation judge** (`curation_judge_mode`): judges the
+    lesson/world duplicate listings; verdicts are remembered in the new
+    `curation_judgments` table (`curation_rejudge_days`) so pairs are not
+    re-sent every sweep. `auto-distinct` applies distinct verdicts as the
+    existing reversible dismissal; `auto` additionally forgets the losing
+    slot of a duplicate verdict after folding the judge's carry-over into
+    the surviving lesson.
+  - **Step-C candidate judge** (`candidate_judge_mode`): after each deep
+    apply the dream's link candidates are judged one `judge_batch` slice
+    per sweep tick — `propose` files an edge proposal (source
+    `deep-dream-judge`, then settled by the link judge), `dismiss` marks
+    the pair distinct (for the merge analyzer too, so the prompt leaves
+    same-referent pairs alone). Every judged pair is memoised
+    (`candidate_rejudge_days`); `shadow` records that memo only.
+  - **Analyzer duplicates are filed** (`analyzer_file_duplicates`): each
+    deep apply files graph_review's live duplicate findings into the merge
+    queue (file/concept pairs into the link queue as `implements`), so the
+    judges finally see them; pairs the merge queue already holds are
+    skipped.
+  - **Unreachable-orphan sweep** (`orphan_sweep`, `orphan_min_age_days`,
+    `orphan_max_per_apply`): entities with no evidence at all — no edge
+    (superseded included), no fact, lesson or world fact by id or name, no
+    alias, scope or proposal — that no current entry mentions are deleted
+    after seven days, at most 50 per pass, audited as `dream-auto` /
+    `deleted` (deliberately not a junk tombstone). 50 such on the
+    2026-09-02 live bank. Ships **off**: it is the one destructive switch
+    that would fire on the first apply after an upgrade.
+  - All judges ride `run_sweep_once` after the merge judge, each ONE
+    bounded `judge_batch` slice per tick (that is also the rate limit on
+    auto-applies), getattr-guarded, never raising into the sweep; skipped
+    rows are stamped `leave` at 0 confidence so a batch head cannot starve
+    the queue; a judge that is about to delete or fold graph rows writes
+    the graph snapshot first (a curation `auto` forget removes lesson/world
+    rows the graph snapshot does not cover — one more reason that mode
+    ships off). Every mode ships `shadow` (candidate judge `off`); the
+    Console's Deep-dream group gains a switch per judge plus one kill
+    switch for all of them (`judges_enabled`). A verdict memoised under a
+    lower mode (curation memo, candidate memo) is not applied
+    retroactively when the mode is raised — it is re-judged after its
+    `*_rejudge_days`. The junk "evidence bar" is structural, not a
+    precision claim: 16 of the 20 panel rows pass it, 5 of them keeps.
+  - **Schema v36** (additive/idempotent): `edge_proposals.judge_verdict /
+    judge_confidence / judge_note / judge_model / judged_at /
+    judge_relation / decided_by / decided_at`, `entity_proposals.judge2_*`
+    (the second opinion), `curation_judgments`. Review payloads show a
+    `judge` block on link rows and a `judge2` block on merge rows. (v35 is
+    the label-pair migration of the parallel PR #245; the two are
+    version-unconditional and compose in either order.)
+  - **Eval gate.** `evals/results/queue-judge-panel-20260902.json` is the
+    committed, scrubbed record of the 2026-09-02 panel (63 merges with
+    three shipped-judge replays, 20 junk, 37 links, 42 candidates, 40 slot
+    pairs — labels, detector classes and votes; the raw evidence pack
+    freezes memory-bank text and stays private under the gitignored
+    `evals/data/`); `evals/queue_judge_ladder.py` replays the SHIPPED
+    prompts per queue against that pack and simulates the auto gates.
+    First run (`evals/results/queue-judge-ladder-20260902.json`, arm
+    `opus-r2`, claude-opus-5, two replicates; the harness-state caveat is
+    recorded in the artifact): link auto-accept 4/4 and auto-reject 5/5 at
+    0.8; junk auto-delete under the evidence bar 6/6 and auto-keep 7/7;
+    curation auto-distinct 21/21 at 0.8, while duplicate keep-side
+    precision was 0.5625 (so `auto` forgetting stays off); candidate
+    auto-propose 7/8 and auto-dismiss 15/16 at 0.6; merge two-vote reject
+    8/8 and two-vote non-low-differential accept 4/4.
+    `tests/test_eval_evidence.py` pins every number here to its artifact.
+
+### Fixed (2026-09-02 — three detector classes that fed the junk queue)
+- **`slot-key-artifact` flagged dotted code and config paths** whose prefix
+  happened to be a known entity (`cortex._norm_key`, `lme.RAG_TOP_K`,
+  `memory.dream.extractor_reasoning_effort`) and version dots
+  (`gpt-5.6-luna`) — 7 of the 10 flags in the 2026-09-02 junk queue. A
+  flattened slot key came through the cortex normalizer, so a tail with
+  underscores, capitals or a leading underscore, or a dot between digits,
+  is no longer flagged.
+- **`compound-artifact` flagged unspaced slashes** (`origin/master`,
+  `fix/autostart-elevation-guidance`): every unspaced slash in the live bank
+  is a ref, branch, path, route or repo slug (106/106 sampled), and every
+  slash-joined junk tombstone was spaced — a slash now joins a compound
+  only when spaced; `+` joins either way.
+- **Lesson objects minted from list-shaped `about` fields** (11 of the 20
+  pending junk rows) — `_link_lesson_graph` now consults the write-time
+  junk gate and the junk detector's own compound predicate like every
+  other write path; the lesson keeps its text, it just gets no graph node.
+  This changes what a dream pass WRITES, which the judge ladders cannot
+  see; the extraction ladder is unaffected because no fact or relation
+  claim changes — only the graph node a lesson's `about` mints.
+- **`_is_code_dotted` spares six of the seven false positives** the panel
+  named; `cms.store` (a plain-word head and tail) is still flagged and
+  left to the junk judge, which kept it at 0.92.
+### Added (2026-09-02 — a claim now remembers who said it and how exactly it must survive; schema v35)
+
+- **A memory kept the claim and lost the terms of its use.** Consolidation
+  preserved *what* was said while erasing *who* said it and *how* (arXiv
+  2608.01679, authority collapse: a third party's offhand remark reads back
+  as a standing user instruction — collapse in 48/49 consolidator configs,
+  50.3% unauthorized-action rate without a label, 16.9% → 0.0% with one),
+  and it summarised a rule at the same rate as a log entry although only
+  the rule needs its exact wording (arXiv 2608.22752, the compaction cliff).
+  Schema v35 (additive/idempotent) adds one write-time label pair to
+  `entries` and `facts`, carried through supersession:
+  - **`authority`** — the SPEECH ACT: `directive` / `observation` /
+    `quoted`. Deliberately a separate axis from `origin`, which says *who
+    wrote* and is a tier driving the provenance guard and the two-man
+    rule (and which entries never persisted — the quarantine derives an
+    entry's tier from `source`); directive-vs-observation is not a tier
+    ordering. The composite `(origin, authority)` is what the paper calls
+    authority.
+  - **`distortion_tolerance`** — the paper's five fidelity classes:
+    `constraint` (zero — verbatim) / `procedural` / `belief` / `preference`
+    / `episodic`.
+  - Explicit parameters on `memory_store` and `memory_fact_set`; the `auto`
+    default is a deterministic form heuristic (no model call on the store
+    path) that asserts only `constraint` (rule-sized deontic or imperative
+    text — `must`, `shall`, `forbidden`, `rule:`, `Never run …`), `quoted`
+    (an explicit reporting construction — `according to`, `per the`, `the
+    docs say`) and `directive` (addressed to the reader). Measured on the
+    live bank before shipping: 836 current entries / 5,267 current facts,
+    hand-labelled hits; the shipped rule fires on ~1.6% of facts at ~0.86
+    precision and on 1 of 836 entries; the rejected variants (any deontic
+    word anywhere: 36% of entries; mid-sentence never/always: 0.53; an
+    attribute-name rule: 0.52) are recorded beside it in
+    `evals/results/label-heuristic-audit-20260902.json`. No backfill.
+    (Re-measured 2026-09-03 after the `must`-noun fix — see the Fixed
+    entry above; these are the pre-fix numbers.)
+  - **Inherit unless restated.** `memory_supersede` and
+    `memory_consolidate` carry the strictest label across the entries they
+    retire (quoted beats directive; a constraint anywhere in the cluster
+    stays a constraint — TypeDecompose) unless the new text restates one;
+    a fact write keeps the slot's labels unless it passes one (explicit
+    `None` clears; the dream passes `INHERIT` for an unlabelled source).
+    Rollback restores the previous version's labels with its value.
+  - **Served absent-when-default** on every read surface an agent acts on
+    (`memory_search` entries and cortex block, `memory_fact_get`,
+    `memory_recall`, history), so an unlabelled record's payload is
+    byte-identical (the `stance` precedent); the compact projections
+    re-select the keys explicitly (the chip 4.1 whitelist lesson).
+- **Dream (TypeCompact).** A `constraint` source entry is zero-distortion:
+  if no scalar claim citing it contains its text verbatim, ONE claim's
+  value is replaced with the entry text — the claim whose tokens overlap
+  the rule most, and only if its target slot is empty or already a
+  constraint; a standing non-constraint fact is never overwritten, a
+  claim about something else is never hijacked, and with no eligible
+  claim the carrier refuses and the guard reports (the pre-review cut
+  took the extractor's FIRST claim by position — the peer review
+  reproduced it superseding a correct unrelated fact with the rule text).
+  Only the verbatim carrier earns the `constraint` class; paraphrased
+  siblings inherit the slot's label (entity/attribute kept, member ops
+  never carriers). A **post-dream guard
+  verifier** then reports every constraint entry in the window with no
+  verbatim derived item — `constraint_verbatim` / `constraint_misses` on
+  the run result, `constraint_missed` on the run row, WARNING in the log.
+  Flag, not hard fail: the raw entry is never discarded and a held cursor
+  would hostage every other claim in the batch. Every derived fact takes
+  the SOURCE entry's labels, never anything the extractor wrote; a `quoted`
+  source is low-trust for the two-man rule (parks as a contender, whoever
+  relayed it — the label only ever demotes). Ships inert on an unlabelled
+  bank. The gates it was held on ran 2026-09-03 and passed:
+  - **Extraction ladder, paired arms** — the pre-#245 tree (`f80105b4`)
+    against master (`f723306e`), same harness, same corpus, same
+    reproducible Qwen3.8 endpoint: verdict-identical on both rungs
+    (floor gold 0.1 / stale 0.1 / 3.4 tok per query;
+    qwen-27b gold 1.0 / stale 0.0 / 13.4 tok per query; every
+    consolidation tally equal). `evals/results/ladder-chip5-paired-verdict.json`,
+    written by `evals/ladder_pair_compare.py` over the four committed
+    `<rung>-chip5-{pre,post}.json` rung files.
+  - **BEAM 100K at the matched 16/16 budget**, paired on all 400 questions
+    against the 2026-09-02 pre-#245 baseline run at `ddf86d42` (the #241
+    merge): the identical-input `rag` control moved 0.0000 (0 rows);
+    hybrid +0.0004 ± 0.0014 (0.6226 → 0.6230);
+    cortex +0.0036 ± 0.0029 (0.2829 → 0.2866) — every delta inside the
+    control's noise, no finding. The 30 rows whose served context differs
+    all sit in chats 13 and 15, the two chats where the write-time
+    heuristic labelled a slot `constraint` (3 of 1099 facts; `quoted` 11 of 1099)
+    and the recall pin then served those facts ahead of the ranking. All
+    three `constraint` fires are false positives on conversational prose
+    (a moderator, a preferred retailer, a month's humidity), so the
+    heuristic is due a tweak before chip 5 publishes a number.
+    `evals/results/beam-100K-qwen-27b-chip5-b16.vs-chip12-b16.paired.json`,
+    written by `evals/beam_cross_run_paired.py` over the two committed runs
+    (`beam-100K-qwen-27b-chip{12,5}-b16.{jsonl,summary.json}`); label fire
+    rates in `beam-100K-qwen-27b-chip5-b16.labels.json`.
+  - `evals/regression_gate.ps1` (the LME arm-1 slice, two replicates)
+    passed after the BEAM run; its artifacts stay gitignored by the gate's
+    own convention, so no number from it is published here.
+- **Recall (TypeRetrieve).** In-scope `constraint` facts are pinned AHEAD of
+  the cosine ranking, marked `pinned: true` — exemption from ranking, not
+  from relevance: a pin must clear the caller's `min_score` floor, pins
+  take at most half of `top_k` so the ranked answer keeps the rest, and
+  the best cosine wins the pin slots (the peer review reproduced the
+  unbounded cut: six rules on one entity displaced the whole block at
+  cosine ~0.37 against a 0.5 floor). In scope = the query names the fact's entity (`memory_search`'s
+  cortex block; separator-insensitive, word-bounded) or the entity is a
+  seed of the walk (`memory_recall`; the pin also survives the per-entity
+  fact cap). Kill switch `memory.cortex.pin_constraints` (Console: Cortex
+  → Pin constraint facts). Retrieval-affecting only when labels exist —
+  an unlabelled bank is served byte-identically, pinned by test. The
+  cortex-block scope test is a raw-string match and does not resolve
+  graph aliases (follow-up once PR #243's alias map lands); the served-
+  facts training log records `pinned` so a reranker never learns a
+  policy pin as a score. The offline `rebuild_contexts.py` mirror does
+  not pin, so its lockstep with the service now holds for unlabelled
+  banks only — a labelled bench bank needs `pin_constraints=false` or
+  a recorded heuristic fire rate beside the result.
+- Served text: the CAPTURE section names the two labels (funded by two
+  trims; the block stays under its budget).
+
+### Fixed (2026-09-02 — fact_get reaches the facts of a merged-away name)
+
+- **`memory_fact_get` returned `record: null` for a fact `memory_recall` had
+  just shown under the same name.** A graph merge folds the absorbed node's
+  canonical into the survivor's aliases without rewriting the cortex
+  records written under it, and the recall side now attaches those records
+  to the surviving node (`graph_neighborhood`, the whole-graph view,
+  `wiki_page` — the other 2026-09-02 alias fix, which recorded this
+  asymmetry as its follow-up). But `cortex_lookup` retried a miss in one
+  direction only, alias → canonical: `memory_fact_get("pr-235", "branch")`
+  found the record while `memory_fact_get("PR #235", "branch")` — the name
+  recall displays it under — missed, so an agent following recall output
+  with the displayed name got a miss on the fact it was shown. `chain()`
+  (`memory_history` with no attribute, `GET /api/chain`, the Atlas
+  timeline) had the same shape: its slot-key set was the queried name plus
+  the canonical, never the node's aliases.
+  - On a scalar miss `cortex_lookup` now retries the canonical, then each
+    of the node's aliases, in that order — a direct hit still
+    short-circuits, and a canonical-keyed record still wins over an
+    alias-keyed one at the same attribute. The served record keeps its own
+    slot key (`entity: "pr-235"`), which is where its `source_entries`,
+    contenders and `correct_with` call live. The set-slot fallback walks
+    the same widened list, so a set written under the alias is served in
+    set shape via the canonical or any other alias.
+  - `chain()` adds the node's aliases to its slot-key set, so the
+    assertion / supersession history written under the folded name shows
+    under the surviving node whichever name reaches it.
+  - **An alias that is also another entity's canonical is skipped.** The
+    alias table can carry such a row (`memory_alias` never checks the
+    entities table), and `find_entity` resolves canonical-first, so that
+    alias never resolves to this node — a record under that name is the
+    other entity's. The retry drops it, exactly as `graph.alias_canonical_map`
+    drops it for the graph read surfaces, so lookup and attachment agree
+    instead of disagreeing in opposite directions. Found by the #244
+    pre-merge review, which reproduced `memory_fact_get("dev-box", "owner")`
+    serving `gpu-rig`'s fact after `memory_alias("dev-box", "gpu-rig")`
+    while `memory_graph("dev-box")` correctly attached nothing.
+  - **A lesson about an alias no longer mints a shadowing entity.**
+    `_link_lesson_graph` (the dream's `lesson_write`, fed by
+    `memory_outcome`'s `about`) upserted the task and object entities by
+    canonical with no alias check, so one lesson about `pr-235` after that
+    node was folded into `PR #235` minted a fresh `pr-235` canonical — from
+    then on the graph detached the surviving node's alias-keyed facts, and
+    a retry that did not skip shadowed aliases would have kept serving
+    them. Both entities now resolve through the alias table first
+    (`_resolve_or_create_entity`, the find-then-create graph writes use;
+    its exact-match slot-key fold now applies to lesson subjects too).
+    Pre-existing, but this pair of changes makes the alias table
+    load-bearing for serving, so it ships here.
+  - Cost: one `find_entity` call per miss plus, only when the node has
+    aliases, one indexed probe (`canonical_names_among`) — still no
+    per-alias storage query. The set-slot check runs `slot_kind` once per
+    name in the list, and `slot_kind` scans the record list for a slot
+    with neither a current scalar nor current members, so a miss on a
+    node with K aliases costs 1+K scans where it cost at most 2 —
+    microseconds at the live bank's size. Aliases are graph norms, so a
+    record whose entity `cortex._norm_key` keeps distinct from its graph
+    norm (`host:port` vs `host-port`) is still not reached this way, the
+    limit the canonical retry has always had.
+  - This widens the resolution surface the 2026-07-27 bank curation
+    trimmed: back then, leak-shaped aliases (`canonical-suffix`) let an
+    alias with no fact at an attribute silently serve the canonical's. The
+    reverse now holds as well — a canonical with no fact at an attribute
+    serves an alias's. For a genuine synonym that is the contract (the
+    alias IS the entity) and it is exactly what recall, `memory_graph` and
+    the dossier already display; a leak-shaped alias remains a curation
+    matter, not a lookup one.
+  - Not changed: `memory_fact_get`'s `contenders` and the empty-slot
+    `candidates` still key on the queried name (and, for candidates, its
+    canonical), slot-mode `memory_history(entity, attribute)` does no
+    alias resolution in either direction, and `memory_alias` still accepts
+    an alias equal to another entity's canonical — the shadow state stays
+    creatable by hand; refusing it, or treating it as a merge, is a tool
+    behaviour change for a separate decision.
+
+### Fixed (2026-09-02 — recall serves the facts of a merged-away name)
+
+- **`memory_recall`, `memory_graph`, and the Console dossier served a node
+  with `facts: []` when its cortex records had been written under an alias
+  of the node's canonical.** A graph merge folds the absorbed node's
+  canonical into the survivor's aliases without rewriting the records, so
+  every fact written under the old name stopped attaching:
+  `graph_neighborhood`, the seedless whole-graph view, and `wiki_page`
+  compared `norm_name(rec.entity)` to the node's canonical alone, while
+  `memory_fact_get` on the same name resolved it (`cortex_lookup` has been
+  alias-aware since 2026-06-14). Observed live on the production bank after
+  the #240 deploy: `memory_fact_get("pr-235", "branch")` returned the
+  current record with `entity_ref.canonical = "pr-#235"`, and
+  `memory_recall` listed the `pr-#235` node with no facts. Pre-existing —
+  not a #240 regression.
+  - Fact attachment now resolves each record's entity through the alias
+    table with `find_entity`'s precedence (canonical first, then alias):
+    one `alias → canonical` map per call, built from the graph the read
+    already loaded (`graph.alias_canonical_map`), never a per-record
+    storage query on the recall path. Exact-match semantics for names that
+    are neither canonical nor alias are unchanged, as are
+    `current_records()` order and the per-entity fact cap — an alias-keyed
+    fact now competes for that cap like any other fact on its node.
+  - `recall`'s `re_verify` annotation matches a served fact back to its
+    slot on the same alias-resolved entity the attachment used, so an
+    alias-keyed fact standing on corrected evidence carries the caution
+    through `memory_recall`'s default projection instead of losing it on
+    exactly the facts this change makes visible. The trace lookup still
+    keys on the record's own slot (`cortex._norm_key(rec.entity)`), which
+    is where the dream wrote it. The recall side of that key is a node's
+    display name, which a later display enrichment can leave normalizing to
+    neither canonical nor alias (`GND (Enshrouded server)` over `gnd`), so
+    it resolves canonical → alias → display; before, no fact on such a node
+    could carry the caution. Cost: one graph load per `recall` call for
+    the alias table (the same load `graph_neighborhood` makes per hop).
+  - The reverse direction — `memory_fact_get` on the node's display or
+    canonical searching the node's aliases, and `chain()` doing the same —
+    lands with #244 (the `### Fixed` block above), which also makes the two
+    sides agree on an alias that another entity's canonical shadows.
+
+### Changed (2026-09-02 — elevated autostart steps say where to elevate)
+- **`ops\install-shim-autostart.ps1`, `ops\install-codex-shim-autostart.ps1`
+  and the one-shot installer's retry hints now tell Windows users to open
+  the elevated PowerShell fresh from the Start menu — never to request the
+  UAC prompt from a shell inside Claude Desktop or another Store-packaged
+  app.** Task Scheduler refuses per-user logon-task registration from an
+  unelevated administrator account (probed: fresh task, Limited principal,
+  root folder and subfolder all denied), so the elevation itself stays; but
+  elevating from inside a packaged app leaves Windows' Application
+  Information service holding that app's container job, and the app's next
+  update then fails to launch ("Another program is currently using this
+  file") until a reboot — anthropics/claude-code#61635, reproduced on the
+  maintainer's box on 2026-09-02, most likely triggered by the Codex
+  installer having been elevated from a Claude Desktop session on
+  2026-08-31 (inferred from timing). `docs/guide/dreaming.md` carries the
+  same note; the
+  `.sh` twins (systemd `--user`) never needed elevation and are unchanged.
+
+### Changed (2026-09-02 — the engram cross-index read in the retract direction)
+
+- **Correcting a memory now says what it put in doubt.** The dream derives
+  cortex facts FROM source memories and records the link in the engram
+  cross-index (`memory_traces`, schema v13), but that link had only ever
+  been used to answer "where did this fact come from?" — for one entry at a
+  time, as a display affordance (`memory_get`'s `consolidated_into`).
+  Superseding a source memory left every fact the dream built on it
+  standing as current with no signal at all (arXiv 2608.10502). No schema
+  change; gated on the existing `memory.traces.enabled` knob.
+  - `PostgresStorage.slots_for_entries` reads the edge backwards in batch,
+    and `MemoryService.derived_from_entries` reports it in display
+    vocabulary (the index stores norms). `memory_supersede` now returns
+    `derived_flagged` — the facts the correction put in doubt, named at the
+    moment of correction.
+  - Served cortex facts carry `re_verify` + `re_verify_reason` when they
+    stand on evidence corrected since they were last confirmed — the same
+    shape lessons already use for "subject facts changed since", not a
+    parallel one. Computed at read time from the cross-index plus live
+    entry state; no stored state, and the keys are absent on unaffected
+    facts, so their payloads are byte-identical.
+  - **FLAG, never cascade.** Nothing is auto-deleted or auto-superseded:
+    deciding whether a derivation still holds is a review judgment, the
+    same two-man rule the consolidation quarantine encodes.
+  - **The `last_confirmed` comparison is load-bearing.** The cross-index is
+    slot-keyed and trace rows are never deleted, so `source_entries` lists
+    every entry that ever formed the slot. A bare "any source superseded"
+    test latches on forever; measured on the live bank it would fire on
+    1470/5153 current facts (28.5%). Keyed on `last_confirmed` it fires on
+    1264 (24.5%) and — unlike the bare test — is cleared by re-asserting or
+    re-confirming the slot.
+  - **`re_verify` is deliberately PASSIVE**, exactly as it is on lessons: it
+    does NOT gate the `correct_with` affordance. At ~25% of a mature bank,
+    routing it into a call whose served note says to run a correction NOW
+    would be a standing instruction to rewrite a quarter of the cortex every
+    session. The active, targeted affordance is `derived_flagged`, which
+    fires only on an explicit correction.
+  - **`re_verify` is BEST-EFFORT, and the docs now say so.** It is derived
+    at read time from evidence that still exists, so losing the evidence
+    loses the flag: `memory_traces.entry_id` is `ON DELETE CASCADE`, a
+    true-drop capacity eviction hard-deletes the entry row (every eviction
+    under the default flat preset), and a superseded entry is the top
+    eviction candidate because contradiction decay multiplies its surprise
+    by 0.3. So a flag can appear and later vanish with nobody having
+    re-verified anything, and `memory_delete` — the strongest retraction of
+    all — raises no flag at any point. Outliving the evidence needs durable
+    per-slot state, i.e. a schema change, which is deliberately not in this
+    change; both behaviours are pinned by tests so the limit is a recorded
+    contract rather than a surprise. `derived_flagged`, named once at the
+    moment of correction, is the half that does not evaporate.
+  - **Set-valued slots carry the flag too.** The grouped set payload has no
+    scalar record behind it, so it carried no `source_entries` and could
+    never be flagged — while `slots_for_entries` is kind-agnostic and named
+    set slots in `derived_flagged` regardless (the lookup payload also had
+    no confirmation stamp; the search entry has carried `last_confirmed`
+    since the Task-6 review). Both surfaces now resolve the slot's traces —
+    the cross-index is slot-keyed, so one lookup answers for the whole set —
+    against the newest member's `last_confirmed`. Bluntly, and stated in the
+    docstring: adding a member also stamps the slot, so an unrelated add
+    silences the caution for members nobody re-checked. A set slot is one
+    served answer and a per-member flag on a grouped payload has nowhere to
+    render; `memory_recall`, where members ARE served individually, matches
+    per member instead.
+  - **`memory_recall` is annotated as well.** It serves canonical facts
+    through the graph projection rather than the cortex block, so the same
+    fact read as cautioned via `memory_search` and clean via `memory_recall`.
+    Scoped to the recall surface — one batched trace query
+    (`traces_for_slots`) plus one evidence query per call — and not pushed
+    down into `graph_neighborhood`, which also backs the Console's Atlas and
+    whole-graph views where facts label a node rather than answer a
+    question. The entity dossier stays unannotated by the same reasoning,
+    stated in its docstring. Facts are matched back to their slot on
+    `(entity, attribute, value)`: the graph and the cortex fold different
+    separator classes — `norm_name` folds `:`, `_norm_key` folds `-` and
+    leaves `:` alone — so `host:port` and `host-port` are two cortex slots
+    hanging off ONE graph node, and matching on entity and attribute alone
+    annotated both against whichever slot won the tie. `memory_recall`'s
+    DEFAULT (`verbose=False`) projection rebuilds each fact as
+    `{attribute, value}`, so it re-selects the two flag keys explicitly —
+    without that the service-layer annotation never reached a default
+    caller and the inconsistency this fixes survived intact on the MCP
+    surface. Both projections are pinned, mirroring the `memory_search`
+    whitelist pin.
+  - **Verification lookups do not pay for it.** `cortex_lookup(track=False)`
+    already declares a lookup a verification rather than an answer; the
+    dream rollback makes one per journal row and reads only `value`, so the
+    annotation is now gated on `track`.
+  - **`derived_flagged` is capped** at 50 slots with
+    `derived_flagged_truncated` / `derived_flagged_total` alongside — one
+    verbose memory can seed many slots and the whole list lands inline in an
+    MCP response.
+  - **`derived_flagged` reports the CURRENT slot vocabulary.** It took
+    display names from every version of every slot, oldest wins, so a slot
+    written as "Payments DB / Host" and re-asserted as "payments-db / host"
+    came back under a name the reader can no longer look up. Current records
+    now supply the naming. Trace rows also outlive the fact they formed, so
+    each row carries a new `has_current_value` — a slot with no current
+    value is still blast radius worth seeing, just not a fact to go
+    re-check — and the list is ordered live-slots-first so the cap keeps the
+    rows a reader can act on.
+  - **Downstream surfaces.** All three Cortex Console views that render
+    canonical facts — the search block, the Cortex view and Recall — now
+    show a shared `re-verify` badge carrying its reason. All three receive
+    the flag (Recall only because of this change), and a caution that shows
+    on one fact list and not the next is worse than none. The LME and BEAM
+    bank dumps pop `re_verify` / `re_verify_reason` beside `source_entries`,
+    so regenerated bank artifacts do not churn on a read-time key the
+    offline replay never uses.
+  - **The durable column is the single authority.** An earlier draft also
+    scanned the live band entries, because `consolidate` stamped its marks
+    in RAM without writing them through. The `Fixed` entry below closed
+    that, so all three entry-level supersession sites write through inside
+    the same locked call that sets the mark and the scan was paying an
+    O(bank) pass per annotated read for a state no live path can produce. A
+    future site that marks in RAM only is a known miss, pinned by a test.
+
+### Investigated, not adopted (2026-09-02 — distinct-provenance-root vote counting)
+
+- **CAMA (arXiv 2608.19701) does not apply to merge fold direction, and the
+  bank says so.** Every place agreement among entries or claims raises
+  confidence, promotes a contender, or resolves arbitration was enumerated;
+  the candidate for root-deduping was fold direction, which ranks entities
+  by `degree + fact_count` and DESTROYS the loser, where one verbose source
+  memory seeding six slots casts six votes. Counting distinct provenance
+  roots instead was built and measured against the live bank: it changes
+  526/1083 entity counts and flips 3 of 53 pending merge proposals — and all
+  three flips hand the merge to a node with ZERO facts and a few edges,
+  against nodes carrying 13 and 5 facts. That is verbatim the regression the
+  `fact_count` term was added to prevent in 2026-07-26. The term is a
+  content-mass measure ("which node is better specified?"), not a
+  corroboration measure ("does this claim have independent support?"), so
+  deduping it is the wrong operation. Reverted; nothing ships.
+- **The other counting sites, for the record.** The consolidation
+  quarantine's second-witness test already collapses at episode granularity
+  (coarser than the entry) and needs no change. The cortex `_confirm`
+  ratchet is already keyed to a distinct `(slot, source entry)` by the
+  dream's `has_trace` guard. Edge confidence still ratchets +0.05 per
+  re-assertion with no per-source key — a real unguarded false majority, but
+  the graph has no cross-index equivalent, so keying it needs a new table
+  and the full schema-bump checklist. Outcome signals are stored without
+  dedup. Everything else that counts (entity context vectors, consolidation
+  clustering, graph-insight question triggers, chronicle dedup, retrieval
+  scoring) counts band ENTRIES, and an entry is its own provenance root —
+  the engine has no entry-to-entry derivation edge, so there is nothing to
+  collapse.
+
+### Fixed (2026-09-02 — briefing handles survive long breaks and empty-root sweeps)
+- **A session's briefing `episode=` handle went permanently stale when the
+  session paused long enough for the idle reaper — the daemon then rejected
+  it as "unknown or closed" and every later write attributed under degraded
+  identity.** Two holes in the always-pass handle contract, observed live on
+  a session whose outcome and status writes lost their episode stamp:
+  - **Prune-at-reap deleted the row.** The reaper's close pruned a
+    zero-band-entry subtree immediately, so a session that had only
+    searched or written outcomes/cortex facts before a >30-min break lost
+    its episode entirely — resume was structurally impossible because
+    nothing remained to resume. The reaper now closes an empty root but
+    keeps it until past `PSEUDOLIFE_SESSION_RESUME_SECONDS`, then a sweep
+    deletes it leaving a **tombstone** (`(session_key, ended_at, title)`
+    in storage meta, restart-safe, capped at 200); a handle presented
+    after the sweep recreates the episode under its original id and
+    agent-set title. The sweep's candidates are exactly the roots the
+    reaper closed empty (a persisted deferred set) — never a scan of the
+    episode log, where zero live band entries also matches real history
+    whose memories were later evicted or forgotten. Explicit ends
+    (shim exit, `memory_episode_end`) keep the immediate prune — the
+    session affirmatively finished. Empty deferred closes fire no dream
+    and get no auto-title, matching what pruned empties did.
+  - **The 6 h session-key window also gated handles.** A presented handle
+    is a daemon-minted id only that session's briefing carried — an
+    explicit identity claim, unlike the session-key inference — so it now
+    resumes under its own `PSEUDOLIFE_HANDLE_RESUME_SECONDS` (default
+    2592000 = 30 days; `0` disables), covering a session deferred for days
+    or weeks (e.g. parked pending a GPU bench window). Reopening a
+    long-closed episode is safe: the dream cursor is monotonic, so late
+    writes are consolidated on the next pass.
+  `reap_idle_sessions` now reports `"swept"` alongside `"reaped"`. No
+  schema change — tombstones ride the existing meta key-value store.
+
+### Fixed (2026-09-02 — memory_consolidate supersessions survive a restart)
+- **A `memory_consolidate` call marked the old entries superseded in memory
+  but never wrote the marks to Postgres, so the correction was lost on the
+  next daemon restart and the consolidated-away entries came back looking
+  current.** `MemoryService.consolidate` set `superseded_at` /
+  `superseded_by_text` on the matched band entries and stopped there;
+  `_persist_all` syncs only `access_count` for entries (plus the
+  cortex/world/lesson snapshots), so nothing else carried the columns down.
+  On the next `hydrate_cms` the entries hydrated from their unchanged rows,
+  un-superseded — silently reverting the consolidation. `consolidate` now
+  mirrors the write-through `MemoryService.supersede` and
+  `ContinuumMemorySystem.store`'s contradiction decay have always had:
+  collect the marked entries, then `update_entry` each one carrying a
+  `db_id`. Both matching branches are covered — the exact-text pass and the
+  embedding fallback for paraphrases, which marks a different entry object.
+  No schema change; the columns already existed and were simply never
+  written on this path. Found while building the retract-direction
+  traversal, which reads supersession from both the live band entries and
+  the `entries.superseded_at` column precisely because of this gap.
+
+### Changed (2026-09-02 — served write-policy and trap-avoidance text)
+- **The always-on served text now names a write decision and warns that a
+  recalled memory can anchor the current task.** Two prompt-level findings
+  adopted; text only — no schema change, no behavior code, and the
+  measurement that would decide either has not been run.
+  - **Write policy (MCB, arXiv 2608.19564).** `memory_store`'s served
+    description and the session-start block's CAPTURE section now name the
+    four options for interaction-derived information — PERSIST /
+    CONTEXT ONLY / RE-VERIFY at source / ASK — with "re-verify" mapped onto
+    the existing `freshness_class="volatile"` vocabulary rather than a new
+    concept. The paper measured a policy prompt cutting erroneous
+    persistence 0.243 -> 0.100, and found models verify changing facts far
+    more reliably than they ask to resolve ambiguity, so the ASK clause is
+    stated explicitly instead of being left implicit.
+  - **Trap avoidance (MemTrapBench / AdaptiveMem, arXiv 2608.20202).**
+    `memory_search` and `memory_lesson_search`'s descriptions and the
+    block's TRUST ORDER paragraph now say a hit is a lead about the past,
+    not a directive for the present — check it against the task in hand
+    before it steers. "Re-derive when today's context differs" is carried
+    by `memory_search` alone: the block's TRUST ORDER already says
+    "re-verify before acting on it" two lines below, and its RECALL
+    section names re-deriving a known dead-end as the common failure, so
+    repeating it there would have cut both ways. The paper
+    found all five memory frameworks it tested underperforming no-memory
+    through stale-framing anchoring, recovered by an inference-time
+    instruction alone. `memory_lesson_search`'s wording is anchored to the
+    `re_verify` flag the tool already computes and returns but never
+    documented on its served surface; both `re_verify` keys are now in its
+    documented Returns shape. `memory_recall` is covered by the block line
+    rather than a third copy of the same sentence.
+  - **Not changed, deliberately.** `_MCP_INSTRUCTIONS` — the connect-time
+    instruction string every conforming client sees, rung 2 of the
+    hook-equivalent ladder in `docs/guide/providers.md` — still frames
+    storage as unconditional. It has 45 chars of headroom under its own
+    512-char cap (`tests/test_mcp_client_neutrality.py`), too little for
+    the four-way boundary; a client with no SessionStart hook therefore
+    gets the write policy from `memory_store`'s description only.
+  - **Manifest cost.** Tool descriptions +823 chars for core and full,
+    +551 for minimal (minimal 3232 -> 3783 of 5000, core 7054 -> 7877 of
+    11500, full 11740 -> 12563 of 17000); the session-start block
+    6908 -> 7316 of its 7500 guard, leaving 184 chars where there were 592.
+    No budget was raised. The block is now the binding surface: the next
+    addition to it must fund itself by trimming.
+  - Both edits are pinned by content tests
+    (`tests/test_tool_consolidation.py`, `tests/test_plugin_packaging.py`)
+    so a future trim that drops them goes red.
+
+### Fixed (2026-09-01 — the answerability probe's text matching)
+- **Four bug classes in `evals/answerability_probe.py`'s containment
+  ladder biased what it called answerable.** All four came out of the
+  post-merge review of the probe and were reproduced by execution before
+  being fixed; **none moved a published number** — all four committed
+  `*.answerability.json` artifacts regenerate byte-identically (pinned by
+  `test_committed_probe_artifacts_regenerate_exactly`), because the 503
+  rows the probe has been run over happen not to exercise the triggering
+  token shapes. The fixes remove latent measurement bias, not a wrong
+  result; the per-class scan behind that reading is in the PR.
+  - The stopword set was built by running the tokenizer over the
+    stopword list, so folded function words collided with real content
+    words: `does` folds to `doe`, which then excluded the genuine noun
+    *doe* from the required-coverage set and scored a context that never
+    mentioned it answerable. Membership is now tested on the raw token
+    and on its depluralized stem, never on the folded token — the stem
+    half matters because the folded set was also correctly absorbing
+    inflected function words (`theirs` folded onto `their`), and dropping
+    that would have pushed rows into `unanswerable` and inflated the
+    red-flag cell in the same edit that fixed the opposite bias.
+  - The spelled-number table was a re-typed subset stopping at *twenty*,
+    while `dream.py`'s reaches *ninety* plus hundred/thousand — so
+    "thirty minutes" scored unanswerable against a context saying "30
+    minutes". The full table is mirrored (importing `dream.py` would
+    pull torch into a CPU-only diagnostic) with a test asserting
+    equality against `dream.py`'s.
+  - Number words were folded to digits *before* the plural-s strip, so
+    `sevens` stayed `seven` while a bare `seven` became `7` and the two
+    spellings of one number stopped matching. The strip now runs first.
+  - The cortex context splitter was dispatched on an exact `arm ==
+    "cortex"` match while the hybrid one beside it used a prefix, so any
+    cortex variant arm would collapse to a single block and lose its
+    pathway attribution. It matches by prefix now. No probed artifact
+    carries such an arm today, so this one is a latent asymmetry closed
+    rather than a live miscount fixed.
+- **`report_block` no longer publishes an answerability block whose arms
+  disagree with the accuracy table beside it.** It discovers arms across
+  all rows while both harnesses derive theirs from row 0; a file resumed
+  with different arm flags silently produced a block covering arms the
+  table omitted. It now fails with the same message shape
+  `longmemeval_bench.report()` already used. `probe_rows` stays tolerant
+  — a per-row diagnostic should still read on a mixed file.
+- **The hybrid arm's served-context headers have one home.** The two
+  header literals had five uncoordinated copies across the producers,
+  the rebuilders and the probe's splitter; they now live in
+  `evals/context_format.py` (stdlib-only, so the CPU-only probe can
+  import it) and are pinned byte-identical to the strings they replaced,
+  so no persisted context shifts. `answerability_probe.JUDGE_SUFFIX` is
+  likewise tied to `replicate._JUDGE_SUFFIXES` by assertion rather than
+  by comment.
+
+### Added (2026-09-01 — failure attribution: was the right answer ever in memory?)
+- **`evals/answerability_probe.py` — memory-only answerability + pathway
+  evidence over judged artifacts.** AWM (arXiv 2608.25618) found 42.5%
+  of correct agent answers could not be reproduced from the agent's
+  memory alone — a failure end-to-end QA cannot see. The probe re-parses
+  a committed artifact's persisted contexts (CPU-only, both harness
+  shapes) and cross-tabs containment-answerability against each arm's
+  verdict; `unanswerable_correct` is the AWM red-flag candidate cell,
+  reconciled with the recorded `gold_in_question` leak flag. The same
+  parse emits per-row PAST-Bench (arXiv 2608.04003) pathway evidence:
+  which served context entries carry the gold, with per-arm supported
+  shares. Containment runs a two-step ladder (gold-variant span match,
+  then content-token coverage) and classifies what it cannot test with
+  reasons (`no_gold`/`trivial_gold`/`abstention`/`context_free_arm`/
+  `no_context`) instead of skipping — abstention golds name an absence
+  and the no-memory arm is unanswerable by construction, so neither may
+  fill the red-flag cell. A committed manual audit
+  (`*.redflag-audit.json`, kept in sync with the probe's red-flag ids by
+  test) records that all six ceiling-e2e red-flag arm-rows are
+  containment artifacts (inference-gap phrasing), not memory-support
+  failures. A judge-based level (`--judge`, `{arm}_answerable_judge`,
+  registered in `replicate.is_judge_field` for every stripper) is wired
+  with fail-fast server probing but has not been run. Both harnesses'
+  `--report` carry the block on artifacts with persisted contexts; probe
+  artifacts for the ceiling-e2e, qwen38 BEAM and both refind-smoke runs
+  are committed with pins in `tests/test_eval_evidence.py` — the qwen38
+  one records that the 2026-08-21 BEAM run predates context persistence
+  and is retroactively untestable (0 of 400 rows).
+
+### Added (2026-09-01 — two eval arms that decide whether a memory win is real)
+- **The BEAM adapter can now run an agentic lexical arm and a no-memory
+  control arm.** Both come from the 2026-09-01 briefing-backlog triage,
+  and both are measurement instruments only — no engine, daemon, or
+  serving behaviour changes. Both have been **smoke-run** (BEAM 100K chat
+  1, 20 questions; LongMemEval oracle, 5 questions; artifacts committed
+  under `evals/results/*-refind-smoke.*`) to validate the plumbing: the
+  loop used 2.9 of 3 rounds and 7.4 queries per question, served exactly
+  the rag control's 6 turns on every row, and hit 0 plan failures and 0
+  fallbacks across 25 questions. **No accuracy from those runs is quoted
+  or claimed** — one chat and five questions cannot separate arms.
+  - `--refind` (ReFind, [arXiv 2608.12888](https://arxiv.org/abs/2608.12888))
+    answers from an agentic **lexical** search loop over the same
+    formatted turns the bank holds: the answerer model plans BM25 queries
+    for up to `--refind-rounds` rounds, may narrow the search to a date
+    range, never re-reads a turn an earlier round inspected, and ranks
+    with session-aware fusion (a weak hit inside a session that already
+    yielded strong evidence outranks an equally weak hit standing alone).
+    That fusion runs twice — once inside a query to choose what it
+    inspects, then again over the union of everything inspected to choose
+    what is served, because per-query normalisation puts every query's
+    best hit at exactly 1.0 and would let a lone weak hit from a late
+    round tie the strongest hit of the first.
+    The paper reports this loop beating most structured memory systems;
+    single-shot BM25 is not that baseline and understates it, so without
+    this arm no ladder claim about the structural stack has a floor to
+    beat. The loop only *retrieves* — its context is answered and judged
+    by the harness's own answerer and judge, so it stays
+    instrument-matched to `rag`/`cortex`/`hybrid` — and its served turn
+    budget is matched to the rag control by default, so any win comes
+    from the loop rather than a wider window. It reuses the engine's own
+    BM25 (`pseudolife_memory/memory/bm25.py`) rather than a second
+    scorer. The index is built over the temporal window and exclusion is
+    applied to its results, so IDF does not drift as rounds accumulate;
+    undated turns stay eligible in every window, because narrowing must
+    not hide evidence it cannot place. `--refind-session-weight`,
+    `--refind-rounds`, `--refind-max-queries`, `--refind-per-round-k` and
+    `--refind-top-k` are flags precisely because their defaults are
+    declared, not measured.
+  - `--nomem` (MemTrapBench,
+    [arXiv 2608.20202](https://arxiv.org/abs/2608.20202)) answers from the
+    question alone under the same task framing, with the context clauses
+    removed rather than emptied. Its prompt is built PER HARNESS from that
+    harness's own answer-length policy: BEAM's rubric judge scores
+    multi-part answers and its answerer is told to answer completely,
+    while LongMemEval's judge grades on containment and caps answers at
+    one sentence. A single shared prompt would have left the arm verbose
+    in the harness whose judge rewards verbosity — more shots at
+    containing the gold than the arms it exists to bound, inflating the
+    memory-off floor in the one direction that matters.
+    All five frameworks that paper tested scored
+    *below* their no-memory arm on trap tasks; if memory-on does not beat
+    memory-off, the win is imaginary, and a harness that never asks
+    cannot tell.
+- **Both arms are wired into the LongMemEval harness too**
+  (`longmemeval_bench.py --refind --nomem`), sharing ONE implementation
+  with the BEAM adapter (`serve_comparator_arms`) so the two harnesses
+  cannot drift into serving them differently. LongMemEval splits
+  extraction from answering, so both contexts are persisted like every
+  other arm: `--phase extract` builds them once and `--phase answer` (or
+  a later `rebuild_contexts.py` re-answer) replays them without re-paying
+  extraction. The ReFind archive is built from the same haystack turns
+  the bank ingests, in the same order and the same stored text — pinned
+  turn-for-turn against the ingest path, since both format the haystack
+  independently. The memory arms' answer prompt is reproduced byte for
+  byte (the regression gate re-answers pinned contexts with it) and the
+  no-memory arm keeps the question-date prefix so the framing stays
+  shared. `replicate.py` now reads the arms off the rows rather than a
+  fixed tuple: `agg` reports comparator arms instead of silently omitting
+  them, `compare --arm refind` works and names the available arms when it
+  does not, and `strip_judged` clears EVERY arm's verdict rather than
+  leaving a stale comparator verdict beside freshly answered ones.
+- **Gold-answer leak check (`evals/leak_check.py`).** After the
+  [SR-TTT retraction](https://arxiv.org/abs/2603.06642) — where the gold
+  answer was already in the injected context, so the reported win measured
+  nothing — every BEAM row records `gold_in_question` at answer time,
+  `--report` carries a `leak_check` block (leaked-row count plus every
+  arm's mean with those rows excluded), and the check also runs standalone
+  over any judged artifact, BEAM `*_score` rows or LongMemEval
+  `*_correct` rows alike. It always writes its report and exits 1 when any
+  row leaked, so it can gate a promotion; answers too short or generic to
+  test for containment — or absent entirely — are reported as untestable
+  and broken down by reason rather than counted clean, each arm gets a
+  testable-only mean beside the leak-free one (untestable rows are not
+  leaked, so they would otherwise ride along inside it), and a
+  context-free arm that was served a context is flagged too.
+  First runs, committed with their claims. Over the 2026-08-21 BEAM
+  artifact: 0 of 400 rows leak, untestable splits 200 no-gold / 10
+  trivial-gold (five of BEAM's ten question types are rubric-judged and
+  carry no gold string, so the check cannot speak to half of it and says
+  so). Over the committed LongMemEval `ceiling-e2e` run: 0 of 78 leak,
+  and all 27 untestable rows are trivial-gold — LongMemEval always has a
+  gold string, so its blind spot is short numeric/yes-no answers rather
+  than missing ones. Both recomputations reproduce their run's published
+  arm means exactly, which is what makes the leak-free reads trustworthy.
+
+### Changed (2026-09-01 — daemon maintenance passes get named pauses and lose their biggest one)
+- **Slow service-lock holds and waits now name themselves in the log.** The
+  coarse service lock is a `MonitoredLock` (`utils/locks.py`): any hold or
+  wait past 1.0s warns with the holder's function name and the duration.
+  Threshold from the 2026-09-01 live-bank profile — every legitimate hold
+  measured there totalled ≤0.43s, so 1s only fires on regressions or the
+  unexplained stall class this exists to name. The 2026-08-31 hook-timeout
+  forensics needed two sessions of external probing to (mis)localize one
+  stall; this makes the next one a one-line diagnosis.
+- **Every sweep tick logs one ledger line with per-phase durations**
+  (`compact` / `prune_runs` / `prune_retrieval` / `deep_tick` / `judge` /
+  `dream` / `total`, also returned under `timings`), and the Step-C judge
+  announces its batch *before* the model call. Completions-only logging is
+  what let the same forensics misread a quiet 36s window as a judging
+  tick — with no tick start or duration in the ledger, a completion
+  timestamp invites back-dating the whole preceding window onto that phase.
+- **`candidate_pairs` is a descending-similarity scan with early exit
+  instead of an O(n²) Python pair loop** — 4.8s → 0.66s per deep tick on
+  the live bank (2,070 vector-eligible entities), verified output-identical
+  there and equivalence-pinned against a verbatim copy of the old loop in
+  `tests/test_graph_consolidation.py`. A similarity-threshold prefilter
+  cannot prune this space (64% of all pairs sit ≥ 0.55 on the live bank);
+  what bounds the work is the top-k output, so pairs are ranked by a
+  blocked matmul and only the top of the ranking runs the per-pair filter
+  chain, through the k-th survivor's rounded-similarity tie band. Worst
+  case degenerates to the old full scan, never worse.
+- **Saves report per-part durations** (`weights` / `access_counts` /
+  `cortex` / `world` / `lessons` under `timings` in the save result) and
+  warn with the breakdown when a save holds the service lock ≥ 1s — the
+  2026-08-31 probe caught a ~1.5s autosave-correlated stall that none of
+  the offline-measurable parts explains (weights ~5ms, access counts
+  ~30ms at live size), so the live daemon now names the part itself
+  instead of leaving it to correlation.
+- **`update_access_counts` is one `unnest`'d UPDATE instead of per-row
+  `executemany`** — 30.5ms → 9.8ms at the live bank's 1,135 rows, and the
+  autosave's lock hold stays O(1) in round trips as the bank grows.
+- **`/health` composes its payload off the event loop** (executor, like
+  every other blocking handler): the payload includes a blocking Postgres
+  ping, and inline it would freeze the daemon's entire web surface for the
+  ping's timeout during a DB stall
+  (`tests/test_web.py::test_asgi_health_runs_off_the_event_loop`).
+
+### Fixed (2026-09-01 — session hooks stop mistaking a busy daemon for a dead one)
+- **The plugin's SessionStart/SessionEnd hooks retry before declaring the
+  daemon down, and the fallback no longer claims the MCP tools are
+  unavailable.** A session start on 2026-09-01 hit the single 5s curl
+  attempt and the hook then told the whole session the
+  `mcp__pseudolife-memory__*` tools were unavailable — falsely, since the
+  MCP transport was fine and steady-state hook latency is ~0.1s. (The
+  incident was initially attributed to the dream-sweep judging tick;
+  same-day follow-up measurements showed no sweep was running at that
+  moment and the sweep's lock holds total ≤0.43s — the retry still
+  correctly bridges the real short stalls, e.g. the ~1.5s CMS autosave
+  measured against a 1,123-entry bank, and whatever timed out the
+  original attempt.) Both hook curls now carry `--retry 1 --retry-delay 1`
+  (plain `--retry` classes a timeout as transient, which is exactly the
+  measured failure; `--retry-all-errors` was deliberately rejected — it
+  breaks option parsing outright on curl < 7.71, still common on LTS
+  hosts, which would turn the intermittent false alarm into a permanent
+  one). Registration is idempotent per session_id so the retry is safe,
+  and the schedules sit inside their hooks.json budgets (5+1+5=11s < 15s
+  start; 3+1+3=7s < 10s end). The session-start fallback now says the
+  daemon "did not answer", tells the agent to make one `memory_stats`-style
+  call before treating memory as offline, and only then points at the
+  docker-compose quickstart. `tests/test_plugin_packaging.py` pins the
+  retry count by regex (a bare retry flag with no count is a no-op), the
+  `--retry-all-errors` ban, the verify-first guidance, and — parsed from
+  both sides — that each script's worst-case curl schedule plus spawn
+  margin fits its hooks.json timeout, so a future bump on either side
+  goes RED instead of silently producing a killed, message-less hook.
+
+### Added (2026-09-01 — dreamer reasoning effort is now a knob)
+- **The dreamer's reasoning effort can be pinned from the Console.** What
+  the dream extractor spent on thinking was previously decided outside the
+  repo (the Claude CLI shim ran at the `claude` CLI's per-model default,
+  the Codex CLI shim inherited the host's `~/.codex/config.toml` — where
+  the desktop app had silently written `model_reasoning_effort = "high"`).
+  New `memory.dream.extractor_reasoning_effort` knob (Console → Extractor
+  panel, plus an **Effort** seg-row on the Dreamer card, applies at the
+  next dream): a set value rides every primary extractor request as
+  `reasoning_effort` — the Claude shim maps it to `claude --effort`, the
+  Codex shim to `-c model_reasoning_effort=`, OpenAI-compatible servers
+  read it natively, most local runtimes ignore the unknown field (a hosted
+  API may reject an unsupported value loudly). Empty (default) sends
+  nothing — byte-identical to the old behavior — and the fallback sidecar
+  never receives it (same rule as the model-only override). Both shims
+  also grew a `--reasoning-effort` launch flag; a request's value wins.
+  (`pseudolife_memory/memory/dream.py`, `pseudolife_memory/utils/config.py`,
+  `pseudolife_memory/web/config_io.py`, `evals/claude_shim.py`,
+  `evals/codex_shim.py`, Console `views/console.js`.)
+
 ### Fixed (2026-09-01 — beam_rejudge: a timed-out judge call can no longer hang the run)
 - **`evals/beam_rejudge.py` now kills the whole process tree on a judge-call
   timeout** — the same `subprocess.run(..., timeout=...)` gap fixed in

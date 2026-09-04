@@ -393,3 +393,74 @@ def test_graph_review_dismiss_slot_pair_routes_to_service(tmp_path: Path, monkey
                       "deploy-host", "pitfall")]
     bad = mod.memory_graph_review("dismiss_slot_pair", store="lesson", src="no-pipe")
     assert bad.get("error") == "store_src_dst_required"
+
+
+def test_graph_review_restore_slot_routes_to_service(tmp_path: Path, monkeypatch) -> None:
+    """The undo for a lesson/world forget over MCP (2026-09-03): ``src`` is
+    the retired "entity|attribute" key as listed by the retired listing, or
+    a bare entity to restore every retired aspect of it."""
+    mod = _reload(tmp_path, monkeypatch)
+    calls: list[tuple] = []
+    monkeypatch.setattr(
+        mod.service, "lesson_restore",
+        lambda task, aspect=None, **kw: calls.append(("lesson", task, aspect, kw))
+        or {"restored": 1})
+    monkeypatch.setattr(
+        mod.service, "world_restore",
+        lambda entity, attribute=None, **kw: calls.append(("world", entity, attribute, kw))
+        or {"restored": 1})
+    out = _invoke("memory_graph_review",
+                  {"action": "restore_slot", "store": "lesson",
+                   "src": "deploy-daemon|approach"})
+    assert out == {"restored": 1}
+    out = _invoke("memory_graph_review",
+                  {"action": "restore_slot", "store": "world", "src": "acme"})
+    assert out == {"restored": 1}
+    assert calls == [("lesson", "deploy-daemon", "approach", {"decided_by": "agent"}),
+                     ("world", "acme", None, {"decided_by": "agent"})]
+    bad = mod.memory_graph_review("restore_slot", store="fact", src="x|y")
+    assert bad.get("error") == "store_src_required"
+    bad = mod.memory_graph_review("restore_slot", store="lesson")
+    assert bad.get("error") == "store_src_required"
+
+
+# ── served policy text (2026-09-02) ───────────────────────────────────────
+
+def _descriptions(tmp_path: Path, monkeypatch) -> dict[str, str]:
+    monkeypatch.setenv("PSEUDOLIFE_MCP_TOOLSET", "full")
+    mod = _reload(tmp_path, monkeypatch)
+    tools = asyncio.run(mod.mcp.list_tools())
+    return {t.name: " ".join((t.description or "").split()) for t in tools}
+
+
+def test_store_description_carries_the_write_policy_boundary(
+        tmp_path: Path, monkeypatch) -> None:
+    """MCB (arXiv 2608.19564) measured agents over-persisting ambiguous
+    interaction-derived information; a policy prompt naming the four
+    options cut erroneous persistence 0.243 -> 0.100. The boundary is
+    served on ``memory_store`` itself, where the decision is made — a
+    future trim that drops it should go red rather than quietly restore
+    the un-gated "store anything worth keeping" surface."""
+    d = _descriptions(tmp_path, monkeypatch)["memory_store"]
+    assert "PERSIST" in d
+    assert "CONTEXT ONLY" in d
+    assert "RE-VERIFY" in d
+    assert 'memory_fact_set(..., freshness_class="volatile")' in d
+    assert "ASK when the claim is ambiguous" in d
+
+
+def test_recall_surface_carries_trap_avoidance_guidance(
+        tmp_path: Path, monkeypatch) -> None:
+    """MemTrapBench (arXiv 2608.20202) found faithfully-recorded, relevant
+    memories still anchoring models on a stale framing (Reasoning Fixation
+    / Belief Distortion), with every framework tested underperforming
+    no-memory; an inference-time instruction recovered the loss. Pin it on
+    the two retrieval surfaces where the anchoring shape is strongest —
+    the always-visible entry point and prior lessons."""
+    d = _descriptions(tmp_path, monkeypatch)
+    assert "leads about the PAST" in d["memory_search"]
+    assert "re-derive" in d["memory_search"]
+    assert "anchors you on a stale framing" in d["memory_lesson_search"]
+    # The prose is anchored to the flag the tool already returns, so the
+    # guidance points at a computed signal rather than a vague heuristic.
+    assert "re_verify" in d["memory_lesson_search"]

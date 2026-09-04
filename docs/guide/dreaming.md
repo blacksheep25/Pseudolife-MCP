@@ -254,7 +254,12 @@ steps:
 1. Register the CLI shim (`evals/claude_shim.py`) to start automatically —
    requires a logged-in `claude` CLI:
    - Windows: `ops\install-shim-autostart.ps1` (Task Scheduler, at logon,
-     `127.0.0.1:8082`; `-Model` picks the served default —
+     `127.0.0.1:8082`; needs an elevated PowerShell — open it fresh from
+     the Start menu, never from a terminal inside Claude Desktop or another
+     Store-packaged app, or that app's next update fails to launch until a
+     reboot — see
+     [anthropics/claude-code#61635](https://github.com/anthropics/claude-code/issues/61635);
+     `-Model` picks the served default —
      `claude-opus-5` since the 2026-08-02 dreamer comparison; the one-shot
      installer prompts for this choice on Claude-shim installs).
    The shim also honors a concrete `claude-*` model named per request, so
@@ -302,7 +307,8 @@ ops/install.sh --extractor codex-fallback     # or codex-only; Windows: ops\inst
 
 which prompts for the GPT-5.6 dreamer (Sol / Terra / Luna), registers the
 shim to start automatically (`ops/install-codex-shim-autostart.ps1` — Task
-Scheduler, elevated pwsh; `.sh` — systemd `--user`, docker-bridge bind),
+Scheduler, elevated pwsh opened from the Start menu, same caveat as the
+Claude shim above; `.sh` — systemd `--user`, docker-bridge bind),
 and writes the env triple for you. The autostart raises the shim's
 health-probe interval to 1800 s (`--health-ttl`) because every `/health`
 refresh is a real CLI call — metered spend on a free ChatGPT tier; a
@@ -324,16 +330,41 @@ Claude presets. On Windows the shim finds the official installer's
 layout is off PATH and rotates on auto-update — the shim re-resolves the
 newest at every start).
 
-One honest caveat: extraction quality has only been ladder-measured on
-Claude models and the local sidecars; the `terra` rung
-(`evals/ladder_sweep.py --rung terra`) exists to measure a Codex-served
-model before you trust it with consolidation. (The shim itself is
-live-verified — smoke-tested 2026-08-31 against codex-cli 0.151.0-alpha
-on a free ChatGPT tier: health warm-up, a production-prompt extraction,
-and a per-request model switch all pass.) And no shim is required for any
-endpoint that already speaks `/v1/chat/completions`: a hosted OpenAI API
-key or any local runtime works directly via the env triple in the
-previous sections.
+Extraction quality: the `terra` and `luna` ladder rungs
+(`evals/ladder_sweep.py --rung terra` / `--rung luna`, first measured
+2026-09-01) score GPT-5.6 Terra and Luna at parity with the Claude
+ceiling rungs on the extraction bench — see the ceiling-probe table in
+`evals/README.md` for the numbers and the single-run caveats. (The shim
+is also live-verified — smoke-tested 2026-08-31 against codex-cli
+0.151.0-alpha on a free ChatGPT tier: health warm-up, a
+production-prompt extraction, and a per-request model switch all pass.)
+And no shim is required for any endpoint that already speaks
+`/v1/chat/completions`: a hosted OpenAI API key or any local runtime
+works directly via the env triple in the previous sections.
+
+## Reasoning effort — the dreamer's thinking budget
+
+By default neither CLI shim sets a reasoning effort: the Claude shim runs
+at the `claude` CLI's per-model default and the Codex shim inherits the
+host's `~/.codex/config.toml`, so what the dreamer actually spends is
+decided outside this repo. To pin it, set
+`memory.dream.extractor_reasoning_effort` (Console → Extractor panel, or
+the **Effort** row on the Dreamer card). A set value rides every primary
+extractor request as `reasoning_effort`:
+
+- the Claude CLI shim maps it to `claude --effort`
+  (`low`/`medium`/`high`/`xhigh`/`max`),
+- the Codex CLI shim maps it to `-c model_reasoning_effort=`
+  (`minimal`/`low`/`medium`/`high`/`xhigh`),
+- OpenAI-compatible servers read the field natively; most local runtimes
+  ignore the unknown field, though a hosted API may reject an unsupported
+  value with a clear 400 — the failure is loud, never silent.
+
+Empty (the default) means the field is never sent — exactly the pre-knob
+behavior. The fallback sidecar never receives it, same rule as the
+model-only override. Both shims also take a `--reasoning-effort` launch
+flag for a pinned default without touching daemon config; a request's
+value wins over the launch flag either way.
 
 ## Cadence — quiescence-gated, daemon-only
 
@@ -478,6 +509,56 @@ contested by design; the aggregate guard already parks the dangerous
 member-over-scalar case). Preregistration:
 `docs/superpowers/specs/2026-08-09-consolidation-quarantine-design.md`.
 
+## Constraint entries survive verbatim — TypeCompact + guard (schema v35)
+
+The dream is a compression step, and the compaction cliff (arXiv
+2608.22752) is what compression does to a rule: a safety rule and an
+episodic log are summarised at the same rate, but only the rule needs
+its exact wording to stay enforceable. An entry whose
+`distortion_tolerance` is `constraint` (set explicitly on `memory_store`,
+or inferred by the `auto` heuristic for rule-sized deontic text — see
+[memory-model](memory-model.md#who-said-it-and-how-exactly-must-it-survive-schema-v35))
+is therefore treated as zero-distortion by the dream:
+
+- **The carrier (TypeCompact).** Among the claims the extractor cites
+  the entry for, at least one scalar claim must contain the entry's text
+  verbatim (whitespace-collapsed, case-preserving). If none does, ONE
+  claim's *value* is replaced with the entry text: the claim whose
+  content tokens overlap the rule most (at least one must), and only if
+  its target slot is empty or already holds a constraint — a standing
+  non-constraint fact is never overwritten and a claim about something
+  else is never hijacked, whatever position it has in extractor output.
+  The extractor's entity and attribute are kept (slotting is what it is
+  good at; wording is not), sibling claims are left alone, member (`op`)
+  claims are never carriers, and with no eligible claim the carrier
+  refuses and leaves the miss to the guard. Only the carrier earns
+  `distortion_tolerance: constraint` (and the pin in recall); a
+  paraphrased sibling is an observation and inherits its slot's label.
+- **The guard verifier.** After the claims loop, every constraint entry
+  in the processed window must have a derived item carrying its text
+  verbatim (a parked contender counts; so does a slot the same entry
+  formed on an earlier pass). Misses are reported on the run result as
+  `constraint_misses` (entry id + text) beside `constraint_verbatim`, on
+  the run row's tallies as `constraint_missed`, and logged at WARNING.
+  This is a **flag, not a hard fail**: the paper fails a compaction whose
+  input is still there to retry, but here the raw entry is never
+  discarded (it stays in the associative store and is served by
+  `memory_search`), and holding the cursor would hostage every other
+  claim in the batch to one rule the extractor could not slot. The
+  typical miss is an extractor that emitted no scalar claim for the
+  entry at all — inventing a slot is not the dream's business.
+
+**Authority rides along.** Every derived fact takes the *source entry's*
+`authority` (`quoted` / `directive` / observation) and inherits the slot's
+label when the source is unlabelled — never anything the extractor wrote,
+which is model output and steerable by note text (the same trust class
+as claim `origin`). Under the two-man rule above, a `quoted` source is
+low-trust whoever relayed it: a third party's remark parks as a contender
+instead of taking `current` on the relayer's tier. The label only ever
+*demotes*; promotion stays keyed on entry metadata, so dressing a note up
+as a quote gains nothing but a park. Rollback restores the previous
+version's labels along with its value.
+
 ## Chronicle events (schema v28) — dated occurrences beside facts
 
 Facts answer "what is current"; they systematically lose *occurrences* —
@@ -549,10 +630,41 @@ default `shadow`; the dream extractor, or a dedicated `judge_url`), and
 records the verdict + confidence + note on the proposal row (schema v30),
 shown beside the evidence in every review surface. In `auto-reject` mode,
 reject verdicts at/above `judge_reject_min_confidence` are applied
-(`decided_by='dream-judge'`, pair dismissed); accepts are never auto-applied
-at this phase. Which models judge reliably is measured, not assumed:
-`evals/judge_ladder.py` scores arms against ratified triage verdicts
-(`evals/results/judge-ladder-20260816.json`).
+(`decided_by='dream-judge'`, pair dismissed). A row whose first verdict sat
+below that gate gets a **second opinion** on a later sweep
+(`judge_second_opinion`, optionally `judge_second_model` — both Console knobs) — a fresh batch,
+so an independent sample: two rejects at mean >= `judge_reject_min_confidence_2`
+apply, a disagreement stamps `split` on the note and leaves the row for a
+human. `judge_mode: auto` goes one step further and folds a pair when two
+independent accepts agree on a row that is not `low_differential` at mean
+>= `judge_accept_min_confidence` — the only path that ever auto-applies an
+accept. Since 2026-09-02 the other queues have judges too, each riding the
+same sweep as a bounded batch, all but one defaulting to `shadow`: the
+**link judge** (`link_judge_mode`; `auto` promotes accept verdicts to live
+edges and applies rejects, each at its own gate — a *retype* is only
+recorded, with its corrected relation on the row, for a reviewer to apply,
+because the first ladder scored the judge's relation choice at 0/1; edges
+are reversible, which is why this queue may run auto), the **junk judge**
+(`junk_judge_mode`; `auto` deletes only under an evidence bar), the
+**store-curation judge** (`curation_judge_mode`; `auto-distinct` applies
+the reversible dismissal, `auto` also retires — never deletes — the losing
+duplicate slot after folding its carry-over into the survivor), and the
+**Step-C candidate judge** (`candidate_judge_mode`, defaulting to `off`;
+after each deep apply, works through that apply's candidates one
+`judge_batch` slice per sweep tick — `propose` files an edge proposal and
+`dismiss` marks the pair distinct, and every judged pair is memoised for
+`candidate_rejudge_days`). Two mechanical additions stop the queues
+refilling: each apply files the Console's live analyzer duplicate findings
+into the merge and link queues (`analyzer_file_duplicates`, on by default)
+and — once you switch it on — deletes week-old entities that carry no
+evidence and no mention at all (`orphan_sweep`, off by default, at most
+`orphan_max_per_apply` per pass: it is the one destructive switch that
+would fire on the first apply after an upgrade). Which models
+judge reliably is measured, not assumed: `evals/judge_ladder.py` scores the
+merge judge against ratified triage verdicts
+(`evals/results/judge-ladder-20260816.json`) and `evals/queue_judge_ladder.py`
+scores every queue's judge against the 2026-09-02 blind-panel set
+(`evals/results/queue-judge-panel-20260902.json`), simulating each auto gate.
 The same need signal rides `memory_dream(action="status")` as the
 `deep_dream: {recommended, reason, ...}` block — a harness-agnostic
 nudge any MCP client can surface to its user when a triage session is

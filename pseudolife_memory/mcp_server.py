@@ -240,9 +240,25 @@ def memory_store(
         description="Who asserted the claim.")] = None,
     episode: Annotated[str | None, Field(
         description="Episode handle for attribution.")] = None,
+    authority: Annotated[
+        Literal["auto", "directive", "observation", "quoted"], Field(
+            description='Speech act: "directive" (an instruction to you) '
+                        '/ "quoted" (a doc or third party said it) / '
+                        '"observation"; "auto" infers.')] = "auto",
+    distortion_tolerance: Annotated[
+        Literal["auto", "constraint", "procedural", "belief", "preference",
+                "episodic"], Field(
+            description='"constraint" = must survive verbatim, pinned '
+                        'in recall; "auto" infers only that.')] = "auto",
 ) -> dict[str, Any]:
     """Store one durable fact, decision, or observation. Use proactively
-    for anything worth keeping — one claim per call. Near-duplicates are
+    for anything worth keeping — one claim per call, and decide which
+    kind it is: PERSIST what stays true and will be wanted back; leave
+    task-scoped detail in CONTEXT ONLY; RE-VERIFY a fast-changing value
+    at its source, parking it with ``memory_fact_set(...,
+    freshness_class="volatile")`` rather than persisting a stale one;
+    ASK when the claim is ambiguous instead of
+    persisting the guess. Near-duplicates are
     dropped, not erred (``stored=False``,
     ``reason="below_surprise_threshold"``). For canonical NOW use
     ``memory_fact_set``.
@@ -250,7 +266,8 @@ def memory_store(
     Returns: ``{stored, surprise, reason, cortex_promoted}``.
     """
     return service.store(
-        text=text, source=source, tags=tags, origin=origin, episode=episode)
+        text=text, source=source, tags=tags, origin=origin, episode=episode,
+        authority=authority, distortion_tolerance=distortion_tolerance)
 
 
 def _restates_fact(entry_text: str, value: str) -> bool:
@@ -289,19 +306,58 @@ def _restates_fact(entry_text: str, value: str) -> bool:
 # the toolset gate. The Cortex Console is unaffected (REST calls service.*).
 
 
-def _compact_entry(e: dict[str, Any]) -> dict[str, Any]:
+def _truncate(t: str, cap: int) -> tuple[str, bool]:
+    """Cap one served text, reporting whether it was cut. Same
+    ``[:cap] + "…"`` convention as ``_compact_recall_text`` and the
+    ``text_preview`` fields in cms.py / service.py."""
+    if cap <= 0 or len(t) <= cap:
+        return t, False
+    return t[:cap] + "…", True
+
+
+def _compact_entry(e: dict[str, Any],
+                   text_chars: int | None = None) -> dict[str, Any]:
     """{id, text, source, tags, score} plus the supersession signal when
-    set — ``superseded_by_text`` changes answers, so it always survives."""
+    set — ``superseded_by_text`` changes answers, so it always survives.
+
+    ``text_chars`` caps the entry's own ``text`` (2026-09-04 agent token
+    ledger: it alone was 64% of a served ``memory_search`` payload, mean
+    1,180 chars per hit) and sets ``truncated: True``, which means one
+    thing: this entry's ``text`` was clipped and ``memory_get`` returns it
+    whole. None = no truncation, the pre-ledger shape.
+
+    ``superseded_by_text`` is EXEMPT from the cap. It has no recovery
+    path: a compact entry carries no id for the superseding entry, and
+    nothing stores a pointer to one, so ``memory_get(entry.id)`` returns
+    this (superseded) entry's text rather than the replacement. Clipping
+    it would destroy the correction three surfaces tell agents to prefer
+    over the entry's own text (``web/session_hook.MEMORY_LOOP_BLOCK``,
+    ``examples/CLAUDE.memory.md``, ``memory_search``'s docstring). The
+    cost is bounded and measured — mean 2,406 chars per ``top_k=8`` query
+    on the 2026-09-04 ledger bank — and the remaining cut still stands."""
     out = {k: e[k] for k in ("id", "text", "source", "tags", "score") if k in e}
     if e.get("superseded"):
         out["superseded"] = True
     if e.get("superseded_by_text"):
         out["superseded_by_text"] = e["superseded_by_text"]
+    # v35 labels change how a hit may be USED (a quoted remark is not an
+    # instruction; a constraint is verbatim), so they survive compaction.
+    for k in ("authority", "distortion_tolerance"):
+        if e.get(k):
+            out[k] = e[k]
+    if text_chars is not None and isinstance(out.get("text"), str):
+        # ``superseded_by_text`` is deliberately absent from this loop —
+        # see the exemption in the docstring above.
+        out["text"], cut = _truncate(out["text"], text_chars)
+        if cut:
+            out["truncated"] = True
     return out
 
 
-def _compact_entries(result: dict[str, Any]) -> dict[str, Any]:
-    result["entries"] = [_compact_entry(e) for e in result.get("entries", [])]
+def _compact_entries(result: dict[str, Any], *,
+                     text_chars: int | None = None) -> dict[str, Any]:
+    result["entries"] = [_compact_entry(e, text_chars)
+                         for e in result.get("entries", [])]
     return result
 
 
@@ -345,6 +401,18 @@ def _cortex_correct_with(f: dict[str, Any]) -> str | None:
     aged = needs_correction_nudge(
         f.get("freshness_class") or "evergreen",
         f.get("last_confirmed") or f.get("asserted_at"))
+    # ``re_verify`` deliberately does NOT gate here. It is a passive
+    # caution, exactly as it is on lessons (`_annotate_lesson_staleness`),
+    # and it fires on ~25% of a mature bank's facts — measured 2026-09-02
+    # on the live bank: 1264/5153 current facts stand on a source memory
+    # contradicted since they were last confirmed, because `cms.store`'s
+    # contradiction decay marks entries superseded automatically and
+    # liberally. Routing that into a call the served CORRECTION_NOTE tells
+    # the reader to run NOW would turn a common, weak signal into a
+    # standing instruction to rewrite a quarter of the cortex every
+    # session. The ACTIVE affordance for retracted evidence is
+    # `memory_supersede`'s `derived_flagged`, which fires only on an
+    # explicit correction and names exactly the facts affected.
     if not (f.get("contested") or f.get("stale") or aged):
         return None
     return (f"memory_fact_set(entity={f['entity']!r}, "
@@ -371,7 +439,7 @@ def memory_search(
     query: Annotated[str, Field(
         description="Natural-language description; specific beats vague.")],
     top_k: Annotated[int, Field(
-        description="Max entries returned.")] = 8,
+        description="Max entries; caps cortex facts too.")] = 8,
     sources: Annotated[list[str] | None, Field(
         description="Keep only entries with one of these source tags.")] = None,
     bands: Annotated[list[str] | None, Field(
@@ -389,23 +457,32 @@ def memory_search(
         description="Tri-state override for cross-encoder reranking "
                     "(~200ms); None follows config.")] = None,
     bm25: Annotated[bool | None, Field(
-        description="Tri-state override for keyword scoring, which aids "
-                    "exact-term queries; None follows config.")] = None,
+        description="Tri-state override for keyword scoring (exact terms); "
+                    "None follows config.")] = None,
     explain: Annotated[bool, Field(
         description="Attach a ranking ``trace``; implies verbose.")] = False,
     verbose: Annotated[bool, Field(
-        description="Full per-entry metadata; the default is compact "
-                    "``{id, text, source, tags, score}`` plus supersession "
-                    "when set.")] = False,
+        description="Full per-entry metadata and untruncated ``text``; "
+                    "default entries are compact.")] = False,
 ) -> dict[str, Any]:
     """Retrieve memories for a query — associative recall plus canonical
-    facts. Call at task start or when context may apply. ``cortex``
+    facts. Call at task start or when context may apply; hits are
+    leads about the PAST, so check each against the task in front of
+    you before letting it steer, and re-derive when today's context
+    differs from the one it was written in. ``cortex``
     facts arrive AHEAD of ``entries`` — the current, deduped answer
-    (``contested: true`` awaits ``memory_fact_resolve``).
+    (``contested: true`` awaits ``memory_fact_resolve``). ``top_k``
+    sizes both blocks: ``min(5, top_k)`` facts.
     ``low_confidence=True``: no confident match, prefer abstaining. On a
-    superseded entry, prefer ``superseded_by_text``. Temporal cues may
-    add ``events`` (oldest first). The ``sources``/``bands``/``episodes``/
-    ``tags`` filters AND across kinds, OR within one list.
+    superseded entry, prefer ``superseded_by_text`` (never
+    clipped). Temporal cues may
+    add ``events`` (oldest first). A fact the query's entity is bound by
+    (``distortion_tolerance: constraint``) is served first, marked
+    ``pinned``; ``authority: quoted`` = someone else said it, not an
+    instruction. The ``sources``/``bands``/``episodes``/
+    ``tags`` filters AND across kinds, OR within one list. A long hit is
+    served clipped, marked ``truncated: true`` — ``memory_get`` returns
+    that entry's full text.
 
     Returns: ``{query, count, entries, cortex, low_confidence}``.
     """
@@ -427,104 +504,169 @@ def memory_search(
     # retrieval-log row this search just wrote. Popped unconditionally so
     # it never leaks into the tool result.
     _evt_id = result.pop("retrieval_event_id", None)
-    # Cortex-first: surface canonical facts above associative recall, and drop
-    # any recall hit that merely restates a surfaced fact (currency, not noise).
-    # ``cortex`` is part of the documented return shape, so it is always
-    # present — an empty list on a miss, never a missing key.
-    result.setdefault("cortex", [])
+    mcp_cfg = service.config.memory.mcp
+    compact_payloads = mcp_cfg.compact_payloads
     cc = service.config.memory.cortex
+    facts: list[dict[str, Any]] = []
     if cc.enabled and cc.search_first and (query or "").strip():
-        facts = service.cortex_search(query, top_k=5, min_score=cc.guard_min_score).get("entries", [])
-        if facts:
-            if _evt_id is not None:
-                service.attach_served_facts(_evt_id, facts)
-            result["cortex"] = [
-                {
-                    "entity": f["entity"], "attribute": f["attribute"],
-                    "value": f["value"], "origin": f.get("origin", ""),
-                    # Task 6: a grouped set-slot entry has no scalar
-                    # ``confidence`` (it summarises many current members,
-                    # each with its own) — ``.get`` degrades to ``None``
-                    # rather than KeyError-ing the whole search.
-                    "confidence": f.get("confidence"), "score": f.get("score"),
-                    "contested": f.get("contested", False),
-                    # Currency. The cortex is the layer an agent trusts most,
-                    # so a stale fact here is worse than a stale entry — and
-                    # supersession only fires within one (entity, attribute)
-                    # slot, so the SAME fact recorded under a second entity
-                    # name goes uncorrected and uncontested. Without a date
-                    # the two are indistinguishable; with one the reader can
-                    # tell which write is newer. (2026-07-26: a ten-day-old
-                    # "(v1 prompt)" fact sat beside a fresh "v2" fact, both
-                    # contested=False, and an agent picked v1.)
-                    "asserted_at": _iso_seconds(f.get("asserted_at")),
-                    "last_confirmed": _iso_seconds(f.get("last_confirmed")),
-                    "age": f.get("age"),
-                    # v23: only surfaced when the writer marked the fact
-                    # transient. Evergreen (the default) decays to nothing and
-                    # would just be noise on every durable fact.
-                    **(
-                        {"freshness_class": f.get("freshness_class"),
-                         "effective_confidence": f.get("effective_confidence"),
-                         "stale": f.get("stale", False)}
-                        if (f.get("freshness_class") or "evergreen") != "evergreen"
-                        else {}
-                    ),
-                    **(
-                        {"contender_value": f.get("contender_value"),
-                         "contender_origin": f.get("contender_origin", "")}
-                        if f.get("contested") else {}
-                    ),
-                    # Serving-side staleness policy (memory.search.
-                    # stale_policy): the fields the policy adds must survive
-                    # this key re-selection, or the most-used read surface
-                    # would serve the quarantine wrapper without the
-                    # original value beside it.
-                    **(
-                        {"warning": f["warning"]}
-                        if f.get("warning") else {}
-                    ),
-                    **(
-                        {"last_known_value": f["last_known_value"]}
-                        if "last_known_value" in f else {}
-                    ),
-                    # Supersede-at-discovery: aged/stale/contested facts
-                    # carry their exact correction call (see CORRECTION_NOTE).
-                    **(
-                        {"correct_with": cw}
-                        if (cw := _cortex_correct_with(f)) else {}
-                    ),
-                }
-                for f in facts
-            ]
-            if any("correct_with" in c for c in result["cortex"]):
-                result["correction_note"] = CORRECTION_NOTE
-            # Dedup against the UNDERLYING value, not the served one: under
-            # stale_policy="quarantine" the served value is the wrapper
-            # string, and keying on it would re-expose the raw stale value
-            # in the entries below the quarantined fact (2026-08-09 review
-            # finding).
-            fact_vals = [f.get("last_known_value", f.get("value", ""))
-                         for f in facts]
-            kept = [
-                e for e in result.get("entries", [])
-                if not any(_restates_fact(e.get("text", ""), v) for v in fact_vals)
-            ]
-            result["entries"] = kept
-            result["count"] = len(kept)
-    # A confident cortex answer must never be flagged low-confidence: the
-    # cortex block IS the answer even when associative recall is weak/empty.
-    result["low_confidence"] = result.get("low_confidence", False) and not result.get("cortex")
+        # The block follows the CALLER (2026-09-04 ledger, cut b): a
+        # ``top_k=2`` search asked for two answers and got five facts
+        # regardless. ``min`` keeps the historical width at the default
+        # (8) and every wider call. The narrowing is passed INTO
+        # ``cortex_search`` rather than sliced off its output, because
+        # constraint pinning budgets itself against that same ``top_k``
+        # (``_pin_constraint_facts``) — a post-hoc slice would take the
+        # pins off the head of the block, which is where they exist to be.
+        fact_k = min(5, max(1, top_k)) if compact_payloads else 5
+        facts = service.cortex_search(
+            query, top_k=fact_k,
+            min_score=cc.guard_min_score).get("entries", [])
+        if facts and _evt_id is not None:
+            service.attach_served_facts(_evt_id, facts)
+    result = _project_search(
+        result, facts, compact=not (verbose or explain),
+        text_chars=(mcp_cfg.entry_text_chars if compact_payloads else None))
     if explain:
         trace_out = service.trace(
             query=query, top_k=top_k, sources=sources, bands=bands,
             episodes=episodes, tags=tags, rerank=rerank, bm25=bm25,
         )
         result["trace"] = trace_out.get("trace")
-    # explain implies verbose: a ranking trace without the entry metadata it
-    # scores against would be unreadable.
-    if not (verbose or explain):
-        result = _compact_entries(result)
+    return result
+
+
+def _project_search(result: dict[str, Any], facts: list[dict[str, Any]], *,
+                    compact: bool,
+                    text_chars: int | None = None) -> dict[str, Any]:
+    """Project a raw ``service.search`` result into the MCP payload — pure.
+
+    Lifted verbatim out of ``memory_search`` (2026-09-04) so the agent
+    token ledger (``evals/agent_token_ledger.py``) can reproduce the exact
+    shape an MCP client receives from raw service output, without a live
+    service and without a second copy of this logic to drift. The tool
+    keeps the two service calls it needs (``cortex_search`` and
+    ``attach_served_facts``) and hands the facts in.
+
+    ``facts`` is the raw cortex block, ``[]`` when the cortex-first path
+    did not run. ``compact`` selects the lean per-entry shape (False for
+    ``verbose``/``explain`` callers) and ``text_chars`` caps the free text
+    inside it (None = untruncated).
+
+    Cortex-first: surface canonical facts above associative recall, and
+    drop any recall hit that merely restates a surfaced fact (currency,
+    not noise). ``cortex`` is part of the documented return shape, so it
+    is always present — an empty list on a miss, never a missing key.
+    """
+    result.setdefault("cortex", [])
+    if facts:
+        result["cortex"] = [
+            {
+                "entity": f["entity"], "attribute": f["attribute"],
+                "value": f["value"], "origin": f.get("origin", ""),
+                # Task 6: a grouped set-slot entry has no scalar
+                # ``confidence`` (it summarises many current members,
+                # each with its own) — ``.get`` degrades to ``None``
+                # rather than KeyError-ing the whole search.
+                "confidence": f.get("confidence"), "score": f.get("score"),
+                "contested": f.get("contested", False),
+                # Currency. The cortex is the layer an agent trusts most,
+                # so a stale fact here is worse than a stale entry — and
+                # supersession only fires within one (entity, attribute)
+                # slot, so the SAME fact recorded under a second entity
+                # name goes uncorrected and uncontested. Without a date
+                # the two are indistinguishable; with one the reader can
+                # tell which write is newer. (2026-07-26: a ten-day-old
+                # "(v1 prompt)" fact sat beside a fresh "v2" fact, both
+                # contested=False, and an agent picked v1.)
+                "asserted_at": _iso_seconds(f.get("asserted_at")),
+                "last_confirmed": _iso_seconds(f.get("last_confirmed")),
+                "age": f.get("age"),
+                # v23: only surfaced when the writer marked the fact
+                # transient. Evergreen (the default) decays to nothing and
+                # would just be noise on every durable fact.
+                **(
+                    {"freshness_class": f.get("freshness_class"),
+                     "effective_confidence": f.get("effective_confidence"),
+                     "stale": f.get("stale", False)}
+                    if (f.get("freshness_class") or "evergreen") != "evergreen"
+                    else {}
+                ),
+                **(
+                    {"contender_value": f.get("contender_value"),
+                     "contender_origin": f.get("contender_origin", "")}
+                    if f.get("contested") else {}
+                ),
+                # Serving-side staleness policy (memory.search.
+                # stale_policy): the fields the policy adds must survive
+                # this key re-selection, or the most-used read surface
+                # would serve the quarantine wrapper without the
+                # original value beside it.
+                **(
+                    {"warning": f["warning"]}
+                    if f.get("warning") else {}
+                ),
+                **(
+                    {"last_known_value": f["last_known_value"]}
+                    if "last_known_value" in f else {}
+                ),
+                # Retract traversal (arXiv 2608.10502): this fact was
+                # derived from a memory that has since been superseded.
+                # Absent on every unaffected fact, so the common payload
+                # is unchanged — but it must be re-selected explicitly
+                # here or the correction never reaches the most-used
+                # read surface (the same failure the stale-policy
+                # comment above records).
+                **(
+                    {"re_verify": True,
+                     "re_verify_reason": f.get("re_verify_reason")}
+                    if f.get("re_verify") else {}
+                ),
+                # v35 label pair + pin marker: absent on every
+                # unlabelled fact (payload unchanged), re-selected
+                # explicitly here for the same whitelist reason as
+                # re_verify above.
+                **(
+                    {"authority": f["authority"]}
+                    if f.get("authority") else {}
+                ),
+                **(
+                    {"distortion_tolerance": f["distortion_tolerance"]}
+                    if f.get("distortion_tolerance") else {}
+                ),
+                **(
+                    {"pinned": True}
+                    if f.get("pinned") else {}
+                ),
+                # Supersede-at-discovery: aged/stale/contested facts
+                # carry their exact correction call (see CORRECTION_NOTE).
+                **(
+                    {"correct_with": cw}
+                    if (cw := _cortex_correct_with(f)) else {}
+                ),
+            }
+            for f in facts
+        ]
+        if any("correct_with" in c for c in result["cortex"]):
+            result["correction_note"] = CORRECTION_NOTE
+        # Dedup against the UNDERLYING value, not the served one: under
+        # stale_policy="quarantine" the served value is the wrapper
+        # string, and keying on it would re-expose the raw stale value
+        # in the entries below the quarantined fact (2026-08-09 review
+        # finding).
+        fact_vals = [f.get("last_known_value", f.get("value", ""))
+                     for f in facts]
+        kept = [
+            e for e in result.get("entries", [])
+            if not any(_restates_fact(e.get("text", ""), v) for v in fact_vals)
+        ]
+        result["entries"] = kept
+        result["count"] = len(kept)
+
+    # A confident cortex answer must never be flagged low-confidence: the
+    # cortex block IS the answer even when associative recall is weak/empty.
+    result["low_confidence"] = result.get("low_confidence", False) and not result.get("cortex")
+    if compact:
+        result = _compact_entries(result, text_chars=text_chars)
     return result
 
 
@@ -567,7 +709,15 @@ def memory_supersede(
     entry is kept but flagged superseded, so retrieval ranks the correction
     higher and shows both together.
 
-    Returns: ``{superseded_count, superseded_texts, new_memory_stored}``.
+    Returns: ``{superseded_count, superseded_texts, new_memory_stored,
+    derived_flagged}`` — the last being the canonical facts the dream built
+    on the memories just corrected. They are FLAGGED, never rewritten;
+    check each and re-assert the ones that moved. Each row carries
+    ``has_current_value``: false means the slot holds no current fact any
+    more — blast radius worth seeing, but nothing to go re-check. The list
+    is capped, live slots first; ``derived_flagged_truncated`` /
+    ``derived_flagged_total`` say when a correction reached further than
+    the cap.
     """
     return service.supersede(old_text=old_text, new_text=new_text)
 
@@ -695,6 +845,9 @@ def memory_fact_get(
                     "is case- and separator-insensitive.")],
     attribute: Annotated[str, Field(
         description="The slot's attribute.")],
+    verbose: Annotated[bool, Field(
+        description="Full record; the default drops bookkeeping keys.")]
+    = False,
 ) -> dict[str, Any]:
     """Look up the one CURRENT value at an ``(entity, attribute)`` slot.
     One value per slot. A null record means EMPTY, not unknown —
@@ -706,6 +859,13 @@ def memory_fact_get(
     entity has a graph node). Non-empty ``contenders`` = unsettled
     conflict (see ``memory_fact_resolve``); on an empty slot,
     ``candidates`` lists nearby slots — ranked leads, not answers.
+    ``re_verify`` = a memory this fact was derived from has since been
+    corrected; the value still stands but check it before acting. Set slots
+    carry it too, at the slot. Its absence is not a guarantee: the flag is
+    read from evidence that still exists, so it stops once the corrected
+    memory is evicted or deleted. ``verbose=True`` adds the record's
+    provenance, support and temporal stamp; ``memory_history`` shows the
+    slot's version chain.
     """
     rec = service.cortex_lookup(entity, attribute)
     out = {
@@ -736,6 +896,77 @@ def memory_fact_get(
             "entity_id": ref["id"], "canonical": ref["canonical"],
             "etype": ref["etype"], "aliases": ref["aliases"],
         }
+    if not verbose and service.config.memory.mcp.compact_payloads:
+        out["record"] = _lean_fact_record(out["record"])
+    return out
+
+
+# The keys ``memory_fact_get`` serves by default (2026-09-04 agent token
+# ledger, cut c). Everything else in ``_cortex_record_to_dict`` —
+# provenance, support, writer/session id, tx/valid time, the supersession
+# chain, status — is audit bookkeeping an agent never acts on mid-task and
+# can still reach through ``verbose=True``, ``memory_history`` or the
+# Console. ``polarity`` is dropped on narrower grounds — it is a negation
+# marker, not bookkeeping, but every service write path leaves it at "+".
+# Each mints ``Slot(entity, attribute, value)`` positionally, so the
+# polarity ``cortex.write_fact`` would honour is never set from the service
+# (``cortex_write``, ``add_member``, and the CMS write-through at
+# service.py ~1258, which folds an extracted negative slot into a
+# NOT-prefixed VALUE rather than a negative row). All 5,500 current facts
+# on the measured bank read "+" (2026-09-04); a "-" row would need
+# ``verbose=True``. Measured: 62% of the record's chars, on every lookup.
+#
+# An allow-list, not a deny-list, and the served-absent-when-default rule
+# (PR #245) still holds: a key that survives is byte-identical to what it
+# was, and every conditional key below is absent on a plain record, so an
+# unlabelled fact reads exactly as it did before minus the bookkeeping.
+_LEAN_FACT_KEYS = (
+    "entity", "attribute", "value", "kind", "confidence", "origin",
+    # Both timestamps, not just the first write: the cortex block in
+    # ``_project_search`` serves ``last_confirmed`` beside ``asserted_at``
+    # for a reason recorded there (2026-07-26 — a ten-day-old fact sat
+    # beside a fresh rival, both uncontested, and an agent picked the old
+    # one; supersession cannot fire across two entity names, so the date
+    # is the only thing telling them apart). The same slot read through
+    # ``memory_fact_get`` must not be the one surface that hides it.
+    "asserted_at", "last_confirmed", "age", "freshness_class", "stale",
+    # Set slots: the members ARE the value.
+    "members", "removed",
+    # Currency / correction affordances — the reason to re-verify before
+    # acting, so dropping one would silently retire the affordance.
+    "re_verify", "re_verify_reason", "correct_with",
+    # Serving-side stale policy wrapper (memory.search.stale_policy).
+    "warning", "last_known_value",
+    # The engram links — a short int list, and the only handle from a fact
+    # back to the episodes that formed it. Three surfaces name it as the
+    # DEFAULT-tier contract: the poisoned-memory procedure in
+    # docs/guide/security-posture.md ("follow the engram links"),
+    # memory_get's core-tier justification above, and
+    # test_release_ux.py::test_core_tier_can_close_its_own_loops. Not
+    # bookkeeping (2026-09-04 review finding).
+    "source_entries",
+    # v29/v35 labels: how the value may be USED.
+    "stance", "authority", "distortion_tolerance",
+)
+
+
+def _lean_fact_record(rec: Any) -> Any:
+    """``memory_fact_get``'s default record projection (see
+    ``_LEAN_FACT_KEYS``). Set members are projected on the same terms —
+    they are records, and a set slot is where the bookkeeping multiplies.
+    ``effective_confidence`` follows the cortex block's rule: served only
+    when the fact's class actually decays, since it equals ``confidence``
+    for evergreen."""
+    if not isinstance(rec, dict):
+        return rec
+    out = {k: rec[k] for k in _LEAN_FACT_KEYS if k in rec}
+    if (rec.get("freshness_class") or "evergreen") != "evergreen" \
+            and "effective_confidence" in rec:
+        out["effective_confidence"] = rec["effective_confidence"]
+    if isinstance(out.get("members"), list):
+        out["members"] = [_lean_fact_record(m) for m in out["members"]]
+    if isinstance(out.get("removed"), list):
+        out["removed"] = [_lean_fact_record(m) for m in out["removed"]]
     return out
 
 
@@ -760,6 +991,16 @@ def memory_fact_set(
         Literal["auto", "evergreen", "slow", "volatile"], Field(
             description='How fast the value rots. "auto" infers the decay '
                         "rate from the entity kind.")] = "auto",
+    authority: Annotated[
+        Literal["auto", "directive", "observation", "quoted"], Field(
+            description='Speech act of the source: "directive" / "quoted" '
+                        '(doc or third party) / "observation"; "auto" '
+                        'infers.')] = "auto",
+    distortion_tolerance: Annotated[
+        Literal["auto", "constraint", "procedural", "belief", "preference",
+                "episodic"], Field(
+            description='"constraint" = verbatim, pinned in recall; "auto" '
+                        'infers only that.')] = "auto",
 ) -> dict[str, Any]:
     """Assert a canonical fact — insert, confirm, or correct a slot.
 
@@ -768,12 +1009,16 @@ def memory_fact_set(
     winner under ``current``) — check with the human, settle via
     ``memory_fact_resolve``.
 
+    ``authority`` / ``distortion_tolerance`` inherit the slot's labels
+    unless restated.
+
     Returns: ``{action: inserted|confirmed|superseded|contested, ...record}``.
     """
     return service.cortex_write(
         entity, attribute, value,
         confidence=confidence, support=(origin or "agent"), episode=episode,
         freshness_class=freshness_class,
+        authority=authority, distortion_tolerance=distortion_tolerance,
     )
 
 
@@ -987,10 +1232,14 @@ def memory_lesson_search(
 ) -> dict[str, Any]:
     """Search learned lessons (procedural memory) by similarity to the task
     at hand. Call at the START of a task: what worked, what to avoid, what
-    the user corrected before. Heed polarity ``-`` entries — known dead-ends.
+    the user corrected before. Heed polarity ``-`` entries — known
+    dead-ends. A lesson describes the run it came from, not this one:
+    apply it where today's specifics match, or it anchors you on a
+    stale framing — ``re_verify: true`` marks one whose subject facts
+    have changed since, so re-derive that one.
 
     Returns: ``{count, entries: [{task, aspect, lesson, about, polarity,
-    outcome, confidence, score}]}``.
+    outcome, confidence, score, re_verify, re_verify_reason}]}``.
     """
     result = service.lesson_search(query, top_k=top_k)
     if not verbose:
@@ -1031,9 +1280,11 @@ def memory_forget(
     tag: Annotated[str | None, Field(
         description="memory scope: delete entries carrying this tag.")] = None,
 ) -> dict[str, Any]:
-    """Hard-delete from one memory store. Cleanup for junk/test data — no
-    audit trail. For "now wrong, keep history" use ``memory_fact_set``
-    (facts) or ``memory_supersede`` (memories) instead.
+    """Forget from one memory store. ``memory`` and ``fact`` hard-delete
+    (cleanup for junk/test data — no audit trail); ``world`` and ``lesson``
+    RETIRE the slot with an audit row, undone by ``memory_graph_review(
+    action="restore_slot")``. For "now wrong, keep history" use
+    ``memory_fact_set`` (facts) or ``memory_supersede`` (memories) instead.
 
     ``scope="memory"`` needs at least one of ``text``/``substring``/
     ``source``/``episode``/``tag``, and those OR-combine — ANY match
@@ -1055,8 +1306,8 @@ def memory_forget(
         if scope == "fact":
             return service.cortex_forget(entity, attribute)
         if scope == "world":
-            return service.world_forget(entity, attribute)
-        return service.lesson_forget(entity, attribute)
+            return service.world_forget(entity, attribute, decided_by="agent")
+        return service.lesson_forget(entity, attribute, decided_by="agent")
     return {"error": "unknown_scope",
             "scopes": ["memory", "fact", "world", "lesson"]}
 
@@ -1143,7 +1394,7 @@ def _coerce_id_list(value: Any) -> list[int] | None:
 @_tool()
 def memory_graph_review(
     action: Literal["list", "propose", "relate", "dismiss_pair",
-                    "dismiss_slot_pair", "accept_link", "reject_link",
+                    "dismiss_slot_pair", "restore_slot", "accept_link", "reject_link",
                     "accept_merge", "accept_junk", "reject_entity"] = "list",
     proposal_id: Annotated[int | None, Field(
         description="Id actions: the one proposal to settle.")] = None,
@@ -1158,7 +1409,7 @@ def memory_graph_review(
     src: Annotated[str | None, Field(
         description="relate/dismiss_pair: the first entity. "
                     'dismiss_slot_pair: an "entity|attribute" key from the '
-                    "deep response.")] = None,
+                    "deep response; restore_slot: retired key or entity.")] = None,
     dst: Annotated[str | None, Field(
         description="relate/dismiss_pair: the second entity. "
                     'dismiss_slot_pair: an "entity|attribute" key from the '
@@ -1167,8 +1418,8 @@ def memory_graph_review(
         description="relate: the edge relation to write, from the graph "
                     "vocabulary.")] = None,
     store: Annotated[str | None, Field(
-        description='dismiss_slot_pair: which duplicate listing the keys '
-                    'came from — "lesson" or "world".')] = None,
+        description='dismiss_slot_pair / restore_slot: which store the key '
+                    'belongs to — "lesson" or "world".')] = None,
 ) -> dict[str, Any]:
     """Work the graph review queue — deep-dream proposals that need a
     verdict before they touch the graph.
@@ -1180,6 +1431,8 @@ def memory_graph_review(
             ``relation`` edge and dismisses the pair.
         ``dismiss_pair``: mark ``src``/``dst`` genuinely distinct.
         ``dismiss_slot_pair``: same for lesson/world duplicate listings.
+        ``restore_slot``: undo a lesson/world forget (forgets retire, never
+            delete) — ``store`` + ``src`` (the retired key).
         ``accept_link``/``reject_link``: settle an edge proposal by id.
         ``accept_merge``: fold a near-duplicate into its twin.
         ``accept_junk``: delete an over-extraction artifact.
@@ -1214,6 +1467,16 @@ def memory_graph_review(
                               "'entity|attribute' keys from the deep response"}
         return service.curation_dismiss_duplicate(
             store, *src.split("|", 1), *dst.split("|", 1))
+    if action == "restore_slot":
+        if store not in ("lesson", "world") or not src:
+            return {"error": "store_src_required",
+                    "detail": "store='lesson'|'world'; src is the retired "
+                              "'entity|attribute' key (or a bare entity to "
+                              "restore every retired aspect of it)"}
+        ent, _, attr = src.partition("|")
+        fn = (service.lesson_restore if store == "lesson"
+              else service.world_restore)
+        return fn(ent, attr or None, decided_by="agent")
     handlers = {
         "accept_link": service.graph_accept_proposal,
         "reject_link": service.graph_reject_proposal,
@@ -1228,7 +1491,7 @@ def memory_graph_review(
     if handler is None:
         return {"error": "unknown_action",
                 "actions": ["list", "propose", "relate", "dismiss_pair",
-                            "dismiss_slot_pair", "accept_link", "reject_link",
+                            "dismiss_slot_pair", "restore_slot", "accept_link", "reject_link",
                             "accept_merge", "accept_junk", "reject_entity"]}
     batch = _coerce_id_list(proposal_ids)
     if batch:
@@ -1630,12 +1893,37 @@ def _cap_recall_texts(texts: list[str], seed_text_count: int,
     return seed_texts[:seed_take] + hop_texts[:hop_take]
 
 
+def _compact_recall_fact(f: dict[str, Any]) -> dict[str, Any]:
+    """One recalled fact in the default (non-verbose) projection:
+    ``{attribute, value}``, plus the retract-traversal caution when the
+    service attached one.
+
+    The caution has to be re-selected HERE or it never reaches a default
+    caller — this projection rebuilds each fact from scratch, which is the
+    same whitelist hazard ``memory_search``'s cortex block hit, and the
+    whole point of annotating recall was that the same fact must not read
+    as cautioned on one tool and clean on the other. Conditional, so an
+    unaffected fact's payload is unchanged (the ``stance`` precedent)."""
+    out = {"attribute": f.get("attribute"), "value": f.get("value")}
+    if f.get("re_verify"):
+        out["re_verify"] = True
+        out["re_verify_reason"] = f.get("re_verify_reason")
+    # v35: the label pair and the pin marker (a constraint pinned ahead
+    # of the fact cap must say so, or it reads as an ordinary rank).
+    for k in ("authority", "distortion_tolerance", "pinned"):
+        if f.get(k):
+            out[k] = f[k]
+    return out
+
+
 def _compact_recall_text(t: str) -> str:
     """Truncate one recall supporting text to the preview cap — same
     80/120/200-char + ellipsis convention as the existing text_preview
-    fields (cms.py, service.py). ``_compact_entry`` itself only projects
-    fields and does not truncate; this is a distinct, recall-specific
-    truncation step."""
+    fields (cms.py, service.py). Distinct from ``_compact_entry``'s search
+    truncation, which caps at ``memory.mcp.entry_text_chars`` (600) — walk
+    evidence gets the tighter 200, and unlike a search hit it carries no
+    ``truncated`` marker, since a recall text is a snippet by
+    construction."""
     if len(t) <= _RECALL_TEXT_CHARS:
         return t
     return t[:_RECALL_TEXT_CHARS] + "…"
@@ -1649,11 +1937,10 @@ def memory_recall(
     hops: Annotated[int, Field(
         description="Max graph hops. Clamped to 1..5.")] = 3,
     top_k: Annotated[int, Field(
-        description="Bounds only the SEED search — the initial hits naming "
-                    "the entities the walk starts from — NOT the result, "
-                    "which is capped separately. Up to 3 ``texts`` slots "
-                    "go to seed hits; the rest to hop-discovered "
-                    "support.")] = 5,
+        description="Bounds only the SEED search (the initial hits that "
+                    "name the walk's start entities), not the result, which "
+                    "is capped separately; up to 3 ``texts`` slots go to "
+                    "seed hits.")] = 5,
     verbose: Annotated[bool, Field(
         description="Full fact/edge provenance and untruncated texts. "
                     "Default facts are ``{attribute, value}``, edges "
@@ -1671,7 +1958,14 @@ def memory_recall(
     per-hop reservation, so a hub seed's own 1-hop ring can't crowd out
     the deeper hops the walk exists to reach; ``edges`` prefers links
     between surviving entities; each entity's ``facts`` is capped
-    (currently 5). Details: docs/guide/retrieval.md.
+    (currently 5). A fact carrying ``re_verify`` stands on a memory that
+    has since been corrected — the value still stands, but check it before
+    acting. A seed entity's ``constraint`` facts come first, marked
+    ``pinned``. ``truncated: true`` (with ``searches_issued``) means a
+    search ceiling or time budget stopped the walk early: some re-queries,
+    and possibly deeper hops, were skipped, so supporting texts and deeper
+    entities may be missing — narrow the question or lower ``hops``.
+    Details: docs/guide/retrieval.md.
     """
     out = service.recall(query, hops=hops, top_k=top_k)
     entity_hop = out.get("entity_hop") or {}
@@ -1691,7 +1985,12 @@ def memory_recall(
     out["texts"] = _cap_recall_texts(
         out.get("texts", []), seed_text_count, top_k)
     # Internal bookkeeping only — stale once entities/edges are capped
-    # above, and not part of the documented return shape.
+    # above, and not part of the documented return shape. ``truncated`` /
+    # ``searches_issued`` are deliberately NOT popped: the output caps
+    # below make a partial walk indistinguishable from a complete one by
+    # size, so the flag is the only signal the caller has. The service
+    # sets them only when a ceiling actually bound, which keeps an
+    # untruncated response byte-identical to the pre-cap one.
     out.pop("entity_hop", None)
     out.pop("edge_hop", None)
     out.pop("seed_text_count", None)
@@ -1699,8 +1998,7 @@ def memory_recall(
     if not verbose:
         out["entities"] = [
             {"entity": n.get("entity"),
-             "facts": [{"attribute": f.get("attribute"), "value": f.get("value")}
-                       for f in n.get("facts", [])]}
+             "facts": [_compact_recall_fact(f) for f in n.get("facts", [])]}
             for n in out["entities"]
         ]
         out["edges"] = [
@@ -2095,7 +2393,9 @@ _session_reaper_started = False
 def start_session_reaper() -> None:
     """Idempotent: close session episodes idle past a threshold. The direct-HTTP
     transport gives no session-end signal, so this is how a session episode
-    closes (fires the end-of-session dream / prunes if empty). Daemon-only."""
+    closes (fires the end-of-session dream; an empty one is kept until past
+    the resume window, then swept with a tombstone so its briefing handle
+    stays honorable). Daemon-only."""
     global _session_reaper_started
     if _session_reaper_started:
         return

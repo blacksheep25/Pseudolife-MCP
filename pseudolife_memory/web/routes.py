@@ -118,14 +118,17 @@ class ConsoleRoutes:
           lambda q, b: svc.history(_s(q, "entity"), _s(q, "attribute")))
         p("/api/facts/resolve", lambda q, b: svc.cortex_resolve(
             b["entity"], b["attribute"], bool(b.get("accept"))))
-        # freshness_class threaded through (v23): this is the documented
-        # fallback when an MCP client stringifies tool params, so a write here
-        # must be able to say the same things as the tool.
+        # freshness_class threaded through (v23), the v35 label pair
+        # likewise: this is the documented fallback when an MCP client
+        # stringifies tool params, so a write here must be able to say the
+        # same things as the tool.
         p("/api/facts/set", lambda q, b: svc.cortex_write(
             b["entity"], b["attribute"], b["value"],
             confidence=float(b.get("confidence", 0.8)),
             support=(b.get("origin") or "agent"),
-            freshness_class=(b.get("freshness_class") or "auto")))
+            freshness_class=(b.get("freshness_class") or "auto"),
+            authority=(b.get("authority") or "auto"),
+            distortion_tolerance=(b.get("distortion_tolerance") or "auto")))
         p("/api/facts/forget", lambda q, b: svc.cortex_forget(
             b["entity"], b.get("attribute")))
 
@@ -212,6 +215,13 @@ class ConsoleRoutes:
         g("/api/curation/duplicates", lambda q, b: svc.curation_duplicates())
         p("/api/curation/dismiss-duplicate", lambda q, b: svc.curation_dismiss_duplicate(
             b["store"], b["a_entity"], b["a_attribute"], b["b_entity"], b["b_attribute"]))
+        # Retire-not-delete (2026-09-03): what a forget retired, and the undo.
+        g("/api/curation/retired", lambda q, b: svc.curation_retired(
+            store=_s(q, "store"), limit=_i(q, "limit", 100)))
+        p("/api/lessons/restore", lambda q, b: svc.lesson_restore(
+            b["task"], b.get("aspect"), decided_by=_decided_by(b)))
+        p("/api/world/restore", lambda q, b: svc.world_restore(
+            b["entity"], b.get("attribute"), decided_by=_decided_by(b)))
         p("/api/graph/delete-entity", lambda q, b: svc.graph_delete_entity(b["entity"]))
         p("/api/graph/merge", lambda q, b: svc.graph_merge(b["from"], b["into"]))
         p("/api/graph/accept-proposal", lambda q, b: svc.graph_accept_proposal(b["id"]))

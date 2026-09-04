@@ -15,7 +15,7 @@ import logging
 
 logger = logging.getLogger(__name__)
 
-SCHEMA_META_VERSION = 34
+SCHEMA_META_VERSION = 37
 
 # Optional RE Hub extension lineage. This is deliberately independent from the
 # upstream integer schema_version: Pseudolife can add v35/v36 without colliding
@@ -111,7 +111,16 @@ CREATE TABLE IF NOT EXISTS entries (
   episode_id TEXT,
   episode_title TEXT,
   tags JSONB NOT NULL DEFAULT '[]',
-  slots JSONB NOT NULL DEFAULT '[]'
+  slots JSONB NOT NULL DEFAULT '[]',
+  -- v35 (write-time label pair, arXiv 2608.01679 + 2608.22752):
+  -- authority = the speech act of the text ('directive' | 'observation'
+  -- | 'quoted'), distortion_tolerance = how exactly it must survive
+  -- consolidation ('constraint' | 'procedural' | 'belief' |
+  -- 'preference' | 'episodic'). Both nullable: NULL = observation /
+  -- unlabelled, exactly the pre-v35 reading, so the migration is a
+  -- no-op on an existing bank. Carried through supersede/consolidate.
+  authority TEXT,
+  distortion_tolerance TEXT
 );
 CREATE INDEX IF NOT EXISTS entries_band_idx ON entries (band);
 CREATE INDEX IF NOT EXISTS entries_ts_idx ON entries (ts);
@@ -203,7 +212,14 @@ CREATE TABLE IF NOT EXISTS entity_kinds (
 -- duplicate analyzer is stateless token-Jaccard, so its false positives
 -- (postgres vs postgres.py) re-flagged forever; a dismissed pair is stored
 -- normalized with a_norm < b_norm and skipped on every later analysis. Kept
--- by name (no entity FK) so a dismissal survives entity churn.
+-- by name (no entity FK) so a dismissal survives entity churn. Namespaces
+-- sharing the table (norm names strip ":" so they never collide):
+-- "lesson:<key>" / "world:<key>" slot-pair dismissals (store curation), and
+-- since v37 the "junk:<canonical>" SELF-pair — a junk proposal rejected as
+-- "keep", written here because the rejected entity_proposals row CASCADEs
+-- away with its entity and a re-mint of the same name was re-filed and
+-- re-judged as if no verdict existed. Merge rejects write the canonical
+-- pair here too (same reason), whoever decided them.
 CREATE TABLE IF NOT EXISTS dismissed_pairs (
   a_norm TEXT NOT NULL,
   b_norm TEXT NOT NULL,
@@ -253,7 +269,15 @@ CREATE TABLE IF NOT EXISTS facts (
   -- confident canonical fact. NULL = asserted plainly (every pre-v29
   -- row). Reader metadata only — never an input to confidence, ranking,
   -- or supersession.
-  stance TEXT
+  stance TEXT,
+  -- v35 (write-time label pair): the SOURCE's speech act and fidelity
+  -- class, inherited from the entry the dream derived the fact from and
+  -- kept through supersession unless a write restates them. NULL =
+  -- observation / unlabelled. distortion_tolerance = 'constraint' is
+  -- the one label recall ranks on (pinned ahead of cosine when the
+  -- query names the entity); neither feeds confidence or supersession.
+  authority TEXT,
+  distortion_tolerance TEXT
 );
 CREATE INDEX IF NOT EXISTS facts_slot_idx
   ON facts (entity_norm, attribute_norm, status);
@@ -444,6 +468,7 @@ BENCH_RESET_TABLES = (
     "merge_decisions", "dream_runs", "dream_run_slots", "chronicle_events",
     "retrieval_events", "retrieval_uses", "slot_reads",
     "re_evidence_artifacts", "re_claims", "re_claim_evidence",
+    "curation_judgments", "store_decisions",
 )
 
 # The dimension every embedding column is declared at (schema v25). Not
@@ -810,6 +835,17 @@ def ensure_schema(conn) -> dict:
         # means "asserted plainly", exactly the pre-v29 behaviour, so this
         # migration is a no-op until an extractor emits a stance.
         cur.execute("ALTER TABLE facts ADD COLUMN IF NOT EXISTS stance TEXT")
+        # v35 additive: the write-time label pair on entries AND facts
+        # (authority collapse, arXiv 2608.01679; compaction cliff, arXiv
+        # 2608.22752). NULL = observation / unlabelled — the pre-v35
+        # reading of every existing row — so this is a no-op until a
+        # writer labels something; no backfill, by design (a label
+        # inferred over the whole bank would pin ~1.4% of facts on a
+        # heuristic the maintainer has not opted into).
+        for table in ("entries", "facts"):
+            for col in ("authority", "distortion_tolerance"):
+                cur.execute(
+                    f"ALTER TABLE {table} ADD COLUMN IF NOT EXISTS {col} TEXT")
         # v31 additive: retrieval event log (learned-reranker Phase 0).
         # retrieval_events = one append-only row per search that served
         # entries (query text, the served list as JSONB with ids/scores/
@@ -976,6 +1012,45 @@ def ensure_schema(conn) -> dict:
         cur.execute(
             "CREATE UNIQUE INDEX IF NOT EXISTS facts_slot_contested_uq "
             "ON facts (entity_norm, attribute_norm) WHERE status = 'contested'"
+        )
+        # v36 additive: the review-queue judges reach the queues the v30
+        # merge judge left for humans. (1) The LINK judge's opinion rides the
+        # edge_proposals row like v30's rides entity_proposals — plus
+        # judge_relation, the corrected relation a "retype" verdict names.
+        # NULL = not yet judged, exactly the pre-v36 behaviour. (2) The
+        # store-curation judge's memo: lesson/world duplicate LISTINGS are
+        # recomputed per pass (nothing is filed), so without a memo every
+        # sweep would re-send the same pairs; keyed like dismissed_pairs
+        # (store + sorted slot keys), overwritten on re-judge.
+        for ddl in ("judge_verdict TEXT", "judge_confidence REAL",
+                    "judge_note TEXT", "judge_model TEXT",
+                    "judged_at DOUBLE PRECISION", "judge_relation TEXT",
+                    "decided_by TEXT", "decided_at DOUBLE PRECISION"):
+            cur.execute(
+                f"ALTER TABLE edge_proposals ADD COLUMN IF NOT EXISTS {ddl}")
+        # (3) The merge judge's SECOND opinion (a fresh batch, optionally a
+        # second model) beside the first: two-vote agreement is the apply
+        # gate for the rows the single-vote 0.8 reject gate leaves pending.
+        for ddl in ("judge2_verdict TEXT", "judge2_confidence REAL",
+                    "judge2_model TEXT", "judged2_at DOUBLE PRECISION"):
+            cur.execute(
+                f"ALTER TABLE entity_proposals ADD COLUMN IF NOT EXISTS {ddl}")
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS curation_judgments (
+              store      TEXT NOT NULL,
+              a_key      TEXT NOT NULL,
+              b_key      TEXT NOT NULL,
+              verdict    TEXT NOT NULL,
+              keep       TEXT,
+              fold       TEXT,
+              confidence REAL,
+              note       TEXT,
+              model      TEXT,
+              judged_at  DOUBLE PRECISION NOT NULL,
+              PRIMARY KEY (store, a_key, b_key)
+            )
+            """
         )
         cur.execute(
             "CREATE UNIQUE INDEX IF NOT EXISTS world_facts_slot_current_uq "
@@ -1163,6 +1238,35 @@ def ensure_schema(conn) -> dict:
             """,
             (REHUB_SCHEMA_VERSION,),
         )
+        # v37 additive (retire-not-delete, 2026-09-03): the FK-free audit of
+        # lesson/world forgets and restores. A forget now RETIRES the slot's
+        # current rows (status 'retired', rows kept; compaction's existing
+        # keep-newest-N rule applies) instead of deleting them, and this
+        # table carries who decided, why, and the verbatim record — so a
+        # restore still works after compaction has purged the retired row,
+        # and an unattended curation forget is never an invisible deletion
+        # (the 2026-09-02 triage hard-deleted three lessons nothing could
+        # bring back). No FK on purpose: the rows it describes are exactly
+        # the ones that get purged.
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS store_decisions (
+              id             BIGSERIAL PRIMARY KEY,
+              store          TEXT NOT NULL,
+              entity_norm    TEXT NOT NULL,
+              attribute_norm TEXT NOT NULL,
+              action         TEXT NOT NULL,
+              decided_by     TEXT,
+              reason         TEXT,
+              record         JSONB,
+              decided_at     DOUBLE PRECISION NOT NULL
+            )
+            """
+        )
+        cur.execute(
+            "CREATE INDEX IF NOT EXISTS store_decisions_slot_idx "
+            "ON store_decisions (store, entity_norm, attribute_norm, "
+            "decided_at DESC)")
         cur.execute(
             """
             INSERT INTO meta (key, value) VALUES ('schema_version', %s::jsonb)

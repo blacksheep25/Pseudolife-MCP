@@ -49,6 +49,23 @@ def test_write_config_roundtrip_live(svc):
         assert yaml.safe_load(f)["memory"]["top_k"] == 11
 
 
+def test_write_config_judge_second_model_is_live(svc):
+    # 2026-09-03: the merge judge reads judge_second_model from
+    # service.config on every batch, so the knob must live-mutate (no
+    # restart) and persist; empty clears it back to same-model second
+    # opinions (which never authorize a fold).
+    res = config_io.write_config(
+        svc, {"memory.deep_dream.judge_second_model": "claude-fable-5"})
+    assert "memory.deep_dream.judge_second_model" in res["applied"]
+    assert res["restart_required"] == []
+    assert svc.config.memory.deep_dream.judge_second_model == "claude-fable-5"
+    with open(res["config_path"], encoding="utf-8") as f:
+        assert (yaml.safe_load(f)["memory"]["deep_dream"]["judge_second_model"]
+                == "claude-fable-5")
+    res = config_io.write_config(svc, {"memory.deep_dream.judge_second_model": ""})
+    assert not svc.config.memory.deep_dream.judge_second_model
+
+
 def test_write_config_restart_classification(svc):
     res = config_io.write_config(svc, {"memory.dream.sweep_interval_seconds": 300})
     assert "memory.dream.sweep_interval_seconds" in res["restart_required"]
@@ -249,6 +266,11 @@ def test_graph_review_route(svc):
      {"store": "lesson", "a_entity": "deploy daemon", "a_attribute": "approach",
       "b_entity": "deploy host", "b_attribute": "pitfall"},
      {"dismissed": True}),
+    # Retire-not-delete (2026-09-03): the undo for a lesson/world forget.
+    ("/api/lessons/restore", {"task": "deploy daemon", "aspect": "approach"},
+     {"restored": 1, "store": "lesson"}),
+    ("/api/world/restore", {"entity": "acme", "attribute": "ceo"},
+     {"restored": 1, "store": "world"}),
 ])
 def test_post_verdict_route_dispatches_and_returns_the_service_result(
         svc, path, body, expected):
@@ -268,7 +290,7 @@ def test_routes_config_write_via_dispatch(svc):
 def test_dream_status_carries_dreamer_card_fields(svc):
     st = ConsoleRoutes(svc).dispatch("GET", "/api/dream/status", {}, {})
     for key in ("primary_model", "primary_model_served", "fallback_model",
-                "extractor_source", "model_override"):
+                "extractor_source", "model_override", "reasoning_effort"):
         assert key in st, f"dreamer card field missing: {key}"
 
 
@@ -277,6 +299,13 @@ def test_dreamer_model_override_knob_applies_live(svc):
         "POST", "/api/config", {},
         {"patch": {"memory.dream.extractor_model_override": "claude-fable-5"}})
     assert "memory.dream.extractor_model_override" in out["applied"]
+
+
+def test_dreamer_reasoning_effort_knob_applies_live(svc):
+    out = ConsoleRoutes(svc).dispatch(
+        "POST", "/api/config", {},
+        {"patch": {"memory.dream.extractor_reasoning_effort": "high"}})
+    assert "memory.dream.extractor_reasoning_effort" in out["applied"]
 
 
 # ── ASGI app ────────────────────────────────────────────────────────────────
@@ -288,6 +317,31 @@ def _app(svc, token=None):
 def test_asgi_health_open(svc):
     st, _ = call(_app(svc), "GET", "/health")
     assert st == 200
+
+
+def test_asgi_health_runs_off_the_event_loop(svc):
+    """/health composes its payload with a blocking Postgres ping. Run
+    inline on the asyncio loop, a stalled DB would freeze the entire web
+    surface — hooks, console, MCP — for the ping's timeout, turning a DB
+    stall into a total daemon outage (2026-09-01 review of the 03:07
+    hook-timeout incident). The payload builder must execute on an
+    executor thread, like every other blocking handler in this app."""
+    import threading
+
+    seen = {}
+
+    def payload():
+        seen["thread"] = threading.current_thread()
+        return {"status": "ok"}
+
+    app = build_console_app(stub_mcp, None, payload, svc)
+    st, _ = call(app, "GET", "/health")
+    assert st == 200
+    # asgi_helpers.call runs the loop on the calling thread, so an inline
+    # (loop-blocking) call would land exactly there.
+    assert seen["thread"] is not threading.current_thread(), (
+        "health_payload ran on the event-loop thread — a stalled DB ping "
+        "would block every request in the daemon")
 
 
 def test_asgi_health_degraded_returns_503(svc):
@@ -638,6 +692,32 @@ def test_facts_set_threads_freshness_class(svc):
     assert json.loads(body)["freshness_class"] == "volatile"
 
 
+def test_facts_set_threads_the_v35_label_pair(svc):
+    """Same contract as freshness_class: the REST fallback must be able to
+    say what memory_fact_set says (review finding, 2026-09-02 — the route
+    had not gained the two params)."""
+    app = _app(svc)
+    st, body = call(app, "POST", "/api/facts/set",
+                     headers=[(b"host", b"127.0.0.1"),
+                              (b"content-type", b"application/json")],
+                     body=b'{"entity":"deploy","attribute":"rule",'
+                          b'"value":"tag before you ship",'
+                          b'"authority":"quoted",'
+                          b'"distortion_tolerance":"constraint"}')
+    assert st == 200
+    out = json.loads(body)
+    assert out["authority"] == "quoted"
+    assert out["distortion_tolerance"] == "constraint"
+    # omitted -> "auto", which infers from the value (here: nothing)
+    st, body = call(app, "POST", "/api/facts/set",
+                     headers=[(b"host", b"127.0.0.1"),
+                              (b"content-type", b"application/json")],
+                     body=b'{"entity":"proj","attribute":"language","value":"python"}')
+    assert st == 200
+    out = json.loads(body)
+    assert "authority" not in out and "distortion_tolerance" not in out
+
+
 def test_facts_set_defaults_freshness_class_to_evergreen(svc):
     """Omitting the field must not become volatile — the personal cortex
     defaults durable, unlike the world cortex."""
@@ -678,5 +758,12 @@ def test_graph_route_nodes_carry_timestamps(svc):
 def test_curation_duplicates_route(svc):
     out = ConsoleRoutes(svc).dispatch("GET", "/api/curation/duplicates", {}, {})
     assert "lesson_duplicates" in out and "world_duplicates" in out
+
+
+def test_curation_retired_route_passes_store_and_limit(svc):
+    out = ConsoleRoutes(svc).dispatch(
+        "GET", "/api/curation/retired", {"store": "lesson", "limit": "5"}, {})
+    assert out["store"] == "lesson" and out["limit"] == 5
+    assert "entries" in out
 
 

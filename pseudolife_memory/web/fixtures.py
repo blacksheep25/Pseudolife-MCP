@@ -244,10 +244,18 @@ class FixtureService:
         return {"entries": hits[:top_k]}
 
     def cortex_write(self, entity, attribute, value, confidence=0.8, support="agent",
-                     freshness_class="auto"):
-        return {"action": "inserted", "entity": entity, "attribute": attribute,
-                "value": value, "origin": support, "confidence": confidence,
-                "freshness_class": freshness_class if freshness_class != "auto" else "evergreen"}
+                     freshness_class="auto", authority="auto",
+                     distortion_tolerance="auto"):
+        out = {"action": "inserted", "entity": entity, "attribute": attribute,
+               "value": value, "origin": support, "confidence": confidence,
+               "freshness_class": freshness_class if freshness_class != "auto" else "evergreen"}
+        # v35 labels: served only when set (the fixture mirrors the
+        # absent-when-default contract; "auto" resolves to nothing here).
+        for k, v in (("authority", authority),
+                     ("distortion_tolerance", distortion_tolerance)):
+            if v and v != "auto":
+                out[k] = v
+        return out
 
     def cortex_resolve(self, entity, attribute, accept):
         return {"resolved": True, "accepted": accept,
@@ -671,6 +679,15 @@ class FixtureService:
                 "a_key": f"{a_entity}|{a_attribute}",
                 "b_key": f"{b_entity}|{b_attribute}"}
 
+    def curation_retired(self, store=None, limit=100):
+        return {"count": 0, "entries": [], "store": store, "limit": limit}
+
+    def lesson_restore(self, task, aspect=None, decided_by="human"):
+        return {"restored": 1, "store": "lesson"}
+
+    def world_restore(self, entity, attribute=None, decided_by="human"):
+        return {"restored": 1, "store": "world"}
+
     def curation_duplicates(self):
         # Representative lesson/world cross-key duplicate pairs so the
         # console's curation section (and its Mark-distinct action) is
@@ -766,6 +783,8 @@ class FixtureService:
                 "fallback_model": "extractor",
                 "extractor_source": "env",
                 "model_override": override,
+                "reasoning_effort":
+                    self.config.memory.dream.extractor_reasoning_effort or None,
                 "primary_healthy": True,
                 "last_dream_extractor": {"which": "primary",
                                          "base_url": "http://host.docker.internal:8082/v1",
