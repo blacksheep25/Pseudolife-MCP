@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import os
 import re
 import zipfile
@@ -106,19 +107,51 @@ def parse_evidence_file(
     if size > max_bytes:
         raise EvidenceInputError(
             f"evidence file is {size} bytes; maximum is {max_bytes} bytes")
-    raw = resolved.read_bytes()
-    return parse_evidence_bytes(raw, source_path=str(resolved))
+    # The file may grow after stat(). Never read an unbounded replacement and
+    # only discover the size after allocating it.
+    if max_bytes < 1:
+        raise EvidenceInputError("maximum evidence size must be positive")
+    with resolved.open("rb") as stream:
+        raw = stream.read(max_bytes + 1)
+    return parse_evidence_bytes(raw, source_path=str(resolved), max_bytes=max_bytes)
 
 
-def parse_evidence_bytes(raw: bytes, *, source_path: str) -> dict[str, Any]:
+def parse_evidence_bytes(raw: bytes, *, source_path: str,
+                         max_bytes: int | None = None) -> dict[str, Any]:
     """Parse original bytes while retaining the representation the hash covers."""
+    maximum = MAX_EVIDENCE_BYTES if max_bytes is None else max_bytes
+    if maximum < 1 or len(raw) > maximum:
+        raise EvidenceInputError(f"evidence exceeds maximum size of {maximum} bytes")
+
+    def unique_object(pairs):
+        result = {}
+        for key, value in pairs:
+            if key in result:
+                raise EvidenceInputError("evidence JSON contains a duplicate object key")
+            result[key] = value
+        return result
+
+    def reject_constant(_value):
+        raise EvidenceInputError("evidence JSON numbers must be finite")
+
+    def finite_float(value):
+        number = float(value)
+        if not math.isfinite(number):
+            raise EvidenceInputError("evidence JSON numbers must be finite")
+        return number
+
     try:
-        payload = json.loads(raw.decode("utf-8-sig"))
-    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        payload = json.loads(raw.decode("utf-8-sig"), object_pairs_hook=unique_object,
+                             parse_constant=reject_constant, parse_float=finite_float)
+        if not isinstance(payload, dict):
+            raise EvidenceInputError("evidence JSON root must be an object")
+        addresses = extract_addresses(payload)
+    except EvidenceInputError:
+        raise
+    except RecursionError as exc:
+        raise EvidenceInputError("evidence JSON exceeds supported nesting depth") from exc
+    except (UnicodeDecodeError, ValueError) as exc:
         raise EvidenceInputError(f"evidence must be valid UTF-8 JSON: {exc}") from exc
-    if not isinstance(payload, dict):
-        raise EvidenceInputError("evidence JSON root must be an object")
-    addresses = extract_addresses(payload)
     return {
         "source_path": source_path,
         "content_hash": hashlib.sha256(raw).hexdigest(),

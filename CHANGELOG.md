@@ -6,6 +6,15 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Fixed (2026-09-06 — unambiguous bounded RE evidence input)
+- Reject duplicate JSON object keys and non-finite numbers in RE evidence
+  artifact payloads during ingestion or archive restoration, instead of discarding values or
+  failing later in database serialization. Original bytes/hashes remain intact
+  for valid JSON, and existing stored artifacts are not rewritten.
+- Bound file reads even if an evidence file grows after its size check, enforce
+  the same byte ceiling for direct byte parsing, and return a controlled input
+  error for excessive JSON nesting. No schema or MCP tool-shape change is needed.
+
 ### Fixed (2026-09-05 — upstream review follow-up)
 - Limit shortened reduced-motion animations to one iteration to stop infinite rapid flashing across all Console views.
 - Normalize offline cortex vectors like live search before dense score floors and BM25 fusion.
