@@ -165,6 +165,15 @@ def test_all_green_status_dots_are_static():
     assert "opacity:1" in body
 
 
+def test_reduced_motion_does_not_repeat_shortened_animations_forever():
+    src = STYLES_CSS.read_text(encoding="utf-8")
+    reduced = src[src.index("@media (prefers-reduced-motion:reduce)"):]
+    rule = reduced[:reduced.index("}")]
+    assert "animation-iteration-count:1 !important" in rule, (
+        "shortening an infinite animation to .001ms creates rapid flicker; "
+        "reduced motion must also limit its iteration count")
+
+
 def test_activity_pulse_avoids_firefox_repaint_flicker():
     """Activity remains visible without animating a painted shadow.
 

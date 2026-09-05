@@ -6,6 +6,11 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Fixed (2026-09-05 — upstream review follow-up)
+- Limit shortened reduced-motion animations to one iteration to stop infinite rapid flashing across all Console views.
+- Normalize offline cortex vectors like live search before dense score floors and BM25 fusion.
+- Install declared runtime/ONNX dependencies with lock constraints (including pypdf), validate with `pip check`, and retain pip downloads in BuildKit caches.
+
 ### Fixed (2026-09-05 — Firefox Console controls)
 - **Healthy Live/Postgres status dots are now static across every view.** Their
   animated box-shadow forced repeated compositing and could make adjacent
