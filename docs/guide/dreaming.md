@@ -90,7 +90,7 @@ ignore the field.
 
 The tier-2 prompt (`_SYSTEM_PROMPT` in `pseudolife_memory/memory/dream.py`,
 shared by the bundled sidecar and any endpoint you point the daemon at)
-asks for three things and deliberately skips the rest — narrative,
+asks for four things and deliberately skips the rest — narrative,
 opinions, meta-chat about the conversation, and values a later note already
 superseded:
 
@@ -101,7 +101,8 @@ superseded:
   accumulating near-duplicate slots.
 - **The source's epistemic stance, kept.** A hedged or negated claim
   ("probably X", "no longer Y") lands with a `stance` marker on the fact
-  (schema v29; the v10 update-anchored prompt is the live one) instead of
+  (schema v29; the live v12-based prompt carries the v10 update-anchored
+  stance rule) instead of
   hardening into a flat assertion — see
   [memory-model — how current is this fact?](memory-model.md#how-current-is-this-fact).
 - **What a document prescribes.** When a note quotes or summarizes a spec,
@@ -110,8 +111,28 @@ superseded:
   was actually done. Paste your deploy runbook, then mention a deploy that
   skipped a step, and you get two facts (the documented rule, and the
   incident), not one blurred into the other.
+- **What the ASSISTANT said, labelled as the assistant's** (since
+  2026-09-05). What the assistant asserted, described or recommended is
+  extractable on the same terms as what you said — keyed to the *thing
+  described*, never to "the assistant". A claim carries a `speaker` field
+  **where the note makes the speaker knowable**: the extractor reads it off
+  an explicit role marker (a leading `user:` / `assistant:`) when the note
+  carries one, infers `assistant` only where the content is unmistakably
+  the assistant's, and omits the field when unsure. Nothing in the daemon
+  writes a role prefix — the dream sends your notes as they were stored,
+  and the `[date] role: content` rendering is an eval-harness convention —
+  so on a bank whose notes carry no marker many claims are simply
+  unlabelled, which writes exactly as it did before 2026-09-05. An
+  assistant-stated fact is written at the floor `assistant` provenance
+  tier: it fills an empty slot, but parks as a contender against a value
+  of any other origin rather than overwriting it
+  (`memory.dream.assistant_claims`, default `contender`). Before this, a
+  session whose answer lived entirely in an assistant turn consolidated
+  with *zero* claims — see
+  [Benchmarks](benchmarks.md#longmemeval-v2--agent-trajectories-and-procedures)
+  and the "Assistant-stated facts" section of `evals/README.md`.
 
-That third one is deliberate, and it is the reason the prompt names its
+That document class is deliberate, and it is the reason the prompt names its
 content classes rather than merely forbidding noise: an extraction prompt
 that enumerates what to extract makes an obedient model **silently discard
 whatever it doesn't name** — no error, no partial result, just a class of
@@ -119,9 +140,36 @@ knowledge that never reaches the cortex. It cost a whole benchmark category
 to find (see [Benchmarks](benchmarks.md#longmemeval-v2--agent-trajectories-and-procedures)),
 and it is worth remembering before narrowing this prompt further.
 
-The Sonnet override prompt (`evals/prompts/sonnet_extractor_v2.md`, used
-when you run the shim below) carries the same three, tuned for a larger
-model.
+The Sonnet override prompt (`evals/prompts/sonnet_extractor_v5.md`, used
+when you run the shim below) carries all four. A shim launched with
+`--system-prompt-file` **replaces** the shipped prompt with that file —
+keeping only the appended vocab/known-facts hints — so a prompt change made
+in `dream.py` alone never reaches an install whose primary extractor is the
+shim. v4 closed that gap on 2026-09-05: it is the v2 body plus the same
+assistant-facts blocks the shipped prompt carries, composed by
+`evals/gen_shim_prompt.py` from `dream.py`'s own constants so the two paths
+cannot drift in what they ask for. Gated on the ladder `opus-5` rung, v2 vs
+v4, two replicates per arm, and **re-gated** after the speaker rule was
+rewritten the same day — v4 is generated from that constant, so the file
+changed and the first verdict
+(`evals/results/ladder-shimprompt-paired-verdict-threshold.json`) is
+superseded by
+`evals/results/ladder-shimprompt-rule2-paired-verdict-threshold.json`
+(`gate: PASS`, `no_regression_gate: PASS`, gold 1.0 and stale 0.0 on both
+replicates). v5 (2026-09-07) re-cuts the v2 body's two worked examples on
+invented names — the same re-cut the daemon's shipped prompt took with the
+v12 base — so the shim path no longer names a benchmark answer; gated the
+same way, v4 vs v5
+(`evals/results/ladder-shimv5-paired-verdict-threshold.json`: `gate: PASS`,
+`no_regression_gate: PASS`, gold 1.0 and stale 0.0 on all four runs). v2
+and v4 stay in the tree as the gates' pre arms; `sonnet_extractor_v3.md` is
+an unrelated, never-adopted 2026-08-02 lineage.
+
+Existing installs pick v5 up when the shim autostart is re-installed
+(`ops/install-shim-autostart.ps1`) or the shim is restarted with the new
+file. Rebuilding the daemon image alone does **not** reach the shim path.
+The Codex shim passes no prompt file at all, so it already runs the shipped
+prompt.
 
 **Literal-faithfulness gate.** After extraction, every claim's digit-bearing
 tokens (dates exempt — format variance makes digit matching unsafe there)
@@ -261,7 +309,11 @@ steps:
      [anthropics/claude-code#61635](https://github.com/anthropics/claude-code/issues/61635);
      `-Model` picks the served default —
      `claude-opus-5` since the 2026-08-02 dreamer comparison; the one-shot
-     installer prompts for this choice on Claude-shim installs).
+     installer prompts for this choice on Claude-shim installs). Re-running
+     the installer replaces a shim already serving the port: it stops that
+     process tree first, then waits (`-StartupTimeoutSec`, default 90 s)
+     for the new task instance to bind and echoes its startup log lines —
+     and fails, rather than reporting success, if no listener appears.
    The shim also honors a concrete `claude-*` model named per request, so
    the Console's **Dreamer** card switches the dreamer live — one click
    between `claude-opus-5` / `claude-sonnet-5` / `claude-haiku-4-5` /

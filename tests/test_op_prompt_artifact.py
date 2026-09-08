@@ -32,19 +32,56 @@ import op_probe  # noqa: E402
     # v10: v5 + the update-anchored stance rule — the sgku bank-diff
     # forensics traced v8's KU failure to a diluted consolidation anchor
     ("ku_op_prompt_v10_stance_update.txt", "v10-stance-update"),
+    # v11: v10 with its two corpus-lifted worked examples re-cut on invented
+    # tokens (2026-09-06); rules byte-identical, examples clean of LongMemEval
+    ("ku_op_prompt_v11_example_recut.txt", "v11-example-recut"),
+    # v12: v11 + a second inline count example for counts OF items from a
+    # source (the v11 KU gate's one real loss was that shape)
+    ("ku_op_prompt_v12_count_source_example.txt", "v12-count-source-example"),
 ])
 def test_prompt_file_matches_probe_construction(filename, variant):
     path = Path(__file__).resolve().parents[1] / "evals" / "prompts" / filename
     assert path.read_text(encoding="utf-8") == op_probe.VARIANTS[variant]
 
 
-def test_shipped_prompt_is_the_measured_v10_artifact():
-    """The v10 stance ship (2026-08-14): the live extraction prompt must
-    be byte-identical to the artifact its gates measured (probe + ladder
-    + same-window KU-oracle paired control; ship decision recorded in
-    the 2026-08-12 stance-span-gate spec's gate-outcomes section). Any
-    drift between what runs and what was measured re-opens the gap the
-    verdict artifacts exist to close."""
-    from pseudolife_memory.memory.dream import _SYSTEM_PROMPT
-    path = Path(__file__).resolve().parents[1] / "evals" / "prompts" / "ku_op_prompt_v10_stance_update.txt"
-    assert _SYSTEM_PROMPT == path.read_text(encoding="utf-8")
+def test_the_prompt_base_is_the_measured_v12_artifact():
+    """The v12 example re-cut ship (2026-09-07, after the v10 stance ship
+    of 2026-08-14): the base of the live extraction prompt must be
+    byte-identical to the artifact its gates measured (op-probe + paired
+    ladder + paired same-window KU-oracle vs the v10 arm; verdicts
+    prompt-recut-v12-ku-paired-verdict.json and
+    ladder-v12recut-paired-verdict.json). Any drift between what runs
+    and what was measured re-opens the gap the verdict artifacts exist
+    to close.
+
+    Since 2026-09-05 the measured op-prompt text is the BASE of the
+    shipped prompt rather than all of it — the assistant-facts blocks
+    are appended after their own ladder gate — so the pin is on
+    `_BASE_SYSTEM_PROMPT`. The shipped constant has its own byte-exact
+    pin, against the measured artifact `assistant_facts_provenance.txt`,
+    in `tests/test_assistant_provenance.py`."""
+    from pseudolife_memory.memory.dream import _BASE_SYSTEM_PROMPT
+    path = Path(__file__).resolve().parents[1] / "evals" / "prompts" / "ku_op_prompt_v12_count_source_example.txt"
+    assert _BASE_SYSTEM_PROMPT == path.read_text(encoding="utf-8")
+
+
+def test_the_shipped_prompt_still_opens_with_the_base():
+    """The append is an append: nothing in the base block may be edited or
+    reordered on its way into the shipped prompt."""
+    from pseudolife_memory.memory.dream import (_BASE_SYSTEM_PROMPT,
+                                                _SYSTEM_PROMPT)
+    assert _SYSTEM_PROMPT.startswith(_BASE_SYSTEM_PROMPT)
+    assert len(_SYSTEM_PROMPT) > len(_BASE_SYSTEM_PROMPT)
+
+
+def test_only_the_required_op_variant_scores_plain_facts_as_op_set():
+    """The probe's decoy scorer treats "op":"set" as the only acceptable
+    plain-fact shape for the v1 variant, whose schema REQUIRES op on every
+    claim. Every other variant leaves plain facts op-less, so their decoys
+    must be scored against {None, "set"} — a name-prefix match that also
+    caught v10 and v11 read their count decoys as 0/7 for a month
+    (op-probe-qwen38-0817.json) while the claims themselves were right."""
+    assert op_probe.requires_op("v1-required-op")
+    for name in op_probe.VARIANTS:
+        if name != "v1-required-op":
+            assert not op_probe.requires_op(name), name

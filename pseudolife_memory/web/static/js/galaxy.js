@@ -336,6 +336,7 @@ export async function createGalaxy(host, data, opts = {}) {
         if (playing) clearInterval(playing);
         playing = null;
         playBtn.textContent = "▶";
+        playBtn.title = "replay growth";
         playBtn.setAttribute("aria-label", "replay growth");
         playBtn.setAttribute("aria-pressed", "false");
       }
@@ -346,6 +347,7 @@ export async function createGalaxy(host, data, opts = {}) {
           if (playing) { stopPlay(); return; }
           let v = 0;
           playBtn.textContent = "❚❚";
+          playBtn.title = "pause growth replay";
           playBtn.setAttribute("aria-label", "pause growth replay");
           playBtn.setAttribute("aria-pressed", "true");
           slider.value = "0";

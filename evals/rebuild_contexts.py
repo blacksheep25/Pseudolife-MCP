@@ -95,6 +95,11 @@ def rebuild_fact_lines(bank: dict, emb, top_k: int, min_score: float,
     only ever contains CURRENT facts (``cortex_dump``), so the "full
     membership" a group composes over is exactly the member rows present
     in ``facts``, same as the live store's ``members()``.
+
+    ``emb.encode`` / ``emb.encode_query`` must return ``torch.Tensor``: the
+    vectors are detached, moved to CPU float32 and re-normalised here,
+    mirroring ``CortexStore.search``'s cosine contract, so a non-normalising
+    embedder cannot turn the cosine floor into a magnitude ranking.
     """
     facts = bank["facts"]
     if not facts:
@@ -108,9 +113,18 @@ def rebuild_fact_lines(bank: dict, emb, top_k: int, min_score: float,
     # Mirror CortexStore.search's cosine contract, including normalization.
     mat = emb.encode(texts).detach().to("cpu", torch.float32)
     mat = mat / (mat.norm(dim=1, keepdim=True) + 1e-12)
-    q = emb.encode_query(bank["question"]).detach().to("cpu", torch.float32).reshape(-1)
+    q = emb.encode_query(bank["question"]).detach().to("cpu", torch.float32)
+    q = q.reshape(-1)
     q = q / (q.norm() + 1e-12)
     sims = (mat @ q).tolist()
+    # Assistant-origin demotion, mirroring CortexStore.search (positive
+    # cosines only, same ASSISTANT_FACT_SCORE_MULT). A dumped fact carries
+    # "origin"; every bank dumped before 2026-09-05 carries none, so this
+    # multiplies by 1.0 and the ranking is byte-identical.
+    from pseudolife_memory.memory.cortex import ASSISTANT_FACT_SCORE_MULT
+    sims = [s * ASSISTANT_FACT_SCORE_MULT
+            if s > 0 and f.get("origin") == "assistant" else s
+            for s, f in zip(sims, facts)]
     ranked = sorted((i for i, s in enumerate(sims) if s >= min_score),
                     key=lambda i: sims[i], reverse=True)[:top_k]
     score_map = {i: sims[i] for i in range(len(sims))}
