@@ -212,7 +212,7 @@ dream-extractor variables (`PSEUDOLIFE_DREAM_*`) are covered in
   parks unbacked scalar claims as visible contenders with a
   `span:unbacked` marker, resolvable via `memory_fact_resolve`. Ships off
   because flipping it on requires the live extraction prompt to emit
-  quotes (the v10 prompt does not).
+  quotes (the live v12 prompt does not).
 - **Lesson-synthesis dedup on**
   (`memory.lessons.synthesis_dedup_min_similarity = 0.88`) — a synthesized
   lesson that near-matches an existing *current* lesson at a different key
@@ -301,6 +301,29 @@ dream-extractor variables (`PSEUDOLIFE_DREAM_*`) are covered in
   a populated reference bank (its raw cosines are not rescaled and
   outrank every memory once the reranker fires). Neither combination has
   been measured.
+- **Assistant-stated claims parked, not adopted**
+  (`memory.dream.assistant_claims = "contender"`) — what a dream claim
+  labelled `speaker: "assistant"` becomes: `contender` writes it at the
+  floor `assistant` provenance tier (it may fill an empty slot, but
+  against a value or member set of any other origin it parks as a
+  contender, and it ranks below user-origin facts at equal similarity),
+  `supersede` treats it as an ordinary agent-tier dream claim, and `drop`
+  discards it. An unrecognised value falls back to `contender` — a typo
+  must not open the overwrite path. **Live on the default path since
+  2026-09-05**, when the provenance extraction prompt shipped: an
+  extraction can now carry a `speaker` label, so the knob decides what
+  happens to assistant-stated claims on a stock install. (It was inert
+  before that, because the old prompt never asked for the field. The
+  label is asked for only where the note makes the speaker knowable, so
+  on a bank whose notes carry no `user:` / `assistant:` marker most
+  claims still arrive without one — as do claims from an older prompt or
+  an extractor shim launched with `--system-prompt-file` — and those
+  write exactly as they did before, whatever this is set to.) Kept off
+  the Console deliberately: `supersede`
+  is the setting that lets model-stated content overwrite a user-stated
+  fact, which is a provenance decision rather than an operator dial. The
+  measured comparison of the three values is in `evals/README.md`
+  ("Assistant-stated facts").
 - **Staleness served as annotation** (`memory.search.stale_policy =
   "annotate"`) — stale records (past 2×TTL for their freshness class)
   carry `effective_confidence`/`stale` flags and nothing more, today's
@@ -707,8 +730,10 @@ The customized RE Hub build adds a separate **`v34-rehub` extension schema**:
 `re_evidence_artifacts`, `re_claims`, and `re_claim_evidence`. Its version is
 stored under the independent `meta.rehub_schema_version` key; it does not bump
 or replace upstream's integer `meta.schema_version`. The extension DDL is
-additive and idempotent, so future upstream v35/v36 migrations can land without
+additive and idempotent, so future upstream migrations can land without
 renumbering the RE proof store.
+
+Later additions that write into these tables without new DDL are listed with the feature that added them rather than as schema milestones: `memory_outcome(used_ids=[...])` (2026-09-05) labels served entries under `used_via="outcome"` — see the memory-model guide.
 
 After running the entity-kind backfill (`evals/apply_entity_kinds.py --apply`), the daemon must be restarted for inference to take effect — it caches the entity-kind map for the life of its process.
 
