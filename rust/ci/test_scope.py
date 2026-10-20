@@ -12,6 +12,24 @@ import scope
 ROOT = Path(__file__).resolve().parents[2]
 
 
+@pytest.mark.parametrize("paths,expected", [
+    ([".github/workflows/rust.yml", "rust/ci/scope.py", "changelog.d/example.md"], "contracts"),
+    (["rust/ci/test_scope.py"], "contracts"),
+    (["rust/ci/scope.py", "rust/shim/src/main.rs"], "full"),
+    (["rust/ci/scope.py", "pyproject.toml"], "full"),
+    (["rust/ci/scope.py", "pseudolife_memory/service.py"], "full"),
+    (["rust/daemon/harness/dbstate.py"], "full"),
+    (["rust/ci/run_coverage.py"], "full"),
+    (["rust/ci/coverage_plan.py"], "full"),
+    (["rust/ci/source_mutants.json"], "full"),
+    (["pseudolife_memory/re_evidence.py"], "none"),
+    (["README.md"], "none"),
+    ([], "full"),
+])
+def test_workflow_only_changes_use_contracts_and_mixed_changes_run_full(paths, expected):
+    assert scope.classify(paths) == expected
+
+
 @pytest.mark.parametrize("path", [
     "rust/shim/src/main.rs", "rust/daemon/src/main.rs", "rust/ci/scope.py",
     "evals/rust_port/oracle_selection.py", "evals/rust_baseline/runner.py",
@@ -65,37 +83,37 @@ def test_push_checks_every_commit_and_both_sides_of_renames(history):
     root, base = history
     commit_file(root, "rust/old.rs")
     head = commit_file(root, "python-fix.py")
-    assert scope.required(root, "push", base, head)
+    assert scope.select_lane(root, "push", base, head) == "full"
     base = head
     git(root, "mv", "rust/old.rs", "moved.py")
     git(root, "commit", "-m", "move out of rust")
     head = git(root, "rev-parse", "HEAD")
-    assert scope.required(root, "push", base, head)
+    assert scope.select_lane(root, "push", base, head) == "full"
 
 
 def test_pr_uses_tested_merge_diff(history):
     root, base = history
     head = commit_file(root, "pseudolife_memory/service.py")
-    assert not scope.required(root, "pull_request", base, head)
+    assert scope.select_lane(root, "pull_request", base, head) == "none"
     commit_file(root, "rust/changed.rs")
-    assert scope.required(root, "pull_request", base, "HEAD")
+    assert scope.select_lane(root, "pull_request", base, "HEAD") == "full"
 
 
 @pytest.mark.parametrize("event", ["schedule", "workflow_dispatch"])
 def test_nightly_and_manual_always_run(history, event):
     root, base = history
-    assert scope.required(root, event, base, base)
+    assert scope.select_lane(root, event, base, base) == "full"
 
 
 @pytest.mark.parametrize("base", ["", "0" * 40, "missing-commit"])
 def test_unknown_history_runs_checks(history, base):
     root, head = history
-    assert scope.required(root, "push", base, head)
+    assert scope.select_lane(root, "push", base, head) == "full"
 
 
 def test_empty_diff_runs_checks(history):
     root, base = history
-    assert scope.required(root, "pull_request", base, base)
+    assert scope.select_lane(root, "pull_request", base, base) == "full"
 
 
 def test_workflow_scopes_expensive_jobs_but_keeps_entry_points_and_gate():
@@ -105,6 +123,16 @@ def test_workflow_scopes_expensive_jobs_but_keeps_entry_points_and_gate():
     assert events["pull_request"] is None
     assert events["push"] == {"branches": ["master"]}
     jobs = workflow["jobs"]
+    contracts = jobs["contracts"]
+    assert contracts["needs"] == "scope"
+    assert contracts["if"] == "needs.scope.outputs.lane == 'contracts'"
+    assert contracts["strategy"]["matrix"]["os"] == ["ubuntu-latest", "windows-latest"]
+    assert contracts["strategy"]["fail-fast"] is False
+    assert not contracts.get("continue-on-error")
+    scripts = "\n".join(step.get("run", "") for step in contracts["steps"])
+    for name in ("test_scope.py", "test_workflow.py", "test_h5_inventory.py", "test_console_mime.py", "test_snapshot_settle.py", "test_timings.py"):
+        assert "rust/ci/" + name in scripts
+    assert "python rust/ci/inventory.py" in scripts
     for name in ("rust", "candidate", "parity-checks", "source-mutants", "daemon-image"):
         assert "scope" in ([jobs[name]["needs"]] if isinstance(jobs[name]["needs"], str) else jobs[name]["needs"])
         assert jobs[name]["if"].startswith("needs.scope.outputs.needed == 'true'")
@@ -129,8 +157,22 @@ def test_workflow_scopes_expensive_jobs_but_keeps_entry_points_and_gate():
 def test_final_gate_only_accepts_proven_unrelated_skips(scope_result, needed, job_result, event, accepted):
     gate = yaml.safe_load((ROOT / ".github/workflows/rust.yml").read_text())["jobs"]["parity"]
     needs = {name: {"result": job_result} for name in gate["needs"]}
-    needs["scope"] = {"result": scope_result, "outputs": {"needed": needed}}
+    needs["scope"] = {"result": scope_result, "outputs": {"needed": needed, "lane": "full" if needed == "true" else "none"}}
+    needs["contracts"]["result"] = "skipped"
     result = subprocess.run(["pwsh", "-NoProfile", "-Command", gate["steps"][0]["run"]],
                             env=dict(os.environ, GATE_RESULTS=json.dumps(needs), GATE_EVENT=event),
                             capture_output=True, text=True)
     assert result.returncode == (0 if accepted else 1), result.stderr
+
+
+@pytest.mark.parametrize("event", ["pull_request", "push", "schedule", "workflow_dispatch"])
+@pytest.mark.parametrize("contracts_result", ["success", "failure", "cancelled", "skipped", ""])
+def test_contract_lane_requires_both_os_contracts_and_cannot_skip_nightly(event, contracts_result):
+    gate = yaml.safe_load((ROOT / ".github/workflows/rust.yml").read_text())["jobs"]["parity"]
+    needs = {name: {"result": "skipped"} for name in gate["needs"]}
+    needs["scope"] = {"result": "success", "outputs": {"needed": "false", "lane": "contracts"}}
+    needs["contracts"]["result"] = contracts_result
+    result = subprocess.run(["pwsh", "-NoProfile", "-Command", gate["steps"][0]["run"]],
+                            env=dict(os.environ, GATE_RESULTS=json.dumps(needs), GATE_EVENT=event),
+                            capture_output=True, text=True)
+    assert result.returncode == (0 if event in ("pull_request", "push") and contracts_result == "success" else 1), result.stderr

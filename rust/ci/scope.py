@@ -27,15 +27,36 @@ EXACT_INPUTS = {
     "tests/maintainer_authenticator.py", "tests/test_cli_dispatch.py",
     "evals/memory_policy_bench.py", "evals/memory_policy_daemon.py",
 }
+WORKFLOW_INPUTS = {
+    ".github/workflows/rust.yml", "rust/ci/scope.py", "rust/ci/inventory.py",
+    "rust/ci/test_scope.py", "rust/ci/test_workflow.py", "rust/ci/test_h5_inventory.py",
+}
 
 
 def relevant(path: str) -> bool:
     return path in EXACT_INPUTS or path.startswith(PREFIXES)
 
 
-def required(root: Path, event: str, base: str, head: str) -> bool:
+def workflow_input(path: str) -> bool:
+    return path in WORKFLOW_INPUTS
+
+
+def classify(paths: list[str]) -> str:
+    if not paths:
+        return "full"
+    # Only the workflow and its own contract tests may use this lane. Any
+    # additional code, fixture or dependency change requires runtime parity.
+    if any(workflow_input(path) for path in paths) and all(
+        workflow_input(path) or path == "CHANGELOG.md" or path.startswith("changelog.d/")
+        for path in paths
+    ):
+        return "contracts"
+    return "full" if any(relevant(path) for path in paths) else "none"
+
+
+def select_lane(root: Path, event: str, base: str, head: str) -> str:
     if event not in ("pull_request", "push") or not base or set(base) == {"0"}:
-        return True
+        return "full"
     try:
         # No rename detection: moving a Rust input out of scope must still run.
         paths = subprocess.check_output(
@@ -43,9 +64,9 @@ def required(root: Path, event: str, base: str, head: str) -> bool:
             cwd=root, timeout=60).decode("utf-8").split("\0")
     except (subprocess.SubprocessError, OSError, UnicodeError):
         print("Cannot determine changed inputs; running Rust CI")
-        return True
+        return "full"
     paths = [path for path in paths if path]
-    return not paths or any(relevant(path) for path in paths)
+    return classify(paths)
 
 
 def main() -> None:
@@ -56,10 +77,10 @@ def main() -> None:
     parser.add_argument("--github-output", type=Path, required=True)
     args = parser.parse_args()
     base = "HEAD^1" if args.event == "pull_request" else args.base
-    needed = required(Path.cwd(), args.event, base, args.head)
+    lane = select_lane(Path.cwd(), args.event, base, args.head)
     with args.github_output.open("a", encoding="utf-8") as output:
-        output.write(f"needed={str(needed).lower()}\n")
-    print(f"Rust CI needed: {str(needed).lower()}")
+        output.write(f"needed={str(lane == 'full').lower()}\nlane={lane}\n")
+    print(f"Rust CI lane: {lane}")
 
 
 if __name__ == "__main__":

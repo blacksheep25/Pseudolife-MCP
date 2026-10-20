@@ -19,17 +19,24 @@ if ($results['scope'].result -cne 'success') {
   exit 1
 }
 $needed = $results['scope'].outputs.needed
-if ($needed -ceq 'false' -and $env:GATE_EVENT -cin @('pull_request', 'push')) {
+$lane = $results['scope'].outputs.lane
+$contractsResult = $results['contracts'].result
+if ($needed -ceq 'false' -and $lane -cin @('none', 'contracts') -and $env:GATE_EVENT -cin @('pull_request', 'push')) {
+  $expected = if ($lane -ceq 'contracts') { 'success' } else { 'skipped' }
+  if ($contractsResult -cne $expected) {
+    Write-Error "Workflow contracts did not return $expected"
+    exit 1
+  }
   foreach ($job in @('rust', 'candidate', 'parity-checks', 'source-mutants')) {
     if ($results[$job].result -cne 'skipped') {
       Write-Error "$job ran unexpectedly outside Rust scope"
       exit 1
     }
   }
-  Write-Output "No Rust CI inputs changed"
+  Write-Output "Rust CI lane: $lane"
   exit 0
 }
-if ($needed -cne 'true') {
+if ($needed -cne 'true' -or $lane -cne 'full' -or $contractsResult -cne 'skipped') {
   Write-Error "Rust CI scope did not select required checks"
   exit 1
 }
@@ -190,7 +197,7 @@ def check(workflow):
     assert 'pull_request' in events and 'workflow_dispatch' in events, 'source events dropped or changed'
     assert source['if'] == SOURCE_EVENTS, 'source event selection changed'
     gate = jobs['parity']
-    assert gate['needs'] == ['scope', 'rust', 'candidate', 'parity-checks', 'source-mutants'], 'Parity event gate lost dependency'
+    assert gate['needs'] == ['scope', 'contracts', 'rust', 'candidate', 'parity-checks', 'source-mutants'], 'Parity event gate lost dependency'
     assert gate['if'] == f'always() && ({ordinary_ci})' and not gate.get('continue-on-error'), 'Parity event gate can skip failures'
     assert len(gate['steps']) == 1, 'Parity event gate steps changed'
     required = gate['steps'][0]
