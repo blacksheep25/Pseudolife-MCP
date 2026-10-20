@@ -1,0 +1,2 @@
+### Changed (2026-10-21 — Scope Rust CI to port inputs)
+- Rust build and parity jobs run on pull requests and master pushes only when native code, harnesses, schema, build inputs or shared port fixtures change. Unrelated Python fixes receive a successful Parity check without running the Rust matrix. Nightly and ordinary manual runs retain full validation, and scope detection failures cannot silently pass the gate.

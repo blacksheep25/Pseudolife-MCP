@@ -28,8 +28,10 @@ permissions:
   contents: read
 
 concurrency:
-  group: ${{ github.event_name == 'workflow_dispatch' && inputs.mode == 'wait-mail' && format('rust-capture-{0}', github.run_id) || format('rust-{0}-{1}', github.workflow, github.ref) }}
-  cancel-in-progress: true
+  group: ${{ github.event_name == 'workflow_dispatch' && inputs.mode == 'wait-mail' && format('rust-capture-{0}', github.run_id) || format('rust-{0}-{1}-{2}', github.workflow, github.event_name, github.event_name == 'pull_request' && github.ref || github.run_id) }}
+  # Only superseded PRs share a group. Unique push/nightly/manual groups
+  # preserve pending relevant runs when an unrelated push follows them.
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 env:
   CARGO_TERM_COLOR: always
@@ -39,8 +41,26 @@ env:
   MKL_NUM_THREADS: '1'
 
 jobs:
-  rust:
+  scope:
     if: github.event_name != 'workflow_dispatch' || inputs.mode != 'wait-mail'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      needed: ${{ steps.scope.outputs.needed }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Select Rust CI inputs
+        id: scope
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          BASE_SHA: ${{ github.event.before }}
+        run: python rust/ci/scope.py --event "$EVENT_NAME" --base "$BASE_SHA" --head "$GITHUB_SHA" --github-output "$GITHUB_OUTPUT"
+
+  rust:
+    needs: scope
+    if: needs.scope.outputs.needed == 'true'
     name: Rust / ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -167,7 +187,8 @@ jobs:
           if-no-files-found: error
 
   candidate:
-    if: github.event_name != 'workflow_dispatch' || inputs.mode != 'wait-mail'
+    needs: scope
+    if: needs.scope.outputs.needed == 'true'
     name: Candidate / ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -215,9 +236,9 @@ jobs:
           if-no-files-found: error
 
   parity-checks:
-    if: github.event_name != 'workflow_dispatch' || inputs.mode != 'wait-mail'
+    if: needs.scope.outputs.needed == 'true'
     name: Parity checks / ${{ matrix.os }} / ${{ matrix.suite }}
-    needs: [candidate, rust]
+    needs: [scope, candidate, rust]
     strategy:
       fail-fast: false
       matrix:
@@ -847,11 +868,11 @@ jobs:
     # Run 38145459384: 92m23s versus the 70m28s baseline; 68 source jobs
     # queued behind the 20-job concurrency cap, with a largest matrix queue
     # of 24m25s. Catch CLI source survivors after merge on master/nightly.
-    if: github.event_name == 'push' || github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && inputs.mode == 'ci')
+    if: needs.scope.outputs.needed == 'true' && (github.event_name == 'push' || github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && inputs.mode == 'ci'))
     name: Source mutants / ${{ matrix.os }} / ${{ matrix.shard }}
     # These shards compile their own source copies and consume no rust-job
     # artifact; the final Parity gate still requires both Rust jobs.
-    needs: [candidate]
+    needs: [scope, candidate]
     strategy:
       fail-fast: false
       matrix:
@@ -933,7 +954,8 @@ jobs:
 
   daemon-image:
     name: Rust daemon / disposable image
-    if: github.event_name != 'workflow_dispatch' || inputs.mode != 'wait-mail'
+    needs: scope
+    if: needs.scope.outputs.needed == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 40
     steps:
@@ -971,11 +993,12 @@ jobs:
           docker compose -p "$project" -f ops/docker-compose.rust.yml logs --no-color rust-daemon > "$RUNNER_TEMP/rust-daemon-startup.log"
           python rust/daemon/container_probe.py --startup-log "$RUNNER_TEMP/rust-daemon-startup.log"
   parity:
-    # Only a PR may skip the after-merge CLI source matrix. Master/nightly
-    # (and ordinary manual CI) require its success, never a skip or failure.
+    # Within Rust scope, only PRs may skip the after-merge source matrix.
+    # Unrelated PR/push runs pass only after scope proves the whole matrix
+    # was unnecessary; nightly and ordinary manual CI require every check.
     if: always() && (github.event_name != 'workflow_dispatch' || inputs.mode != 'wait-mail')
     name: Parity / ${{ matrix.os }}
-    needs: [rust, candidate, parity-checks, source-mutants]
+    needs: [scope, rust, candidate, parity-checks, source-mutants]
     strategy:
       fail-fast: false
       matrix:
@@ -990,6 +1013,25 @@ jobs:
           GATE_EVENT: ${{ github.event_name }}
         run: |
           $results = ConvertFrom-Json $env:GATE_RESULTS -AsHashtable
+          if ($results['scope'].result -cne 'success') {
+            Write-Error "Rust CI scope did not succeed"
+            exit 1
+          }
+          $needed = $results['scope'].outputs.needed
+          if ($needed -ceq 'false' -and $env:GATE_EVENT -cin @('pull_request', 'push')) {
+            foreach ($job in @('rust', 'candidate', 'parity-checks', 'source-mutants')) {
+              if ($results[$job].result -cne 'skipped') {
+                Write-Error "$job ran unexpectedly outside Rust scope"
+                exit 1
+              }
+            }
+            Write-Output "No Rust CI inputs changed"
+            exit 0
+          }
+          if ($needed -cne 'true') {
+            Write-Error "Rust CI scope did not select required checks"
+            exit 1
+          }
           foreach ($job in @('rust', 'candidate', 'parity-checks')) {
             if ($results[$job].result -cne 'success') {
               Write-Error "$job did not succeed"
