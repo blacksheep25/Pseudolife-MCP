@@ -191,8 +191,7 @@ def build_streamable_http_app():
     # Session lifetime stays as on mcp 2.1 (maintainer decision 2026-10-16):
     # mcp 2.2.0's defaults close a stateful session after 1800 s idle and
     # answer 503 past 10,000 live sessions; None turns both off. Adopting
-    # limits is a separate decision (and the Rust daemon's parity row
-    # MCP-LIVE-SESSIONS in rust/daemon/divergences.md moves with it).
+    # limits is a separate decision.
     return mcp.streamable_http_app(transport_security=_TRANSPORT_SECURITY,
                                    session_idle_timeout=None, max_sessions=None)
 

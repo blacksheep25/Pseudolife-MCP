@@ -9750,8 +9750,8 @@ refuses incompatible unpublished pilot table shapes. Canonical and RE extension
 initialization share one transaction in the Python service, so a refused
 extension does not commit a partial canonical upgrade.
 
-This fork's RE tools use the Python daemon and shim. The upstream native
-Rust candidate remains an explicit opt-in and does not implement the RE tools.
+This fork's RE tools use the Python daemon and shim. The fork does not carry
+upstream's unfinished native Rust port.
 
 The `re_evidence` tool is in the **core** tier. If the client does not list
 it, expand with `memory_toolset` and rediscover tools. The Svelte Console

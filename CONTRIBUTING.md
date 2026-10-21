@@ -189,13 +189,9 @@ bash 3.2 and BSD tools. If you add
 behavior, add a test; if you fix a bug, add the test that would have
 caught it.
 
-A pull request that touches `rust/` and changes nothing else except
-`.github/workflows/rust.yml`, `CHANGELOG.md` or `changelog.d/` fragments
-changes no Python, so CI skips the four Python suite lanes for it and runs
-a `guards` job instead (the tracked-tree and release-doc guards); the Rust
-workflow is that PR's gate. Every master push, and a nightly run, still
-runs the full suite. The Rust port under `rust/` is experimental and
-nothing installs it; see [rust/README.md](rust/README.md).
+This fork carries no Rust port: upstream's experimental `rust/` tree, its
+evals and its CI workflow were removed on 2026-10-21 while the port is
+unfinished. When an upstream merge touches them, keep them deleted.
 
 A docs-only change can skip the full run locally. That means Markdown
 anywhere, `llms.txt` / `llms-full.txt`, and non-code files under `docs/`
@@ -274,17 +270,7 @@ guard tests go red:
   don't just renumber;
 - the two literal meta-version pins in `tests/test_migrate_embeddings.py`,
   then `python ops/gen_llms_txt.py` if any doc changed
-  (`tests/test_llms_txt.py` pins the generated file);
-- the Rust side: `python rust/daemon/harness/gen_schema_sql.py` (then
-  `--check`), the shim's transfer schema literals in
-  `rust/shim/src/cli/transfer/{export,import}.rs` and `transfer.rs`
-  (pinned to `SCHEMA_META_VERSION` by `tests/test_schema_version.py`), the
-  schema-startup golden, and every parity golden that digests the table
-  catalog or dumps a bank (dream cursors, the daemon `run.py` rows, graph
-  store, principals, and the CLI harness rows under
-  `rust/cli_harness/goldens/` whose cases dump or export the bank:
-  transfer, invite, maintainer at least), re-recorded on both OSes;
-  `rust/PARITY.md` names the pin.
+  (`tests/test_llms_txt.py` pins the generated file).
 
 ## Licensing of contributions
 

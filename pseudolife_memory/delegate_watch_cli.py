@@ -118,8 +118,7 @@ def run(cmd: list[str]) -> tuple[int, str, str]:
 
 
 # ── pure classification: JSON in, exact lines out ────────────────────────────
-# tests/fixtures/delegate_watch_events.json holds cases for each function;
-# the Rust port's contract tests read the same file.
+# tests/fixtures/delegate_watch_events.json holds cases for each function.
 
 def checks_state(rollup) -> tuple[str, list[str]]:
     """``failing`` with the failed names, ``pending``, ``cancelled`` with the

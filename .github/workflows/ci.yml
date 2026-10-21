@@ -23,21 +23,18 @@
 # Kept lean: master-push + PR triggers only, cancel-in-progress,
 # pip + HuggingFace caches, diagnostic artifacts for the full Linux lanes.
 #
-# Rust-only pull requests (maintainer decision 2026-10-09): a PR that touches
-# rust/ and whose every other changed file is .github/workflows/rust.yml,
-# CHANGELOG.md or a changelog.d/ fragment changes no Python, so the four
-# Python suite lanes are skipped for it and the `guards` job runs the
-# tree-wide and release-doc guards
-# instead (tracked-tree identifiers and control bytes, CHANGELOG and release
-# pins, committed eval evidence). The Rust workflow is that PR's gate. The
-# full suite still runs on every master push and nightly.
-#
 # Console-only pull requests (maintainer decision 2026-10-16): a PR that
 # touches frontend/ and whose every other changed file is the committed build
 # under pseudolife_memory/web/static/, CHANGELOG.md or a changelog.d/
-# fragment changes no daemon Python either. The four suite lanes are skipped
-# for it as above; `guards` runs, and `console-guards` runs the Python tests
-# that pin the Console source and its committed bundle against embedded PG.
+# fragment changes no daemon Python. The four Python suite lanes are skipped
+# for it; the `guards` job runs the tree-wide and release-doc guards instead
+# (tracked-tree identifiers and control bytes, CHANGELOG and release pins,
+# committed eval evidence), and `console-guards` runs the Python tests that
+# pin the Console source and its committed bundle against embedded PG. The
+# full suite still runs on every master push and nightly.
+#
+# This fork carries no Rust port (stripped 2026-10-21 while the port is
+# unfinished), so upstream's Rust-only lane and Rust workflow are absent.
 # The `frontend` job (vitest, svelte-check, build) is that PR's gate.
 name: CI
 
@@ -46,7 +43,7 @@ on:
     branches: [master]
   pull_request:
   schedule:
-    # Nightly full run on master (02:17 AEDT), so a Rust-only day still
+    # Nightly full run on master (02:17 AEDT), so a Console-only day still
     # gets a full Python suite.
     - cron: "17 15 * * *"
   workflow_dispatch:
@@ -66,9 +63,8 @@ jobs:
   scope:
     # Decides whether this run needs the Python suite lanes. Only a pull
     # request whose net change (merge commit vs its base parent) is a
-    # Rust-only or a Console-only change (see the header) skips them; an
-    # empty or unreadable diff runs everything. `lane` names which:
-    # full, rust or console.
+    # Console-only change (see the header) skips them; an empty or
+    # unreadable diff runs everything. `lane` names which: full or console.
     runs-on: ubuntu-latest
     timeout-minutes: 15
     outputs:
@@ -99,10 +95,7 @@ jobs:
           # Here-strings, not pipes: under pipefail an early-exiting grep -q
           # can SIGPIPE the writer and flip the result on a long file list.
           lane=full
-          if ! grep -qvE '^(rust/|\.github/workflows/rust\.yml$|CHANGELOG\.md$|changelog\.d/)' <<<"$files" \
-             && grep -qE '^rust/' <<<"$files"; then
-            lane=rust
-          elif ! grep -qvE '^(frontend/|pseudolife_memory/web/static/|CHANGELOG\.md$|changelog\.d/)' <<<"$files" \
+          if ! grep -qvE '^(frontend/|pseudolife_memory/web/static/|CHANGELOG\.md$|changelog\.d/)' <<<"$files" \
              && grep -qE '^frontend/' <<<"$files"; then
             lane=console
           fi
@@ -112,7 +105,7 @@ jobs:
 
   guards:
     # Runs only when `scope` skips the Python lanes: the guards that scan
-    # every tracked file and pin the release docs, so a Rust-only PR is still
+    # every tracked file and pin the release docs, so a Console-only PR is still
     # checked for maintainer identifiers, stray control bytes, CHANGELOG and
     # release pins, and uncommitted evidence claims. Measured 2026-10-09 on
     # Windows: these files run in about 65 s with no PostgreSQL service
@@ -138,9 +131,9 @@ jobs:
 
       - name: Tree-wide guards
         # Every test file that reads CHANGELOG.md, plus the tracked-tree
-        # scans. The disposable-database guard scans every tracked .py file,
-        # rust/cli_harness/ included: #660 and #662 landed an unguarded reap
-        # there on 2026-10-09 because this job did not run it.
+        # scans. The disposable-database guard scans every tracked .py file:
+        # #660 and #662 landed an unguarded reap on 2026-10-09 because this
+        # job did not run it.
         run: >-
           python -m pytest -q
           tests/test_release_ux.py tests/test_eval_evidence.py

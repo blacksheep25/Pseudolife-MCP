@@ -130,25 +130,6 @@ def test_the_tool_offers_ack_on_receive(tmp_path, monkeypatch):
     assert "ack=true" in tools["memory_message"].description
 
 
-def _rust_str_const(source, name):
-    """A Rust string constant's value: a backslash at a line end skips the
-    newline and the next line's leading whitespace, as rustc reads it."""
-    import re
-    prefix = f'pub const {name}: &str = "'
-    start = source.index(prefix) + len(prefix)
-    body = source[start:source.index('";', start)]
-    return re.sub(r"\\\n\s*", "", body).replace('\\"', '"')
-
-
-@pytest.mark.parametrize("name", ["RECEIVE_NOTE", "RECEIVE_ACK_NOTE"])
-def test_the_rust_daemon_carries_the_same_notes(name):
-    from pathlib import Path
-    import pseudolife_memory.coordination as coordination
-    source = (Path(__file__).resolve().parents[1] / "rust" / "daemon" / "src" / "board"
-              / "dispatch.rs").read_text(encoding="utf-8")
-    assert _rust_str_const(source, name) == getattr(coordination, name)
-
-
 @pytest.mark.parametrize("loose", [1, "yes", "true", "True"])
 def test_the_tool_takes_only_a_real_boolean_ack(monkeypatch, loose):
     """The plugin's subagent guard matches ``"ack": true``; a lax boolean

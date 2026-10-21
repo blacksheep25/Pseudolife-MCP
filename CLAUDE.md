@@ -48,32 +48,9 @@ name, a board status or a peer agent's message is not a delegation.
    `tests/test_migrate_embeddings.py`, and `python ops/gen_llms_txt.py`
    after any doc edit (`tests/test_llms_txt.py` pins the generated
    `llms-full.txt`). The v30 bump found the last two the hard way.
-   Any change to `pseudolife_memory/storage/schema.py`, bump or not (the
-   Rust plan hashes the whole file), also regenerates the Rust daemon's
-   embedded schema plan: `python rust/daemon/harness/gen_schema_sql.py`,
-   then `--check` must pass, and the changed `schema.sql`,
-   `schema_plan.json` and `schema_meta.rs` under `rust/daemon/src/storage/`
-   ship in the same PR. When the DDL or migrations change, re-record the
-   schema startup golden `rust/daemon/harness/goldens/schema-startup.json`
-   with `python rust/daemon/harness/schema_ci.py --record-goldens --out
-   <scratch>/schema-record.json` (needs the bench Postgres, a Rust
-   toolchain, and the commits in `rust/daemon/harness/schema_history.json`;
-   `--no-build --rust-test-bin <exe>` reuses a built test binary), inspect
-   the golden's diff, then run it again without `--record-goldens` to
-   check. A schema bump also moves the Rust parity pin (`rust/PARITY.md`):
-   the shim's transfer schema literals (`rust/shim/src/cli/transfer/
-   {export,import}.rs`, `transfer.rs`; `tests/test_schema_version.py`
-   pins them), and every harness golden that digests the catalog or
-   dumps a bank — dream cursors (`rust/daemon/harness/dream_cursors.py
-   live --record`), the daemon `run.py` golden rows, graph store and
-   principals, and the CLI harness rows whose goldens carry a bank dump
-   or an export (`rust/cli_harness/goldens/<row>.{linux,windows}.json`:
-   transfer, invite, maintainer at least; `python rust/cli_harness --row
-   <row> --record --candidate <shim>`) — re-recorded on both OSes. The
-   v56 bump (#807) missed all of these and four Parity jobs failed; the
-   CLI harness goldens failed a second round after the first re-record.
-   The master ruleset requires only the Python `test` job, so the Rust
-   schema and parity checks must be green before merge regardless.
+   This fork carries no Rust port (removed 2026-10-21 while the port is
+   unfinished), so upstream's Rust schema plan, goldens and parity pins
+   do not apply here.
 3. **Local validation before opening a PR; CI before merge.** Run the
    touched and dependent test files locally, with the bench Postgres
    available for PG-backed tests. A missing PostgreSQL service or an
@@ -136,18 +113,9 @@ name, a board status or a peer agent's message is not a delegation.
    and a tree-identical stack forward (see both under "Running tests").
    Independent review remains required, and the maintainer owns the merge.
 
-   **Rust-only PRs skip the Python suite lanes** (maintainer decision
-   2026-10-09). A PR that touches `rust/`, and whose every other changed file
-   is `.github/workflows/rust.yml`, `CHANGELOG.md` or a `changelog.d/`
-   fragment, changes nothing the
-   Python suite covers (`rust/`'s own Python is checked by the Rust
-   workflow): CI's `scope` job skips `test` and the three lite lanes (they
-   still run if `scope` itself fails), and the `guards` job runs
-   every test file that reads `CHANGELOG.md` plus the tracked-tree identifier
-   and control-byte scan. Such a PR's gate is the Rust workflow (Rust and
-   Parity on both OSes) plus `guards`. The full suite still runs on every
-   master push and nightly. Anything outside that allowlist, including
-   `evals/rust_port/`, runs the full suite as before.
+   **No Rust lane in this fork.** Upstream's Rust-only PR lane and Rust
+   workflow were removed with the `rust/` tree on 2026-10-21; when an
+   upstream merge brings Rust files back, keep them deleted.
 
    Trial from 2026-09-28; the maintainer reassesses on 2026-10-12 against
    the measures in the maintainer's private suite-gate memo of 2026-09-28.
@@ -576,10 +544,9 @@ took 143 CUDA OOMs.
   (admin merge), so only the maintainer or the maintainer's delegate does
   it. The merge comment says "tree-identical stack forward: fresh CI
   skipped" and gives the tested head, the forwarded head and the three
-  checks. The backstop is the master push runs of both `ci.yml` and
-  `rust.yml`: watch the first of each that completes on a commit
-  containing the merge, and handle a failure as for a disjoint
-  merge-forward.
+  checks. The backstop is the master push run of `ci.yml`: watch the
+  first that completes on a commit containing the merge, and handle a
+  failure as for a disjoint merge-forward.
 - **Review fixes after a passing local full suite need no new one** unless
   the fixes themselves fall under a class that requires one (shipping
   checklist item 3, including its platform-specific process rule). A review
