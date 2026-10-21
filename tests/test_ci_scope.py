@@ -1,8 +1,9 @@
 """The CI ``scope`` job's lanes, and the Console lane's test list.
 
 ``.github/workflows/ci.yml`` skips the four Python suite lanes for a pull
-request whose net change is Rust-only (2026-10-09) or Console-only
-(2026-10-16). These tests run the job's own classification script on
+request whose net change is Console-only (2026-10-16). This fork carries
+no Rust port (stripped 2026-10-21), so upstream's Rust-only lane is gone and
+a Rust path runs the full suite like any other change. These tests run the job's own classification script on
 representative file lists, so a widened allowlist cannot quietly skip the
 suite for a change that touches the daemon. They also keep the
 ``console-guards`` job's file list in step with every test file that reads
@@ -73,9 +74,9 @@ def _classify(files: list[str], tmp_path: Path, event: str = "pull_request") -> 
 
 
 CASES = [
-    # Rust-only, unchanged from 2026-10-09.
-    (["rust/src/main.rs"], "rust"),
-    (["rust/Cargo.toml", ".github/workflows/rust.yml", "CHANGELOG.md"], "rust"),
+    # No Rust-only lane in this fork: a Rust path runs the full suite.
+    (["rust/src/main.rs"], "full"),
+    (["rust/Cargo.toml", ".github/workflows/rust.yml", "CHANGELOG.md"], "full"),
     # Console-only.
     (["frontend/src/components/Topbar.svelte"], "console"),
     (["frontend/src/lib/dreamChip.ts", "pseudolife_memory/web/static/index.html",

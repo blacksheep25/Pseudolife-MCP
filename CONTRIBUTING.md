@@ -189,13 +189,9 @@ bash 3.2 and BSD tools. If you add
 behavior, add a test; if you fix a bug, add the test that would have
 caught it.
 
-A pull request that touches `rust/` and changes nothing else except
-`.github/workflows/rust.yml`, `CHANGELOG.md` or `changelog.d/` fragments
-changes no Python, so CI skips the four Python suite lanes for it and runs
-a `guards` job instead (the tracked-tree and release-doc guards); the Rust
-workflow is that PR's gate. Every master push, and a nightly run, still
-runs the full suite. The Rust port under `rust/` is experimental and
-nothing installs it; see [rust/README.md](rust/README.md).
+This fork carries no Rust port: upstream's experimental `rust/` tree, its
+evals and its CI workflow were removed on 2026-10-21 while the port is
+unfinished. When an upstream merge touches them, keep them deleted.
 
 A docs-only change can skip the full run locally. That means Markdown
 anywhere, `llms.txt` / `llms-full.txt`, and non-code files under `docs/`

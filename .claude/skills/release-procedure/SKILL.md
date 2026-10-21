@@ -86,6 +86,9 @@ them in this order (first done 2026-07-16, v0.8.0; GHCR images added
    (issue #185) — run it as part of the cut, before tagging, so a missed
    field fails in the suite rather than mid-CI. Nothing pins the packaged
    compose copy's tag to the version: check it by hand.
+
+   This fork carries no Rust port (removed 2026-10-21), so the native
+   shim bump and the release-cut parity check do not apply.
    Tag `vN.N.N` at the exact commit the artifacts build from.
 2. **Build + inspect before upload**: `python -m build`, `twine check dist/*`,
    then open the wheel — Console build present: every file
