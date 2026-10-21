@@ -31,11 +31,11 @@
 # (tracked-tree identifiers and control bytes, CHANGELOG and release pins,
 # committed eval evidence), and `console-guards` runs the Python tests that
 # pin the Console source and its committed bundle against embedded PG. The
-# full suite still runs on every master push and nightly.
+# `frontend` job (vitest, svelte-check, build) is that PR's gate. The full
+# suite still runs on every master push and nightly.
 #
 # This fork carries no Rust port (stripped 2026-10-21 while the port is
 # unfinished), so upstream's Rust-only lane and Rust workflow are absent.
-# The `frontend` job (vitest, svelte-check, build) is that PR's gate.
 name: CI
 
 on:
