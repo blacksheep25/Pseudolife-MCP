@@ -1,12 +1,14 @@
 <script lang="ts">
   // Stores the bearer token under localStorage "pl_token".
   import { readKey, TOKEN_KEY } from "../lib/storage";
-  import { saveToken, ui } from "../lib/state.svelte";
+  import { saveToken, store, ui } from "../lib/state.svelte";
+  import { tokenHelp } from "../lib/tokenHelp";
   import { toast } from "../lib/overlay.svelte";
 
   let dialog: HTMLDialogElement | undefined = $state();
   let value = $state("");
   let reveal = $state(false);
+  const help = $derived(tokenHelp(store.health.data));
 
   $effect(() => {
     if (!dialog) return;
@@ -44,10 +46,10 @@
 >
   <form method="dialog" onsubmit={onSubmit}>
     <h2 id="token-title" class="panel-title">Bearer token</h2>
-    <p class="caption">
-      The daemon's token (PSEUDOLIFE_MCP_TOKEN, or one from PSEUDOLIFE_MCP_TOKENS). It stays in this
-      browser's local storage.
-    </p>
+    <p class="caption">{help.text}</p>
+    {#if help.fix}
+      <p class="caption fix" role="note">{help.fix}</p>
+    {/if}
     <label for="token-input" class="field-label">Token</label>
     <div class="field">
       <input
@@ -118,6 +120,9 @@
     flex-wrap: wrap;
     gap: 8px;
     margin-top: 4px;
+  }
+  .fix {
+    color: var(--ink);
   }
   .spacer {
     flex: 1 1 auto;
