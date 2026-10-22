@@ -12,7 +12,7 @@ describe("tokenHelp", () => {
     expect(h.tokenless).toBe(true);
     expect(h.text).toMatch(/no bearer token yet/i);
     expect(h.text).toMatch(/board needs one/i);
-    expect(h.fix).toContain("pwsh ops\install.ps1");
+    expect(h.fix).toContain(String.raw`pwsh ops\install.ps1`);
     expect(h.fix).toContain("ops/install.sh");
     expect(h.fix).toContain("~/.pseudolife-mcp/claude-code.token");
   });
@@ -40,7 +40,7 @@ describe("explainError authentication_required", () => {
   it("names the installer as the fix for a daemon with no token", () => {
     const x = explainError(new ApiError(403, "authentication_required", { error: "authentication_required" }), "The board");
     expect(x.body).toMatch(/no bearer token yet/i);
-    expect(x.body).toContain("pwsh ops\install.ps1");
+    expect(x.body).toContain(String.raw`pwsh ops\install.ps1`);
     expect(x.body).toContain("ops/install.sh");
     expect(x.body).toContain("~/.pseudolife-mcp/claude-code.token");
   });

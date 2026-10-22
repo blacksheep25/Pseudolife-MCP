@@ -3,7 +3,8 @@
   `PSEUDOLIFE_MCP_TOKEN` nor `PSEUDOLIFE_MCP_TOKENS`, `/health` reporting
   `"auth": false`), the Console's "Bearer token" dialog now says the daemon
   has no token yet, that the board needs one, and names the fix: re-run the
-  installer (`pwsh ops\install.ps1` / `ops/install.sh`), which adds
+  installer with its defaults (`pwsh ops\install.ps1` / `ops/install.sh`,
+  not `-NoToken` / `--no-token`), which adds
   `PSEUDOLIFE_MCP_TOKEN` to `ops/.env` and writes
   `~/.pseudolife-mcp/claude-code.token`. Before, it described "the daemon's
   token" as if one existed, and a user went looking for a token file that was
