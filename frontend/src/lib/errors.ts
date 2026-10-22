@@ -3,6 +3,7 @@
 
 import type { ApiError } from "./api/client";
 import type { BoardSnapshot } from "./api/types";
+import { INSTALL_TOKEN_FIX } from "./tokenHelp";
 
 export interface Explained {
   title: string;
@@ -34,7 +35,7 @@ export function explainError(e: ApiError, what = "This view"): Explained {
     case "authentication_required":
       return {
         title: "The board needs a bearer token on the daemon",
-        body: "Coordination requires a configured token even on a loopback install. Start the daemon with PSEUDOLIFE_MCP_TOKEN (or PSEUDOLIFE_MCP_TOKENS), then store the same token here.",
+        body: `This daemon has no bearer token yet, and the board needs one even on a loopback install. ${INSTALL_TOKEN_FIX}`,
         token: true,
       };
     case "principal_not_allowed":
