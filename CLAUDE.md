@@ -733,8 +733,16 @@ hook does not see.
   with `$OUT` a per-pass path outside the working tree (the session
   scratchpad, named by the reviewed short sha so a rerun does not
   overwrite it). Use `--uncommitted` for a pre-commit pass and
-  `--commit <sha>` for a single commit. Pin the model and effort on the
-  command line, and check the log's header names both. To stop one early,
+  `--commit <sha>` for a single commit. These model settings are the default
+  for this automated second review; they do not set the lead agent's model or
+  Claude Code's own subagent settings. An explicit user or repository-wide
+  instruction limiting Codex/OpenAI reviewer models takes precedence: run the
+  second review with the allowed model and effort rather than launching a
+  disallowed default or pausing to request authorization already given. Pin
+  the model and effort actually used on the command line, check the log's
+  header names both, and record any user-authorized substitution in the PR or
+  commit body. Never claim the GPT-6.1 Sol/high review ran when it did not;
+  keep its review scope and all other PR gates. To stop one early,
   kill its own process tree by the PID taken at launch, never by image
   name (see "Stopping processes (shared host)"). Verify
   its findings against the code like a subagent's, and record both reviews
