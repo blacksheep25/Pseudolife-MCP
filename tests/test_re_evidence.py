@@ -461,6 +461,32 @@ def test_database_rejects_every_artifact_update(pg_conn, assignment):
                 (evidence_id,))
 
 
+def test_hashed_archive_uses_one_private_snapshot(tmp_path):
+    import hashlib
+    import zipfile
+
+    from pseudolife_memory.re_evidence import _open_hashed_archive
+
+    archive_path = tmp_path / "proof.zip"
+    replacement_path = tmp_path / "replacement.zip"
+    original_payload = b'{"value":"original"}'
+    replacement_payload = b'{"value":"changed!"}'
+    with zipfile.ZipFile(archive_path, "w", compression=zipfile.ZIP_STORED) as archive:
+        archive.writestr("payload.json", original_payload)
+    original_bytes = archive_path.read_bytes()
+    with zipfile.ZipFile(
+            replacement_path, "w", compression=zipfile.ZIP_STORED) as archive:
+        archive.writestr("payload.json", replacement_payload)
+    replacement_bytes = replacement_path.read_bytes()
+    assert len(original_bytes) == len(replacement_bytes)
+
+    with _open_hashed_archive(archive_path) as (archive, archive_sha256):
+        archive_path.write_bytes(replacement_bytes)
+        assert archive.read("payload.json") == original_payload
+        assert archive_sha256 == hashlib.sha256(original_bytes).hexdigest()
+    assert archive_path.read_bytes() == replacement_bytes
+
+
 def test_portable_archive_round_trip_preserves_original_bytes(pg_url, pg_conn, tmp_path):
     import hashlib
 
@@ -477,9 +503,21 @@ def test_portable_archive_round_trip_preserves_original_bytes(pg_url, pg_conn, t
             "kind": "ghidra-function", "summary": "round trip",
         })
         old_id = storage.insert_re_evidence(artifact)
-        storage.upsert_re_claim(
+        old_claim_id = storage.upsert_re_claim(
             project="srfn-client", binary_id="client:test", subject="00b72870",
             claim="round-trip claim", status="verified", evidence_ids=[old_id])
+        second_raw = b'{"address":"00B72871","value":2}\r\n'
+        second_artifact = parse_evidence_bytes(
+            second_raw, source_path="evidence/second.json")
+        second_artifact.update({
+            "project": "srfn-client", "binary_id": "client:test",
+            "kind": "ghidra-function", "summary": "second round trip",
+        })
+        old_second_id = storage.insert_re_evidence(second_artifact)
+        old_second_claim_id = storage.upsert_re_claim(
+            project="srfn-client", binary_id="client:test", subject="00b72871",
+            claim="second round-trip claim", status="verified",
+            evidence_ids=[old_second_id])
 
         archive_path = tmp_path / "proof.zip"
         exported = export_evidence_archive(
@@ -581,20 +619,272 @@ def test_portable_archive_round_trip_preserves_original_bytes(pg_url, pg_conn, t
         imported = import_evidence_archive(
             storage, path=archive_path, project="srfn-client",
             binary_id="client:test", archive_root=tmp_path)
-        assert imported == {
-            "format": "pseudolife-re-evidence-v1", "project": "srfn-client",
-            "binary_id": "client:test", "artifacts": 1, "claims": 1}
-
-        ids = storage.re_evidence_export_ids(
-            project="srfn-client", binary_id="client:test")
-        restored = storage.get_re_evidence_for_export(
-            artifact_id=ids[0], project="srfn-client", binary_id="client:test")
-        assert restored["raw_bytes"] == raw
+        rows = storage.query_re_evidence(
+            project="srfn-client", binary_id="client:test", limit=None)
+        new_id_by_locator = {row["locator"]: row["id"] for row in rows}
+        assert len(new_id_by_locator) == 2
+        assert storage.get_re_evidence_for_export(
+            artifact_id=new_id_by_locator["00b72870"],
+            project="srfn-client", binary_id="client:test")["raw_bytes"] == raw
+        assert storage.get_re_evidence_for_export(
+            artifact_id=new_id_by_locator["00b72871"],
+            project="srfn-client", binary_id="client:test")["raw_bytes"] == second_raw
         claims = storage.query_re_claims(
             project="srfn-client", binary_id="client:test")
-        assert claims[0]["evidence_ids"] == ids
+        new_claim_by_text = {row["claim"]: row for row in claims}
+        assert new_claim_by_text["round-trip claim"]["evidence_ids"] == [
+            new_id_by_locator["00b72870"]]
+        assert new_claim_by_text["second round-trip claim"]["evidence_ids"] == [
+            new_id_by_locator["00b72871"]]
+        assert imported == {
+            "format": "pseudolife-re-evidence-v1", "project": "srfn-client",
+            "binary_id": "client:test", "artifacts": 2, "claims": 2,
+            "archive_sha256": exported["sha256"],
+            "artifact_id_map": [
+                {"old_id": old_id, "new_id": new_id_by_locator["00b72870"]},
+                {"old_id": old_second_id,
+                 "new_id": new_id_by_locator["00b72871"]},
+            ],
+            "claim_id_map": [
+                {"old_id": old_claim_id,
+                 "new_id": new_claim_by_text["round-trip claim"]["id"]},
+                {"old_id": old_second_claim_id,
+                 "new_id": new_claim_by_text["second round-trip claim"]["id"]},
+            ],
+        }
     finally:
         storage.close()
+
+
+def test_archive_import_rolls_back_after_partial_restore(
+        pg_url, pg_conn, tmp_path, monkeypatch):
+    from pseudolife_memory.re_evidence import (
+        export_evidence_archive, import_evidence_archive, parse_evidence_bytes)
+    from pseudolife_memory.storage.postgres import PostgresStorage
+
+    project = "archive-import-rollback"
+    binary_id = "client:rollback"
+    storage = PostgresStorage(pg_url)
+    try:
+        artifact = parse_evidence_bytes(
+            b'{"address":"00b72870"}', source_path="evidence/rollback.json")
+        artifact.update({
+            "project": project, "binary_id": binary_id,
+            "kind": "ghidra-function", "summary": "rollback probe",
+        })
+        artifact_id = storage.insert_re_evidence(artifact)
+        storage.upsert_re_claim(
+            project=project, binary_id=binary_id, subject="00b72870",
+            claim="first rollback claim", status="verified",
+            evidence_ids=[artifact_id])
+        storage.upsert_re_claim(
+            project=project, binary_id=binary_id, subject="00b72871",
+            claim="second rollback claim", status="verified",
+            evidence_ids=[artifact_id])
+        archive_path = tmp_path / "rollback.zip"
+        export_evidence_archive(
+            storage, path=archive_path, project=project,
+            binary_id=binary_id, archive_root=tmp_path)
+        with storage._txn():
+            storage.conn.execute(
+                "DELETE FROM re_claims WHERE project = %s", (project,))
+            storage.conn.execute(
+                "DELETE FROM re_evidence_artifacts WHERE project = %s", (project,))
+
+        original_upsert = storage.upsert_re_claim
+        calls = 0
+
+        def fail_second_claim(**kwargs):
+            nonlocal calls
+            calls += 1
+            if calls == 2:
+                raise RuntimeError("injected archive restore failure")
+            return original_upsert(**kwargs)
+
+        monkeypatch.setattr(storage, "upsert_re_claim", fail_second_claim)
+        with pytest.raises(RuntimeError, match="injected archive restore failure"):
+            import_evidence_archive(
+                storage, path=archive_path, project=project,
+                binary_id=binary_id, archive_root=tmp_path)
+        assert calls == 2
+        assert storage.query_re_evidence(
+            project=project, binary_id=binary_id, limit=None) == []
+        assert storage.query_re_claims(
+            project=project, binary_id=binary_id) == []
+    finally:
+        storage.close()
+
+
+@pytest.mark.parametrize("archive_id", [True, 1.5, "1", 0, -1])
+def test_archive_prevalidation_requires_positive_integer_artifact_ids(
+        tmp_path, archive_id):
+    import zipfile
+
+    from pseudolife_memory.re_evidence import (
+        EvidenceInputError, import_evidence_archive, parse_evidence_bytes)
+
+    raw = b'{"address":"00b72870"}'
+    parsed = parse_evidence_bytes(raw, source_path="evidence/id.json")
+    member = "artifacts/item.json"
+    manifest = {
+        "format": "pseudolife-re-evidence-v1", "project": "srfn-client",
+        "binary_id": "client:test",
+        "artifacts": [{
+            "id": archive_id, "member": member,
+            "content_hash": parsed["content_hash"], "locator": parsed["locator"],
+            "addresses": parsed["addresses"], "payload_keys": parsed["payload_keys"],
+            "kind": "ghidra-function", "summary": None,
+        }],
+        "claims": [],
+    }
+    path = tmp_path / "invalid-artifact-id.zip"
+    with zipfile.ZipFile(path, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+        archive.writestr(member, raw)
+        archive.writestr("manifest.json", json.dumps(manifest))
+
+    with pytest.raises(EvidenceInputError, match="artifact id must be a positive integer"):
+        import_evidence_archive(
+            object(), path=path, project="srfn-client", binary_id="client:test",
+            archive_root=tmp_path)
+
+
+@pytest.mark.parametrize("claim_id", [True, 1.5, "1", 0, -1])
+def test_archive_prevalidation_requires_positive_integer_claim_ids(
+        tmp_path, claim_id):
+    import zipfile
+
+    from pseudolife_memory.re_evidence import (
+        EvidenceInputError, import_evidence_archive, parse_evidence_bytes)
+
+    raw = b'{"address":"00b72870"}'
+    parsed = parse_evidence_bytes(raw, source_path="evidence/claim-id.json")
+    member = "artifacts/item.json"
+    manifest = {
+        "format": "pseudolife-re-evidence-v1", "project": "srfn-client",
+        "binary_id": "client:test",
+        "artifacts": [{
+            "id": 1, "member": member,
+            "content_hash": parsed["content_hash"], "locator": parsed["locator"],
+            "addresses": parsed["addresses"], "payload_keys": parsed["payload_keys"],
+            "kind": "ghidra-function", "summary": None,
+        }],
+        "claims": [{
+            "id": claim_id, "subject": "00b72870", "claim": "claim ID check",
+            "status": "verified", "evidence_ids": [1], "confidence": None,
+        }],
+    }
+    path = tmp_path / "invalid-claim-id.zip"
+    with zipfile.ZipFile(path, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+        archive.writestr(member, raw)
+        archive.writestr("manifest.json", json.dumps(manifest))
+
+    with pytest.raises(EvidenceInputError, match="claim id must be a positive integer"):
+        import_evidence_archive(
+            object(), path=path, project="srfn-client", binary_id="client:test",
+            archive_root=tmp_path)
+
+
+def test_archive_prevalidation_rejects_duplicate_claim_ids(tmp_path):
+    import zipfile
+
+    from pseudolife_memory.re_evidence import (
+        EvidenceInputError, import_evidence_archive, parse_evidence_bytes)
+
+    raw = b'{"address":"00b72870"}'
+    parsed = parse_evidence_bytes(raw, source_path="evidence/duplicate-claim.json")
+    member = "artifacts/item.json"
+    manifest = {
+        "format": "pseudolife-re-evidence-v1", "project": "srfn-client",
+        "binary_id": "client:test",
+        "artifacts": [{
+            "id": 1, "member": member,
+            "content_hash": parsed["content_hash"], "locator": parsed["locator"],
+            "addresses": parsed["addresses"], "payload_keys": parsed["payload_keys"],
+            "kind": "ghidra-function", "summary": None,
+        }],
+        "claims": [
+            {"id": 1, "subject": "00b72870", "claim": "first claim",
+             "status": "verified", "evidence_ids": [1], "confidence": None},
+            {"id": 1, "subject": "00b72871", "claim": "second claim",
+             "status": "verified", "evidence_ids": [1], "confidence": None},
+        ],
+    }
+    path = tmp_path / "duplicate-claim-id.zip"
+    with zipfile.ZipFile(path, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+        archive.writestr(member, raw)
+        archive.writestr("manifest.json", json.dumps(manifest))
+
+    with pytest.raises(EvidenceInputError, match="duplicate claim id in manifest"):
+        import_evidence_archive(
+            object(), path=path, project="srfn-client", binary_id="client:test",
+            archive_root=tmp_path)
+
+
+def test_archive_prevalidation_requires_integer_claim_evidence_ids(tmp_path):
+    import zipfile
+
+    from pseudolife_memory.re_evidence import (
+        EvidenceInputError, import_evidence_archive, parse_evidence_bytes)
+
+    raw = b'{"address":"00b72870"}'
+    parsed = parse_evidence_bytes(raw, source_path="evidence/ref.json")
+    member = "artifacts/item.json"
+    manifest = {
+        "format": "pseudolife-re-evidence-v1", "project": "srfn-client",
+        "binary_id": "client:test",
+        "artifacts": [{
+            "id": 1, "member": member,
+            "content_hash": parsed["content_hash"], "locator": parsed["locator"],
+            "addresses": parsed["addresses"], "payload_keys": parsed["payload_keys"],
+            "kind": "ghidra-function", "summary": None,
+        }],
+        "claims": [{
+            "id": 1, "subject": "00b72870", "claim": "bad reference",
+            "status": "verified", "evidence_ids": [1.5], "confidence": None,
+        }],
+    }
+    path = tmp_path / "invalid-claim-reference.zip"
+    with zipfile.ZipFile(path, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+        archive.writestr(member, raw)
+        archive.writestr("manifest.json", json.dumps(manifest))
+
+    with pytest.raises(
+            EvidenceInputError,
+            match="claim evidence ids must be positive integers"):
+        import_evidence_archive(
+            object(), path=path, project="srfn-client", binary_id="client:test",
+            archive_root=tmp_path)
+
+
+def test_archive_prevalidation_rejects_duplicate_artifact_identity(tmp_path):
+    import zipfile
+
+    from pseudolife_memory.re_evidence import (
+        EvidenceInputError, import_evidence_archive, parse_evidence_bytes)
+
+    raw = b'{"address":"00b72870"}'
+    parsed = parse_evidence_bytes(raw, source_path="evidence/duplicate.json")
+    artifacts = []
+    path = tmp_path / "duplicate-identity.zip"
+    with zipfile.ZipFile(path, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+        for artifact_id in (1, 2):
+            member = f"artifacts/item-{artifact_id}.json"
+            artifacts.append({
+                "id": artifact_id, "member": member,
+                "content_hash": parsed["content_hash"], "locator": parsed["locator"],
+                "addresses": parsed["addresses"], "payload_keys": parsed["payload_keys"],
+                "kind": "ghidra-function", "summary": None,
+            })
+            archive.writestr(member, raw)
+        archive.writestr("manifest.json", json.dumps({
+            "format": "pseudolife-re-evidence-v1", "project": "srfn-client",
+            "binary_id": "client:test", "artifacts": artifacts, "claims": [],
+        }))
+
+    with pytest.raises(EvidenceInputError, match="duplicate artifact identity"):
+        import_evidence_archive(
+            object(), path=path, project="srfn-client", binary_id="client:test",
+            archive_root=tmp_path)
 
 
 def test_archive_prevalidation_rejects_duplicate_member_reference(tmp_path):

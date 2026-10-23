@@ -13,7 +13,9 @@ import json
 import math
 import os
 import re
+import tempfile
 import zipfile
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 
@@ -237,6 +239,29 @@ def resolve_evidence_archive_path(
     return resolved
 
 
+@contextmanager
+def _open_hashed_archive(source: Path):
+    """Snapshot, hash and open one bounded copy of an archive."""
+    with tempfile.SpooledTemporaryFile(
+            max_size=8 * 1024 * 1024, mode="w+b") as snapshot:
+        digest = hashlib.sha256()
+        total = 0
+        with source.open("rb") as stream:
+            while True:
+                chunk = stream.read(1024 * 1024)
+                if not chunk:
+                    break
+                total += len(chunk)
+                if total > MAX_ARCHIVE_FILE_BYTES:
+                    raise EvidenceInputError(
+                        "evidence archive exceeds physical-size limit")
+                digest.update(chunk)
+                snapshot.write(chunk)
+        snapshot.seek(0)
+        with zipfile.ZipFile(snapshot, mode="r") as archive:
+            yield archive, digest.hexdigest()
+
+
 def export_evidence_archive(
     storage, *, path: str | Path, project: str, binary_id: str,
     archive_root: str | Path,
@@ -345,7 +370,7 @@ def import_evidence_archive(
         raise EvidenceInputError(f"evidence archive not found: {source}")
     if source.stat().st_size > MAX_ARCHIVE_FILE_BYTES:
         raise EvidenceInputError("evidence archive exceeds physical-size limit")
-    with zipfile.ZipFile(source, mode="r") as archive:
+    with _open_hashed_archive(source) as (archive, archive_sha256):
         infos = archive.infolist()
         if len(infos) > MAX_ARCHIVE_ARTIFACTS + 1:
             raise EvidenceInputError("evidence archive has too many members")
@@ -381,6 +406,7 @@ def import_evidence_archive(
         total_compressed = max(1, manifest_info.compress_size)
         validated: list[tuple[dict[str, Any], str]] = []
         old_ids: set[int] = set()
+        artifact_identities: set[tuple[str, str]] = set()
         referenced_members: set[str] = set()
         # Pass 1: validate the ENTIRE archive before touching the database.
         for item in artifacts:
@@ -415,18 +441,41 @@ def import_evidence_archive(
                 if parsed[field] != item.get(field):
                     raise EvidenceInputError(
                         f"artifact derived metadata mismatch for {member}: {field}")
-            old_id = int(item["id"])
+            old_id = item.get("id")
+            if type(old_id) is not int or old_id <= 0:
+                raise EvidenceInputError(
+                    "artifact id must be a positive integer in archive manifest")
             if old_id in old_ids:
                 raise EvidenceInputError(f"duplicate artifact id in manifest: {old_id}")
             old_ids.add(old_id)
+            identity = (parsed["content_hash"], parsed["locator"])
+            if identity in artifact_identities:
+                raise EvidenceInputError(
+                    f"duplicate artifact identity in manifest: {identity!r}")
+            artifact_identities.add(identity)
             validated.append((item, member))
         if set(names) != expected_members:
             raise EvidenceInputError("archive contains unreferenced or missing members")
         if total_uncompressed / total_compressed > MAX_ARCHIVE_COMPRESSION_RATIO:
             raise EvidenceInputError("archive aggregate compression ratio exceeds limit")
         claim_identities: set[tuple[str, str]] = set()
+        claim_ids: set[int] = set()
         for claim in claims:
-            linked = [int(old) for old in claim.get("evidence_ids") or []]
+            old_claim_id = claim.get("id")
+            if type(old_claim_id) is not int or old_claim_id <= 0:
+                raise EvidenceInputError(
+                    "claim id must be a positive integer in archive manifest")
+            if old_claim_id in claim_ids:
+                raise EvidenceInputError(
+                    f"duplicate claim id in manifest: {old_claim_id}")
+            claim_ids.add(old_claim_id)
+            linked = claim.get("evidence_ids")
+            if linked is None:
+                linked = []
+            if (not isinstance(linked, list)
+                    or any(type(old) is not int or old <= 0 for old in linked)):
+                raise EvidenceInputError(
+                    "claim evidence ids must be positive integers in archive manifest")
             missing = sorted(set(linked) - old_ids)
             if missing:
                 raise EvidenceInputError(
@@ -442,12 +491,14 @@ def import_evidence_archive(
                     f"duplicate claim identity in manifest: {identity!r}")
             claim_identities.add(identity)
 
-        # Pass 2: re-read validated members and restore inside one outer
-        # transaction. The database-scoped lock serializes this destination
-        # across daemon processes/connections; emptiness is rechecked only
+        # Pass 2 re-reads validated members from the private snapshot and
+        # restores inside one outer transaction. The database-scoped lock
+        # serializes this destination across daemon processes/connections;
+        # emptiness is rechecked only
         # after acquiring it. Storage methods create nested savepoints; any
         # later failure rolls the complete import back at the outer boundary.
         id_map: dict[int, int] = {}
+        claim_id_map: dict[int, int] = {}
         with storage._txn():
             storage.conn.execute(
                 "SELECT pg_advisory_xact_lock(hashtextextended(%s, 0))",
@@ -466,10 +517,11 @@ def import_evidence_archive(
                     "kind": item.get("kind"),
                     "summary": item.get("summary"),
                 })
-                id_map[int(item["id"])] = storage.insert_re_evidence(parsed)
+                id_map[item["id"]] = storage.insert_re_evidence(parsed)
             for claim in claims:
-                linked = [id_map[int(old)] for old in claim.get("evidence_ids") or []]
-                storage.upsert_re_claim(
+                linked = [
+                    id_map[old] for old in claim.get("evidence_ids") or []]
+                claim_id_map[claim["id"]] = storage.upsert_re_claim(
                     project=project, binary_id=binary_id,
                     subject=claim["subject"], claim=claim["claim"],
                     status=claim["status"], evidence_ids=linked,
@@ -480,4 +532,11 @@ def import_evidence_archive(
         "binary_id": binary_id,
         "artifacts": len(id_map),
         "claims": len(claims),
+        "archive_sha256": archive_sha256,
+        "artifact_id_map": [
+            {"old_id": old_id, "new_id": new_id}
+            for old_id, new_id in sorted(id_map.items())],
+        "claim_id_map": [
+            {"old_id": old_id, "new_id": new_id}
+            for old_id, new_id in sorted(claim_id_map.items())],
     }

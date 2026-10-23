@@ -268,6 +268,12 @@ hash. Export refuses to overwrite an existing file. Artifact count, claim
 count, manifest size, aggregate uncompressed bytes, and compression ratio are
 bounded so an archive cannot monopolize the daemon indefinitely.
 
+An import response includes `archive_sha256`, `artifact_id_map`, and
+`claim_id_map`. The maps are arrays of `{old_id, new_id}` pairs, so a caller
+can reconnect a saved manifest to the artifact and claim IDs assigned in the
+destination. Use `archive_sha256` with the requested project/build to bind
+those mappings to the archive that was imported.
+
 Archive paths are resolved beneath `PSEUDOLIFE_RE_EVIDENCE_ARCHIVE_ROOT`,
 which defaults to `<data_dir>/re_evidence_archives` (and to
 `/data/re_evidence_archives` in Docker compose). Relative paths are preferred;
