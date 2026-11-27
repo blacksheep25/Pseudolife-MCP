@@ -2981,15 +2981,17 @@ def memory_relation_define(
 
 @_tool(tier="core")
 def re_evidence(
-    action: Annotated[Literal["ingest", "claim", "query", "export", "import", "stats", "dependencies"], Field(
-        description="Operation: ingest immutable Evidence Hub JSON; record an "
+    action: Annotated[Literal["register", "ingest", "claim", "query", "export", "import", "stats", "dependencies"], Field(
+        description="Operation: register a build by hashing its binary file; "
+                    "ingest immutable Evidence Hub JSON; record an "
                     "evidence-gated claim; query exact addresses/claims; export "
                     "or import a portable archive; audit declared dependency hashes; "
                     "or return project counts.")],
     project: Annotated[str, Field(
         description="Stable project key, for example 'srfn-client'.")],
     path: Annotated[str | None, Field(
-        description="For ingest/dependencies: JSON input path. For export/import: archive "
+        description="For register: original binary path (daemon-visible). "
+                    "For ingest/dependencies: JSON input path. For export/import: archive "
                     "path beneath the server's configured RE evidence archive "
                     "root (relative paths are preferred).")] = None,
     kind: Annotated[str, Field(
@@ -3001,7 +3003,7 @@ def re_evidence(
         description="For ingest: short human-reviewed description; never proof.")] = None,
     binary_id: Annotated[str | None, Field(
         description="Required build identity for ingest/claim/query/export/import/dependencies, "
-                    "preferably filename plus cryptographic hash. Optional stats filter.")] = None,
+                    "use the exact binary_id returned by register. Optional stats filter.")] = None,
     subject: Annotated[str | None, Field(
         description="For claim/query: exact address or other stable subject.")] = None,
     claim: Annotated[str | None, Field(
@@ -3039,6 +3041,10 @@ def re_evidence(
     """
     if action != "query" and (artifact_id is not None or content_hash is not None):
         raise ValueError("re_evidence exact artifact selectors require action=query")
+    if action == "register":
+        if not path:
+            raise ValueError("re_evidence register requires path to the original binary")
+        return service.re_evidence_register(path=path, project=project)
     if action != "stats" and not binary_id:
         raise ValueError(f"re_evidence {action} requires binary_id")
     if action == "ingest":

@@ -15,6 +15,80 @@ class ReEvidenceStore:
 
     # ── reverse-engineering evidence (v34-rehub extension) ────────────
 
+    def register_re_build(self, *, project: str, path, dry_run: bool = False) -> dict:
+        """Admit a computed binary identity; one name per project/digest.
+
+        Registrations use the existing durable metadata store, so startup
+        needs no DDL or heuristic backfill of historical caller-supplied IDs.
+        Logical memory transfer excludes this admission authority; a target
+        bank verifies its own binary bytes before accepting evidence writes.
+        """
+        from pseudolife_memory.re_evidence import (
+            EvidenceInputError, build_registration_key, hash_binary_file, parse_binary_id)
+
+        project = project.strip()
+        if not project:
+            raise EvidenceInputError("project must be non-empty")
+        binary_id, digest = hash_binary_file(path)
+        key = build_registration_key(project, digest)
+        with self._txn():
+            self._lock_re_evidence_scope(project, key)
+            row = self.conn.execute("SELECT value FROM meta WHERE key=%s", (key,)).fetchone()
+            if row is not None:
+                registered = row[0]
+                self.require_re_build(project, registered["binary_id"])
+                return registered
+            # A renamed original must not start a second scope on upgrade.
+            # Only an exact match to the digest we just computed qualifies;
+            # caller labels alone never establish a binary's identity.
+            historical = self.conn.execute(
+                "SELECT binary_id FROM ("
+                "SELECT binary_id FROM re_evidence_artifacts WHERE project=%s "
+                "UNION ALL SELECT binary_id FROM re_claims WHERE project=%s) scopes "
+                "WHERE binary_id LIKE %s GROUP BY binary_id "
+                "ORDER BY count(*) DESC,binary_id",
+                (project, project, "%:sha256:" + digest)).fetchall()
+            for candidate, in historical:
+                try:
+                    parse_binary_id(candidate)
+                except EvidenceInputError:
+                    continue
+                binary_id = candidate
+                break
+            registration = {"project": project, "binary_id": binary_id,
+                            "sha256": digest}
+            if dry_run:
+                return registration
+            self.conn.execute(
+                "INSERT INTO meta (key, value) VALUES (%s, %s) "
+                "ON CONFLICT (key) DO NOTHING", (key, Jsonb(registration)))
+            row = self.conn.execute("SELECT value FROM meta WHERE key = %s", (key,)).fetchone()
+            registered = row[0]
+            self.require_re_build(project, registered["binary_id"])
+        return registered
+
+    def require_re_build(self, project: str, binary_id: str) -> str:
+        """Refuse typo scopes, including syntactically valid wrong hashes."""
+        from pseudolife_memory.re_evidence import (
+            EvidenceInputError, build_registration_key, parse_binary_id)
+
+        _, digest = parse_binary_id(binary_id)
+        row = self.conn.execute(
+            "SELECT value FROM meta WHERE key = %s",
+            (build_registration_key(project, digest),)).fetchone()
+        if row is None:
+            raise EvidenceInputError(
+                f"unregistered binary_id for project {project!r}; "
+                "use re_evidence(action='register', project=..., path=<binary path>) "
+                "and use its returned binary_id")
+        registration = row[0]
+        if (registration.get("project") != project or registration.get("sha256") != digest
+                or registration.get("binary_id") != binary_id):
+            raise EvidenceInputError(
+                f"binary_id differs from the registered identity; use "
+                f"{registration.get('binary_id')!r}")
+        return binary_id
+
     def _lock_re_evidence_scope(self, project: str, binary_id: str) -> None:
         """Serialize every proof-store mutation for one project/build.
 
@@ -40,6 +114,7 @@ class ReEvidenceStore:
             raise EvidenceInputError(f"evidence artifact missing fields: {missing}")
         now = time.time()
         with self._txn():
+            self.require_re_build(artifact["project"], artifact["binary_id"])
             self._lock_re_evidence_scope(
                 str(artifact["project"]), str(artifact["binary_id"]))
             row = self.conn.execute(
@@ -154,6 +229,7 @@ class ReEvidenceStore:
             require_evidence=not preserve_links)
         now = time.time()
         with self._txn():
+            self.require_re_build(project, binary_id)
             self._lock_re_evidence_scope(project, binary_id)
             if preserve_links and status.strip().lower() in (
                     "observed", "verified", "rejected"):

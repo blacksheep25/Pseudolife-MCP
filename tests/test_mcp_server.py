@@ -194,6 +194,18 @@ def test_re_evidence_dispatches_ingest_and_claim(monkeypatch) -> None:
     assert seen[1][1]["evidence_ids"] == [7]
 
 
+def test_re_evidence_register_computes_build_without_caller_binary_id(monkeypatch):
+    from pseudolife_memory import mcp_server
+
+    seen = []
+    monkeypatch.setattr(mcp_server.service, "re_evidence_register",
+        lambda **kw: seen.append(kw) or {"binary_id": "client.exe:sha256:" + "a" * 64})
+    result = _invoke("re_evidence", {
+        "action": "register", "project": "example", "path": "mounted/client.exe"})
+    assert result["binary_id"] == "client.exe:sha256:" + "a" * 64
+    assert seen == [{"project": "example", "path": "mounted/client.exe"}]
+
+
 def test_re_evidence_coerces_stringified_evidence_ids(monkeypatch) -> None:
     from pseudolife_memory import mcp_server
 

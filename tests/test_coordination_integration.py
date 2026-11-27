@@ -233,7 +233,10 @@ def test_coordinator_assigns_re_task_and_checks_worker_evidence(pg_service, tmp_
         "SELECT (SELECT count(*) FROM entries), (SELECT count(*) FROM facts), "
         "(SELECT count(*) FROM entities), (SELECT count(*) FROM world_facts)"
     ).fetchone()
-    scope = {"project": "example-client", "binary_id": "client.exe:sha256:" + "a" * 64}
+    binary = tmp_path / "client.exe"
+    binary.write_bytes(b"original client executable")
+    registered = service.re_evidence_register(project="example-client", path=str(binary))
+    scope = {"project": "example-client", "binary_id": registered["binary_id"]}
     raw = b'{"function":{"address":"00401000","c_code":"raw-proof-stays-out-of-mail"}}\n'
     source = tmp_path / "lookup.json"
     source.write_bytes(raw)

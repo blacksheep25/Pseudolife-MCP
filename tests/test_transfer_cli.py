@@ -367,6 +367,9 @@ def test_table_roster_covers_the_whole_schema():
 def test_export_import_roundtrip_preserves_every_table(pg_url, tmp_path):
     with _bank(pg_url) as conn:
         _seed_bank(conn)
+        conn.execute("INSERT INTO meta (key,value) VALUES "
+                     "('re_evidence_build:synthetic', '{\"binary_id\": \"untrusted\"}'::jsonb)")
+        conn.commit()
         before = _dump_all(conn)
         cur = conn.execute("SELECT MAX(id) FROM entries")
         max_entry_id = cur.fetchone()[0]
@@ -377,11 +380,18 @@ def test_export_import_roundtrip_preserves_every_table(pg_url, tmp_path):
     assert result["counts"]["entries"] == 2
     assert result["counts"]["facts"] == 3
     assert result["counts"]["edge_evidence"] == 1
+    with zipfile.ZipFile(out) as archive:
+        assert b"re_evidence_build:" not in archive.read("meta.jsonl")
 
     with _bank(pg_url):
         pass  # truncate back to empty, then release the connection
 
-    perform_import(pg_url, out)
+    # A hand-edited logical archive must not forge build admission either.
+    forged = tmp_path / "with-build-registration.zip"
+    def inject_build_registration(blobs):
+        blobs["meta.jsonl"] += b'\n{"key":"re_evidence_build:forged","value":{"binary_id":"untrusted"}}\n'
+    _rewrite_zip(out, forged, inject_build_registration)
+    perform_import(pg_url, forged)
 
     with psycopg.connect(pg_url) as conn:
         conn.execute("SET search_path TO public")
@@ -396,6 +406,7 @@ def test_export_import_roundtrip_preserves_every_table(pg_url, tmp_path):
         cur = conn.execute(
             "SELECT count(*) FROM meta WHERE key = 'active_session_pointer'")
         assert cur.fetchone()[0] == 0
+        assert conn.execute("SELECT count(*) FROM meta WHERE key LIKE 're_evidence_build:%'").fetchone()[0] == 0
         cur = conn.execute(
             "SELECT value FROM meta WHERE key = 'cortex_dream_cursor'")
         assert cur.fetchone()[0] == 160.5

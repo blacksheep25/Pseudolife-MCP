@@ -97,6 +97,10 @@ def test_audit_manifest_and_result_roundtrip_as_immutable_evidence(pg_url, pg_co
     service._lock = threading.RLock()
     service._ensure_postgres_storage = lambda: storage
     data = manifest()
+    binary = tmp_path / "sample"
+    binary.write_bytes(b"original binary")
+    data["binary_id"] = service.re_evidence_register(
+        project=data["project"], path=str(binary))["binary_id"]
     path = tmp_path / "dependencies.json"
     path.write_text(json.dumps(data), encoding="utf-8")
     try:

@@ -1673,6 +1673,12 @@ class MemoryService(DreamOps, MaintainerOps):
     # Tool: strict reverse-engineering evidence
     # ------------------------------------------------------------------
 
+    def re_evidence_register(self, *, path: str, project: str) -> dict[str, Any]:
+        # Like archive I/O, hashing a large binary must not monopolize the
+        # shared service connection/lock while it reads the original file.
+        with self._re_evidence_archive_storage() as storage:
+            return storage.register_re_build(project=project, path=path)
+
     def re_evidence_ingest(
         self, *, path: str, project: str, kind: str = "evidence-hub-json",
         locator: str | None = None, summary: str | None = None,
