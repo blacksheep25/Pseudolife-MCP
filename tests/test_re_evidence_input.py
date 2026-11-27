@@ -11,6 +11,14 @@ import pytest
 from pseudolife_memory.re_evidence import EvidenceInputError, parse_evidence_bytes, parse_evidence_file
 
 
+@pytest.mark.parametrize("identity", [None, 123, {"sha256": "a" * 64}, ["binary"]])
+def test_non_string_build_identity_has_a_clear_input_error(identity):
+    from pseudolife_memory.re_evidence import parse_binary_id
+
+    with pytest.raises(EvidenceInputError, match="binary_id must"):
+        parse_binary_id(identity)
+
+
 @pytest.mark.parametrize("raw", [
     b'{"address":"00401000","address":"00402000"}',
     b'{"function":{"address":"00401000","address":"00402000"}}',

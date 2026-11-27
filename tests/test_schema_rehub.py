@@ -55,7 +55,7 @@ def test_python_startup_refusal_rolls_back_canonical_upgrade(pg_conn, pg_url):
         ensure_schema(pg_conn)
 
 
-def test_populated_v37_rehub_bank_upgrades_without_changing_proof(pg_conn, pg_url):
+def test_populated_v37_rehub_bank_upgrades_without_changing_proof(pg_conn, pg_url, tmp_path):
     from psycopg import sql
     from pseudolife_memory.re_evidence import parse_evidence_bytes
     from pseudolife_memory.storage.re_evidence import ReEvidenceArchiveStorage
@@ -76,16 +76,19 @@ def test_populated_v37_rehub_bank_upgrades_without_changing_proof(pg_conn, pg_ur
         historical["ensure_schema"](pg_conn)
         raw = b'{ "address": "00B72870", "value": 1.00 }\r\n'
         artifact = parse_evidence_bytes(raw, source_path="evidence/original.json")
-        artifact.update(project="upgrade-proof", binary_id="client:test", kind="function")
         store = ReEvidenceArchiveStorage(pg_conn)
+        binary = tmp_path / "client.exe"
+        binary.write_bytes(b"historical executable")
+        binary_id = store.register_re_build(project="upgrade-proof", path=binary)["binary_id"]
+        artifact.update(project="upgrade-proof", binary_id=binary_id, kind="function")
         evidence_id = store.insert_re_evidence(artifact)
         claim_id = store.upsert_re_claim(
-            project="upgrade-proof", binary_id="client:test", subject="00b72870",
+            project="upgrade-proof", binary_id=binary_id, subject="00b72870",
             claim="calls the indexed function", status="verified", evidence_ids=[evidence_id])
         before = store.get_re_evidence_for_export(
-            artifact_id=evidence_id, project="upgrade-proof", binary_id="client:test")
+            artifact_id=evidence_id, project="upgrade-proof", binary_id=binary_id)
         claims_before = store.query_re_claims(
-            project="upgrade-proof", binary_id="client:test")
+            project="upgrade-proof", binary_id=binary_id)
         assert pg_conn.execute(
             "SELECT value FROM meta WHERE key = 'schema_version'").fetchone()[0] == 37
 
@@ -93,11 +96,11 @@ def test_populated_v37_rehub_bank_upgrades_without_changing_proof(pg_conn, pg_ur
         storage = PostgresStorage(pg_url)
         storage.close()
         after = store.get_re_evidence_for_export(
-            artifact_id=evidence_id, project="upgrade-proof", binary_id="client:test")
+            artifact_id=evidence_id, project="upgrade-proof", binary_id=binary_id)
         assert after == before
         assert after["raw_bytes"] == raw
         assert after["content_hash"] == artifact["content_hash"]
-        claims = store.query_re_claims(project="upgrade-proof", binary_id="client:test")
+        claims = store.query_re_claims(project="upgrade-proof", binary_id=binary_id)
         assert claims == claims_before
         assert [(row["id"], row["status"], row["evidence_ids"]) for row in claims] == [
             (claim_id, "verified", [evidence_id])]

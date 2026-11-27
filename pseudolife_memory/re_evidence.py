@@ -33,6 +33,42 @@ class EvidenceInputError(ValueError):
     """The caller supplied evidence that cannot safely enter the proof store."""
 
 
+def parse_binary_id(binary_id: str) -> tuple[str, str]:
+    """Parse a build reference without guessing or repairing its digest."""
+    match = (re.fullmatch(r"([^/\\\x00-\x1f:]+):sha256:([0-9a-f]{64})", binary_id)
+             if isinstance(binary_id, str) else None)
+    if match is None:
+        raise EvidenceInputError(
+            "binary_id must be filename:sha256:<64 lower-case hex digits>; "
+            "use re_evidence(action='register', project=..., path=<binary path>) "
+            "and use its returned binary_id")
+    return match.group(1), match.group(2)
+
+
+def build_registration_key(project: str, digest: str) -> str:
+    """Keep build admission separate from caller-controlled names and paths."""
+    identity = json.dumps([project, digest], ensure_ascii=True, separators=(",", ":"))
+    return "re_evidence_build:" + hashlib.sha256(identity.encode()).hexdigest()
+
+
+def hash_binary_file(path: str | Path) -> tuple[str, str]:
+    """Compute identity from the original binary, with bounded memory use."""
+    binary = Path(path).expanduser().resolve()
+    if not binary.is_file():
+        raise EvidenceInputError(f"binary file not found: {binary}")
+    digest = hashlib.sha256()
+    size = 0
+    with binary.open("rb") as stream:
+        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+            size += len(chunk)
+            digest.update(chunk)
+    if not size:
+        raise EvidenceInputError("cannot register an empty binary file")
+    identity = f"{binary.name}:sha256:{digest.hexdigest()}"
+    parse_binary_id(identity)
+    return identity, digest.hexdigest()
+
+
 def validate_artifact_selectors(
     artifact_id: int | None = None, content_hash: str | None = None,
 ) -> tuple[int | None, str | None]:
@@ -365,7 +401,11 @@ def import_evidence_archive(
         manifest = json.loads(archive.read(manifest_info).decode("utf-8"))
         if manifest.get("format") != ARCHIVE_FORMAT:
             raise EvidenceInputError("unsupported evidence archive format")
-        if manifest.get("project") != project or manifest.get("binary_id") != binary_id:
+        # Filenames are display labels. A fresh bank may have registered a
+        # renamed copy of the same binary; only the exact digest may remap.
+        _, source_digest = parse_binary_id(manifest.get("binary_id") or "")
+        _, destination_digest = parse_binary_id(binary_id)
+        if manifest.get("project") != project or source_digest != destination_digest:
             raise EvidenceInputError(
                 "archive project/binary_id does not match the requested scope")
 
@@ -449,6 +489,8 @@ def import_evidence_archive(
         # later failure rolls the complete import back at the outer boundary.
         id_map: dict[int, int] = {}
         with storage._txn():
+            # Even an empty archive must not introduce an unregistered scope.
+            storage.require_re_build(project, binary_id)
             storage.conn.execute(
                 "SELECT pg_advisory_xact_lock(hashtextextended(%s, 0))",
                 (_archive_scope_lock_key(project, binary_id),))

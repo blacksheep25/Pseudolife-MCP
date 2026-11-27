@@ -50,10 +50,67 @@ does not turn memories, summaries, or model output into evidence.
 
 ## Safety boundary
 
+### Registered build identities
+
+Before writing evidence for a build, call
+`re_evidence(action="register", project="example", path="/mounted/client.exe")`
+with the original binary on the daemon's filesystem. Registration computes
+SHA-256 from its bytes and returns the canonical `binary_id`. Use that exact
+returned value for ingest, claims and archive import. Registering the same
+bytes under another filename returns the existing project/build identity.
+New binary contents require their own registration; another project's
+registration does not admit writes to this project.
+
+Caller-written hash strings cannot create builds. Writes reject malformed
+IDs, unregistered digests (including valid-length typos), and alternate names
+for a registered digest. Reading/exporting historical scopes remains possible
+so mistakes can be investigated without changing their immutable contents.
+The existing `meta` table stores registrations under `re_evidence_build:`
+keys; there is no schema migration. General memory transfer excludes these
+bank-local admission records, and portable RE archives cannot register builds.
+Register the original binary in a destination bank before restoring an archive.
+An archive from a differently named copy can be restored into the registered
+scope only when its project and complete SHA-256 digest match.
+
+For an existing bank, register each original binary before its next evidence
+write. Existing scope labels are deliberately not trusted as registrations.
+This is a build-verification workflow step, with no daemon configuration change.
+
+### Repairing historical scope mistakes
+
+`ops/reconcile_re_evidence.py` provides operator maintenance with a dry run
+by default. Supply `--plan <plan.json> --archive <new-recovery-file.json>`;
+add `--apply` only after reviewing the source scopes and their provenance.
+The daemon-host environment supplies `PSEUDOLIFE_MCP_DATABASE_URL`. The plan is:
+
+```json
+{
+  "project": "example",
+  "binary_path": "/mounted/client.exe",
+  "source_scopes": ["explicitly-reviewed-historical-typo"]
+}
+```
+
+The repair hashes and registers the binary, serializes affected scopes, saves
+every original artifact/claim/link row in an exclusive recovery file (binary
+columns use base64), verifies that file, copies byte-identical artifacts into
+the registered scope, and redirects claims and evidence links transactionally.
+Claim IDs survive except for duplicate assertions already in the destination;
+conflicting duplicate statuses/confidence refuse the entire transaction.
+Duplicate artifacts must also agree on kind, structured addresses and payload
+keys. Different summaries refuse by default. After reviewing both versions,
+an operator may set `"allow_summary_differences": true` in the plan to keep
+the canonical summaries; the ledger records both versions explicitly and
+the recovery archive retains every original row.
+Original embedded IDs and JSON are never rewritten. A new immutable migration
+ledger maps historical IDs to their canonical records and hashes the recovery
+archive. Retain that archive alongside a database backup. The tool never
+chooses scopes by filename similarity or hash distance.
+
 The three `v34-rehub` extension tables are isolated from associative search, the document
 reference bank, cortex facts, and dream consolidation. An artifact is the raw
 JSON object read from disk plus the SHA-256 of its original bytes. Re-ingesting
-the same `(project, hash, locator)` returns the existing id. Artifacts are not
+the same `(project, binary_id, hash, locator)` returns the existing id. Artifacts are not
 updated in place.
 
 Claims are separate records. `hypothesis` and `todo` may be recorded without

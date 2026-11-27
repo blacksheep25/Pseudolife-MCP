@@ -8,6 +8,12 @@ worktrees of the recreation repository. Use the stable project `srfn-client`
 for SRFN; choose one agreed project for other work. Every artifact, claim,
 query, dependency audit and handoff names the exact binary/build identity,
 including its full SHA-256, such as `client.exe:sha256:<full-hash>`.
+Before the first write for a build, register its daemon-visible original
+binary with `re_evidence(action="register", project=<project>, path=<binary>)`.
+Use the exact returned `binary_id`; do not hand-type or reconstruct its hash.
+Existing historical labels are not registrations. New binary contents must
+be registered separately, while registering a renamed copy returns the
+existing identity for those bytes in that project.
 
 At startup, resume and before shared-file work:
 

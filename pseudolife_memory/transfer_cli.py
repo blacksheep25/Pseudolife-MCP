@@ -139,7 +139,8 @@ _META_SKIP_KEYS = {
 
 
 def _skip_meta_key(key) -> bool:
-    return key in _META_SKIP_KEYS or str(key).endswith("_schema_version")
+    return (key in _META_SKIP_KEYS or str(key).endswith("_schema_version")
+            or str(key).startswith("re_evidence_build:"))
 
 
 # curation_safety._LISTING_SPELLING_META (not imported: that module loads

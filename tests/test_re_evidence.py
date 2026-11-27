@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
+import tempfile
+from pathlib import Path
 import threading
 import time
 from contextlib import nullcontext
@@ -10,6 +13,29 @@ from contextlib import nullcontext
 import pytest
 
 from tests.pg_fixtures import pg_conn, pg_url  # noqa: F401
+
+
+_TEST_BUILD_FILES = {
+    "client.exe": b"test client", "decomp_sro_client.exe": b"decompiled client",
+    "old.exe": b"old client", "new.exe": b"new client",
+    "a.exe": b"build a", "b.exe": b"build b", "one.exe": b"build one",
+}
+(CLIENT_BUILD, DECOMP_BUILD, OLD_BUILD, NEW_BUILD, BUILD_A, BUILD_B, BUILD_ONE) = (
+    f"{name}:sha256:{hashlib.sha256(raw).hexdigest()}"
+    for name, raw in _TEST_BUILD_FILES.items()
+)
+
+
+def _register_test_builds(storage):
+    # Synthetic original binaries, registered through the real computed-hash path.
+    with tempfile.TemporaryDirectory() as directory:
+        for project in ("srfn-client", "archive-owner", "archive-rollback",
+                        "exact-project", "other-project"):
+            for name, raw in _TEST_BUILD_FILES.items():
+                path = Path(directory) / name
+                path.write_bytes(raw)
+                storage.register_re_build(project=project, path=path)
+    return storage
 
 
 def _sample_payload() -> dict:
@@ -58,7 +84,7 @@ def test_parse_artifact_rejects_non_json_and_oversized_input(tmp_path):
 def test_storage_deduplicates_artifacts_and_queries_exact_address(pg_url, pg_conn):
     from pseudolife_memory.storage.postgres import PostgresStorage
 
-    storage = PostgresStorage(pg_url)
+    storage = _register_test_builds(PostgresStorage(pg_url))
     try:
         artifact = {
             "project": "srfn-client",
@@ -68,7 +94,7 @@ def test_storage_deduplicates_artifacts_and_queries_exact_address(pg_url, pg_con
             "content_hash": "a" * 64,
             "payload": _sample_payload(),
             "summary": "World movement step candidate.",
-            "binary_id": "decomp_sro_client.exe:sha256:test",
+            "binary_id": DECOMP_BUILD,
             "addresses": ["00b72510", "00b72870"],
             "raw_bytes": b"{}", "payload_keys": ["function", "relationships"],
         }
@@ -77,13 +103,13 @@ def test_storage_deduplicates_artifacts_and_queries_exact_address(pg_url, pg_con
         assert second == first
 
         rows = storage.query_re_evidence(
-            project="srfn-client", binary_id="decomp_sro_client.exe:sha256:test",
+            project="srfn-client", binary_id=DECOMP_BUILD,
             address="0x00B72870")
         assert [row["id"] for row in rows] == [first]
         assert rows[0]["addresses"] == ["00b72510", "00b72870"]
 
         text_rows = storage.query_re_evidence(
-            project="srfn-client", binary_id="decomp_sro_client.exe:sha256:test",
+            project="srfn-client", binary_id=DECOMP_BUILD,
             text="00b72510")
         assert [row["id"] for row in text_rows] == [first]
     finally:
@@ -93,7 +119,7 @@ def test_storage_deduplicates_artifacts_and_queries_exact_address(pg_url, pg_con
 def test_storage_lists_re_evidence_scopes_with_counts(pg_url, pg_conn):
     from pseudolife_memory.storage.postgres import PostgresStorage
 
-    storage = PostgresStorage(pg_url)
+    storage = _register_test_builds(PostgresStorage(pg_url))
     try:
         def add(project: str, binary_id: str, locator: str, digest: str) -> int:
             return storage.insert_re_evidence({
@@ -105,18 +131,18 @@ def test_storage_lists_re_evidence_scopes_with_counts(pg_url, pg_conn):
                 "payload_keys": ["address"],
             })
 
-        old_id = add("srfn-client", "client:old", "00100000", "1")
+        old_id = add("srfn-client", OLD_BUILD, "00100000", "1")
         storage.upsert_re_claim(
-            project="srfn-client", binary_id="client:old", subject="00100000",
+            project="srfn-client", binary_id=OLD_BUILD, subject="00100000",
             claim="old build behavior", status="verified",
             evidence_ids=[old_id], confidence=1.0)
         time.sleep(0.001)
-        add("srfn-client", "client:new", "00200000", "2")
+        add("srfn-client", NEW_BUILD, "00200000", "2")
 
         scopes = storage.re_evidence_scopes()
 
         selected = [s for s in scopes if s["project"] == "srfn-client"]
-        assert [s["binary_id"] for s in selected] == ["client:new", "client:old"]
+        assert [s["binary_id"] for s in selected] == [NEW_BUILD, OLD_BUILD]
         assert selected[0]["artifacts"] == 1
         assert selected[0]["claims"] == {}
         assert selected[1]["artifacts"] == 1
@@ -131,21 +157,21 @@ def test_service_re_evidence_dashboard_uses_latest_scope_and_filters():
     class Storage:
         def re_evidence_scopes(self):
             return [{
-                "project": "srfn-client", "binary_id": "client:test",
+                "project": "srfn-client", "binary_id": CLIENT_BUILD,
                 "artifacts": 2, "claims": {"verified": 1},
                 "last_activity": 123.0,
             }]
 
         def query_re_evidence(self, **kwargs):
             assert kwargs == {
-                "project": "srfn-client", "binary_id": "client:test",
+                "project": "srfn-client", "binary_id": CLIENT_BUILD,
                 "text": "login", "limit": 25, "include_payload": False,
             }
             return [{"id": 7, "locator": "00abcdef"}]
 
         def query_re_claims(self, **kwargs):
             assert kwargs == {
-                "project": "srfn-client", "binary_id": "client:test",
+                "project": "srfn-client", "binary_id": CLIENT_BUILD,
                 "status": "verified", "text": "login", "limit": 25,
             }
             return [{"id": 3, "status": "verified"}]
@@ -158,7 +184,7 @@ def test_service_re_evidence_dashboard_uses_latest_scope_and_filters():
         text="login", status="verified", limit=25)
 
     assert out["selection"] == {
-        "project": "srfn-client", "binary_id": "client:test"}
+        "project": "srfn-client", "binary_id": CLIENT_BUILD}
     assert out["totals"] == {"artifacts": 2, "claims": {"verified": 1}}
     assert out["artifacts"] == [{"id": 7, "locator": "00abcdef"}]
     assert out["claims"] == [{"id": 3, "status": "verified"}]
@@ -168,17 +194,17 @@ def test_verified_claim_requires_existing_linked_evidence(pg_url, pg_conn):
     from pseudolife_memory.re_evidence import EvidenceInputError
     from pseudolife_memory.storage.postgres import PostgresStorage
 
-    storage = PostgresStorage(pg_url)
+    storage = _register_test_builds(PostgresStorage(pg_url))
     try:
         with pytest.raises(EvidenceInputError, match="requires linked evidence"):
             storage.upsert_re_claim(
-                project="srfn-client", binary_id="client:test", subject="00b72870",
+                project="srfn-client", binary_id=CLIENT_BUILD, subject="00b72870",
                 claim="steps movement in param_3 increments", status="verified",
                 evidence_ids=[])
 
         with pytest.raises(EvidenceInputError, match="not found"):
             storage.upsert_re_claim(
-                project="srfn-client", binary_id="client:test", subject="00b72870",
+                project="srfn-client", binary_id=CLIENT_BUILD, subject="00b72870",
                 claim="steps movement in param_3 increments", status="verified",
                 evidence_ids=[999999])
     finally:
@@ -188,26 +214,26 @@ def test_verified_claim_requires_existing_linked_evidence(pg_url, pg_conn):
 def test_claim_query_returns_linked_evidence_ids(pg_url, pg_conn):
     from pseudolife_memory.storage.postgres import PostgresStorage
 
-    storage = PostgresStorage(pg_url)
+    storage = _register_test_builds(PostgresStorage(pg_url))
     try:
         evidence_id = storage.insert_re_evidence({
             "project": "srfn-client", "kind": "ghidra-function",
             "locator": "00b72870", "source_path": "evidence/world-step.json",
             "content_hash": "b" * 64, "payload": _sample_payload(),
-            "summary": None, "binary_id": "client:test", "addresses": ["00b72870"],
+            "summary": None, "binary_id": CLIENT_BUILD, "addresses": ["00b72870"],
             "raw_bytes": b"{}", "payload_keys": ["function", "relationships"],
         })
         claim_id = storage.upsert_re_claim(
-            project="srfn-client", binary_id="client:test", subject="00b72870",
+            project="srfn-client", binary_id=CLIENT_BUILD, subject="00b72870",
             claim="calls 00b72510 before collision dispatch", status="observed",
             evidence_ids=[evidence_id], confidence=1.0)
 
         result = storage.query_re_claims(
-            project="srfn-client", binary_id="client:test", subject="0x00B72870")
+            project="srfn-client", binary_id=CLIENT_BUILD, subject="0x00B72870")
         assert result == [{
             "id": claim_id,
             "project": "srfn-client",
-            "binary_id": "client:test",
+            "binary_id": CLIENT_BUILD,
             "subject": "00b72870",
             "claim": "calls 00b72510 before collision dispatch",
             "status": "observed",
@@ -223,29 +249,29 @@ def test_claim_query_returns_linked_evidence_ids(pg_url, pg_conn):
 def test_claim_update_replaces_its_evidence_set(pg_url, pg_conn):
     from pseudolife_memory.storage.postgres import PostgresStorage
 
-    storage = PostgresStorage(pg_url)
+    storage = _register_test_builds(PostgresStorage(pg_url))
     try:
         def add(locator: str, digest: str) -> int:
             return storage.insert_re_evidence({
                 "project": "srfn-client", "kind": "ghidra-function",
                 "locator": locator, "source_path": f"evidence/{locator}.json",
                 "content_hash": digest * 64, "payload": {"address": locator},
-                "summary": None, "binary_id": "client:test",
+                "summary": None, "binary_id": CLIENT_BUILD,
                 "addresses": [locator], "raw_bytes": b"{}", "payload_keys": ["address"],
             })
 
         first, second = add("00b72870", "c"), add("00b72510", "d")
         storage.upsert_re_claim(
-            project="srfn-client", binary_id="client:test", subject="00b72870",
+            project="srfn-client", binary_id=CLIENT_BUILD, subject="00b72870",
             claim="collision dispatch succeeds", status="observed",
             evidence_ids=[first])
         storage.upsert_re_claim(
-            project="srfn-client", binary_id="client:test", subject="00b72870",
+            project="srfn-client", binary_id=CLIENT_BUILD, subject="00b72870",
             claim="collision dispatch succeeds", status="rejected",
             evidence_ids=[second])
 
         rows = storage.query_re_claims(
-            project="srfn-client", binary_id="client:test", subject="00b72870")
+            project="srfn-client", binary_id=CLIENT_BUILD, subject="00b72870")
         assert rows[0]["status"] == "rejected"
         assert rows[0]["evidence_ids"] == [second]
     finally:
@@ -256,44 +282,44 @@ def test_claim_update_preserves_links_when_evidence_ids_are_omitted(
         pg_url, pg_conn):
     from pseudolife_memory.storage.postgres import PostgresStorage
 
-    storage = PostgresStorage(pg_url)
+    storage = _register_test_builds(PostgresStorage(pg_url))
     try:
         evidence_id = storage.insert_re_evidence({
             "project": "srfn-client", "kind": "ghidra-function",
             "locator": "00b72870", "source_path": "evidence/a.json",
             "content_hash": "9" * 64, "payload": {"address": "00b72870"},
-            "summary": None, "binary_id": "client:test",
+            "summary": None, "binary_id": CLIENT_BUILD,
             "addresses": ["00b72870"], "raw_bytes": b"{}",
             "payload_keys": ["address"],
         })
         storage.upsert_re_claim(
-            project="srfn-client", binary_id="client:test", subject="00b72870",
+            project="srfn-client", binary_id=CLIENT_BUILD, subject="00b72870",
             claim="collision dispatch succeeds", status="observed",
             evidence_ids=[evidence_id])
 
         storage.upsert_re_claim(
-            project="srfn-client", binary_id="client:test", subject="00b72870",
+            project="srfn-client", binary_id=CLIENT_BUILD, subject="00b72870",
             claim="collision dispatch succeeds", status="verified")
         rows = storage.query_re_claims(
-            project="srfn-client", binary_id="client:test", subject="00b72870")
+            project="srfn-client", binary_id=CLIENT_BUILD, subject="00b72870")
         assert rows[0]["status"] == "verified"
         assert rows[0]["evidence_ids"] == [evidence_id]
 
         storage.upsert_re_claim(
-            project="srfn-client", binary_id="client:test", subject="00b72870",
+            project="srfn-client", binary_id=CLIENT_BUILD, subject="00b72870",
             claim="collision dispatch succeeds", status="hypothesis")
 
         rows = storage.query_re_claims(
-            project="srfn-client", binary_id="client:test", subject="00b72870")
+            project="srfn-client", binary_id=CLIENT_BUILD, subject="00b72870")
         assert rows[0]["status"] == "hypothesis"
         assert rows[0]["evidence_ids"] == [evidence_id]
 
         storage.upsert_re_claim(
-            project="srfn-client", binary_id="client:test", subject="00b72870",
+            project="srfn-client", binary_id=CLIENT_BUILD, subject="00b72870",
             claim="collision dispatch succeeds", status="hypothesis",
             evidence_ids=[])
         rows = storage.query_re_claims(
-            project="srfn-client", binary_id="client:test", subject="00b72870")
+            project="srfn-client", binary_id=CLIENT_BUILD, subject="00b72870")
         assert rows[0]["evidence_ids"] == []
     finally:
         storage.close()
@@ -303,13 +329,13 @@ def test_replay_with_conflicting_metadata_is_rejected(pg_url, pg_conn):
     from pseudolife_memory.re_evidence import EvidenceInputError
     from pseudolife_memory.storage.postgres import PostgresStorage
 
-    storage = PostgresStorage(pg_url)
+    storage = _register_test_builds(PostgresStorage(pg_url))
     try:
         artifact = {
             "project": "srfn-client", "kind": "ghidra-function",
             "locator": "00b72870", "source_path": "evidence/a.json",
             "content_hash": "e" * 64, "payload": {"address": "00b72870"},
-            "summary": "first", "binary_id": "client:test",
+            "summary": "first", "binary_id": CLIENT_BUILD,
             "addresses": ["00b72870"], "raw_bytes": b"{}",
             "payload_keys": ["address"],
         }
@@ -338,11 +364,12 @@ def test_replay_missing_after_conflict_is_a_clean_input_error():
 
     storage = ReEvidenceArchiveStorage(Connection())
     storage._txn = lambda: nullcontext()
+    storage.require_re_build = lambda project, binary_id: binary_id
     artifact = {
         "project": "srfn-client", "kind": "ghidra-function",
         "locator": "00b72870", "source_path": "evidence/a.json",
         "content_hash": "8" * 64, "payload": {"address": "00b72870"},
-        "summary": None, "binary_id": "client:test",
+        "summary": None, "binary_id": CLIENT_BUILD,
         "addresses": ["00b72870"], "raw_bytes": b"{}",
         "payload_keys": ["address"],
     }
@@ -354,7 +381,7 @@ def test_replay_missing_after_conflict_is_a_clean_input_error():
 def test_address_query_plan_can_use_gin_index(pg_url, pg_conn):
     from pseudolife_memory.storage.postgres import PostgresStorage
 
-    storage = PostgresStorage(pg_url)
+    storage = _register_test_builds(PostgresStorage(pg_url))
     try:
         storage.conn.execute("SET enable_seqscan = off")
         storage.conn.execute("SET enable_indexscan = off")
@@ -468,23 +495,23 @@ def test_portable_archive_round_trip_preserves_original_bytes(pg_url, pg_conn, t
         export_evidence_archive, import_evidence_archive, parse_evidence_bytes)
     from pseudolife_memory.storage.postgres import PostgresStorage
 
-    storage = PostgresStorage(pg_url)
+    storage = _register_test_builds(PostgresStorage(pg_url))
     try:
         raw = b'\xef\xbb\xbf{ "address": "00B72870", "value": 1.00 }\r\n'
         artifact = parse_evidence_bytes(raw, source_path="evidence/original.json")
         artifact.update({
-            "project": "srfn-client", "binary_id": "client:test",
+            "project": "srfn-client", "binary_id": CLIENT_BUILD,
             "kind": "ghidra-function", "summary": "round trip",
         })
         old_id = storage.insert_re_evidence(artifact)
         storage.upsert_re_claim(
-            project="srfn-client", binary_id="client:test", subject="00b72870",
+            project="srfn-client", binary_id=CLIENT_BUILD, subject="00b72870",
             claim="round-trip claim", status="verified", evidence_ids=[old_id])
 
         archive_path = tmp_path / "proof.zip"
         exported = export_evidence_archive(
             storage, path=archive_path, project="srfn-client",
-            binary_id="client:test", archive_root=tmp_path)
+            binary_id=CLIENT_BUILD, archive_root=tmp_path)
         assert exported["sha256"] == hashlib.sha256(archive_path.read_bytes()).hexdigest()
         from pseudolife_memory.re_evidence import EvidenceInputError
         with pytest.raises(
@@ -492,11 +519,11 @@ def test_portable_archive_round_trip_preserves_original_bytes(pg_url, pg_conn, t
                 match="project and binary_id must be non-empty"):
             import_evidence_archive(
                 storage, path=archive_path, project=" ",
-                binary_id="client:test", archive_root=tmp_path)
+                binary_id=CLIENT_BUILD, archive_root=tmp_path)
         with pytest.raises(EvidenceInputError, match="empty project/build"):
             import_evidence_archive(
                 storage, path=archive_path, project="srfn-client",
-                binary_id="client:test", archive_root=tmp_path)
+                binary_id=CLIENT_BUILD, archive_root=tmp_path)
 
         with storage._txn():
             storage.conn.execute("DELETE FROM re_claims WHERE project = 'srfn-client'")
@@ -519,7 +546,7 @@ def test_portable_archive_round_trip_preserves_original_bytes(pg_url, pg_conn, t
             try:
                 result.append(import_evidence_archive(
                     importer, path=archive_path, project="srfn-client",
-                    binary_id="client:test", archive_root=tmp_path))
+                    binary_id=CLIENT_BUILD, archive_root=tmp_path))
             except Exception as exc:  # asserted below across the thread boundary
                 result.append(exc)
 
@@ -527,7 +554,7 @@ def test_portable_archive_round_trip_preserves_original_bytes(pg_url, pg_conn, t
             with blocker._txn():
                 blocker.conn.execute(
                     "SELECT pg_advisory_xact_lock(hashtextextended(%s, 0))",
-                    (_archive_scope_lock_key("srfn-client", "client:test"),))
+                    (_archive_scope_lock_key("srfn-client", CLIENT_BUILD),))
                 thread = threading.Thread(target=concurrent_import)
                 thread.start()
                 assert started.wait(timeout=1)
@@ -550,7 +577,7 @@ def test_portable_archive_round_trip_preserves_original_bytes(pg_url, pg_conn, t
                     blocker.conn.execute(
                         "SELECT pg_advisory_xact_lock(hashtextextended(%s, 0))",
                         (_archive_scope_lock_key(
-                            "srfn-client", "client:test"),))
+                            "srfn-client", CLIENT_BUILD),))
 
                     def concurrent_writer():
                         try:
@@ -580,18 +607,18 @@ def test_portable_archive_round_trip_preserves_original_bytes(pg_url, pg_conn, t
                 "DELETE FROM re_evidence_artifacts WHERE project = 'srfn-client'")
         imported = import_evidence_archive(
             storage, path=archive_path, project="srfn-client",
-            binary_id="client:test", archive_root=tmp_path)
+            binary_id=CLIENT_BUILD, archive_root=tmp_path)
         assert imported == {
             "format": "pseudolife-re-evidence-v1", "project": "srfn-client",
-            "binary_id": "client:test", "artifacts": 1, "claims": 1}
+            "binary_id": CLIENT_BUILD, "artifacts": 1, "claims": 1}
 
         ids = storage.re_evidence_export_ids(
-            project="srfn-client", binary_id="client:test")
+            project="srfn-client", binary_id=CLIENT_BUILD)
         restored = storage.get_re_evidence_for_export(
-            artifact_id=ids[0], project="srfn-client", binary_id="client:test")
+            artifact_id=ids[0], project="srfn-client", binary_id=CLIENT_BUILD)
         assert restored["raw_bytes"] == raw
         claims = storage.query_re_claims(
-            project="srfn-client", binary_id="client:test")
+            project="srfn-client", binary_id=CLIENT_BUILD)
         assert claims[0]["evidence_ids"] == ids
     finally:
         storage.close()
@@ -608,14 +635,14 @@ def test_archive_prevalidation_rejects_duplicate_member_reference(tmp_path):
     digest = hashlib.sha256(raw).hexdigest()
     member = f"artifacts/1-{digest}.json"
     artifact = {
-        "id": 1, "project": "srfn-client", "binary_id": "client:test",
+        "id": 1, "project": "srfn-client", "binary_id": CLIENT_BUILD,
         "kind": "ghidra-function", "locator": "00b72870",
         "content_hash": digest, "summary": None, "addresses": ["00b72870"],
         "payload_keys": ["address"], "member": member,
     }
     manifest = {
         "format": "pseudolife-re-evidence-v1", "project": "srfn-client",
-        "binary_id": "client:test",
+        "binary_id": CLIENT_BUILD,
         "artifacts": [artifact, {**artifact, "id": 2}], "claims": [],
     }
     path = tmp_path / "duplicate-member.zip"
@@ -625,7 +652,7 @@ def test_archive_prevalidation_rejects_duplicate_member_reference(tmp_path):
 
     with pytest.raises(EvidenceInputError, match="duplicate artifact member"):
         import_evidence_archive(
-            object(), path=path, project="srfn-client", binary_id="client:test",
+            object(), path=path, project="srfn-client", binary_id=CLIENT_BUILD,
             archive_root=tmp_path)
 
 
@@ -708,7 +735,7 @@ def test_archive_file_io_does_not_hold_the_service_lock(
     monkeypatch.setattr(
         re_evidence, f"{operation}_evidence_archive", file_io)
     result = getattr(service, f"re_evidence_{operation}")(
-        project="srfn-client", binary_id="client:test", path="proof.zip")
+        project="srfn-client", binary_id=CLIENT_BUILD, path="proof.zip")
 
     assert result == {"operation": operation}
 
@@ -733,14 +760,14 @@ def test_archive_runs_while_primary_holds_writer_lease(pg_url, tmp_path, monkeyp
 
     service = MemoryService(data_dir=tmp_path, database_url=pg_url)
     monkeypatch.setenv("PSEUDOLIFE_RE_EVIDENCE_ARCHIVE_ROOT", str(tmp_path))
-    primary = service._ensure_postgres_storage()
+    primary = _register_test_builds(service._ensure_postgres_storage())
     try:
         path = tmp_path / "evidence.json"
         path.write_text(json.dumps(_sample_payload()), encoding="utf-8")
         ingested = service.re_evidence_ingest(
-            path=str(path), project="archive-owner", binary_id="build:one")
+            path=str(path), project="archive-owner", binary_id=BUILD_ONE)
         service.re_claim_record(
-            project="archive-owner", binary_id="build:one", subject="00b72870",
+            project="archive-owner", binary_id=BUILD_ONE, subject="00b72870",
             claim="calls the indexed function", status="verified",
             evidence_ids=[ingested["id"]])
         export = re_evidence.export_evidence_archive
@@ -752,16 +779,16 @@ def test_archive_runs_while_primary_holds_writer_lease(pg_url, tmp_path, monkeyp
 
         monkeypatch.setattr(re_evidence, "export_evidence_archive", assert_snapshot)
         result = service.re_evidence_export(
-            project="archive-owner", binary_id="build:one", path="owned.zip")
+            project="archive-owner", binary_id=BUILD_ONE, path="owned.zip")
         assert result["artifacts"] == 1
         with primary._txn():
             primary.conn.execute("DELETE FROM re_claims WHERE project = 'archive-owner'")
             primary.conn.execute("DELETE FROM re_evidence_artifacts WHERE project = 'archive-owner'")
         restored = service.re_evidence_import(
-            project="archive-owner", binary_id="build:one", path="owned.zip")
+            project="archive-owner", binary_id=BUILD_ONE, path="owned.zip")
         assert restored["artifacts"] == restored["claims"] == 1
         assert service.re_evidence_query(
-            project="archive-owner", binary_id="build:one")["claims"][0]["status"] == "verified"
+            project="archive-owner", binary_id=BUILD_ONE)["claims"][0]["status"] == "verified"
         # The archive connection must not take ownership away from the
         # resident primary, including its lease epoch and canonical state.
         primary.verify_writer_session()
@@ -769,7 +796,7 @@ def test_archive_runs_while_primary_holds_writer_lease(pg_url, tmp_path, monkeyp
             with pytest.raises(RuntimeError, match="rollback probe"):
                 with archive._txn():
                     archive.upsert_re_claim(
-                        project="archive-rollback", binary_id="build:one",
+                        project="archive-rollback", binary_id=BUILD_ONE,
                         subject="00b72870", claim="temporary", status="hypothesis")
                     raise RuntimeError("rollback probe")
         assert primary.re_evidence_stats("archive-rollback")["claims"] == {}
@@ -784,14 +811,14 @@ def test_exact_artifact_selectors_find_retained_bytes_across_paths_and_scopes(pg
     path = tmp_path / "retained.json"
     path.write_text(json.dumps(_sample_payload()), encoding="utf-8")
     artifact = {**parse_evidence_file(path), "project": "exact-project",
-                "binary_id": "build:a", "kind": "ghidra-function"}
-    storage = PostgresStorage(pg_url)
+                "binary_id": BUILD_A, "kind": "ghidra-function"}
+    storage = _register_test_builds(PostgresStorage(pg_url))
     try:
         first = storage.insert_re_evidence(artifact)
         other_locator = storage.insert_re_evidence({**artifact, "locator": "retained-copy"})
-        other_build = storage.insert_re_evidence({**artifact, "binary_id": "build:b"})
+        other_build = storage.insert_re_evidence({**artifact, "binary_id": BUILD_B})
         other_project = storage.insert_re_evidence({**artifact, "project": "other-project"})
-        scope = {"project": "exact-project", "binary_id": "build:a"}
+        scope = {"project": "exact-project", "binary_id": BUILD_A}
         rows = storage.query_re_evidence(**scope, content_hash=artifact["content_hash"].upper())
         assert {row["id"] for row in rows} == {first, other_locator}
         assert all("payload" not in row and "raw_bytes" not in row for row in rows)
@@ -819,7 +846,7 @@ def test_exact_artifact_selector_validation_precedes_database_access(selectors):
     from pseudolife_memory.storage.re_evidence import ReEvidenceStore
 
     with pytest.raises(EvidenceInputError):
-        ReEvidenceStore().query_re_evidence(project="example", binary_id="build:a", **selectors)
+        ReEvidenceStore().query_re_evidence(project="example", binary_id=BUILD_A, **selectors)
 
 
 def test_service_exact_artifact_selectors_acknowledged_without_claim_semantics_change():
@@ -838,7 +865,7 @@ def test_service_exact_artifact_selectors_acknowledged_without_claim_semantics_c
     service = object.__new__(MemoryService)
     service._lock = threading.RLock()
     service._ensure_postgres_storage = lambda: Storage()
-    result = service.re_evidence_query(project="example", binary_id="build:a",
+    result = service.re_evidence_query(project="example", binary_id=BUILD_A,
                                       artifact_id=42, content_hash="A" * 64)
     assert result["artifact_selectors"] == {"artifact_id": 42, "content_hash": "a" * 64}
     assert result["claims"] == [{"id": 7, "evidence_ids": [99]}]
